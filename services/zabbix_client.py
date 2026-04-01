@@ -87,6 +87,45 @@ class ZabbixClient:
 
         return self._stub_metric_summary(alert)
 
+    def get_disk_summary(self, alert: dict) -> dict:
+        if self.use_stub:
+            return self._stub_disk_summary(alert)
+
+        mount_point = alert.get("resource_scope", {}).get("mount_point")
+        if not mount_point:
+            return self._stub_disk_summary(alert)
+
+        try:
+            host_id = self._resolve_host_id(alert)
+            if not host_id:
+                return self._stub_disk_summary(alert)
+
+            items = self._get_host_items(host_id)
+            used_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},pused]"])
+            free_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},free]"])
+            total_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},total]"])
+
+            used_values = self._get_numeric_history(used_item["itemid"], used_item["value_type"]) if used_item else []
+            free_values = self._get_numeric_history(free_item["itemid"], free_item["value_type"]) if free_item else []
+            total_values = self._get_numeric_history(total_item["itemid"], total_item["value_type"]) if total_item else []
+
+            if used_values:
+                latest_free = free_values[-1] if free_values else 0
+                free_24h_ago = free_values[0] if len(free_values) > 1 else latest_free
+                latest_total = total_values[-1] if total_values else 0
+                return {
+                    "mount_point": mount_point,
+                    "used_percent": round(used_values[-1], 2),
+                    "free_gb": round(latest_free / 1024 / 1024 / 1024, 2) if latest_free else 0,
+                    "total_gb": round(latest_total / 1024 / 1024 / 1024, 2) if latest_total else 0,
+                    "growth_gb_24h": round((free_24h_ago - latest_free) / 1024 / 1024 / 1024, 2),
+                    "trend": "sharp_increase" if free_24h_ago - latest_free > 20 * 1024 * 1024 * 1024 else "gradual",
+                }
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Zabbix disk query failed, falling back to stub: %s", exc)
+
+        return self._stub_disk_summary(alert)
+
     def debug_metric_summary(self, alert: dict) -> dict:
         if self.use_stub:
             summary = self._stub_metric_summary(alert)
@@ -224,3 +263,25 @@ class ZabbixClient:
         if severity in {"high", "critical"}:
             return {"cpu_avg": 94.1, "cpu_max": 97.6, "load_avg": 18.2}
         return {"cpu_avg": 68.2, "cpu_max": 76.4, "load_avg": 3.4}
+
+    @staticmethod
+    def _stub_disk_summary(alert: dict) -> dict:
+        mount_point = alert.get("resource_scope", {}).get("mount_point", "/")
+        host_name = alert.get("host_name", "").lower()
+        if "db" in host_name or "tidb" in host_name:
+            return {
+                "mount_point": mount_point,
+                "used_percent": 96.4,
+                "free_gb": 8.5,
+                "total_gb": 512.0,
+                "growth_gb_24h": 36.8,
+                "trend": "sharp_increase",
+            }
+        return {
+            "mount_point": mount_point,
+            "used_percent": 91.2,
+            "free_gb": 42.0,
+            "total_gb": 1024.0,
+            "growth_gb_24h": 4.3,
+            "trend": "gradual",
+        }

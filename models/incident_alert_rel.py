@@ -1,0 +1,9 @@
+INCIDENT_ALERT_REL_TABLE_SQL = """
+CREATE TABLE incident_alert_rel (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    incident_no VARCHAR(128) NOT NULL,
+    alert_event_id BIGINT NOT NULL,
+    rel_type VARCHAR(32) NOT NULL DEFAULT 'member',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+"""

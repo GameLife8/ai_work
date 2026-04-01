@@ -27,7 +27,7 @@ class AIClient:
                 "alert_type": alert.get("alert_type"),
                 "resource_scope": alert.get("resource_scope", {}),
                 "signal": alert.get("signal", {}),
-            }
+            },
         }
         return self._post_json("/plan_context", payload, fallback=self._stub_plan(alert))
 
@@ -69,15 +69,18 @@ class AIClient:
             [
                 "You are an alert-context planner for infrastructure incidents.",
                 "Your task is to decide which local context blocks are required before final judgment.",
-                "Return JSON only with shape: {\"needs\": [...]}",
-                "Allowed needs: metric_summary, disk_summary, topology, related_incidents, alert_history",
+                'Return JSON only with shape: {"needs": [...]}',
+                "Allowed needs: metric_summary, disk_summary, memory_summary, disk_io_summary, availability_summary, topology, related_incidents, alert_history",
                 "Do not give explanations, markdown, or extra keys.",
                 "Planning rules:",
                 "1. If alert_type is disk, request disk_summary, related_incidents, and alert_history.",
                 "2. If alert_type is cpu, request metric_summary, related_incidents, and alert_history.",
-                "3. If service or topology may affect blast radius, request topology.",
-                "4. For resolved alerts, still request related_incidents and alert_history so downstream can decide closure or suppression.",
-                "5. Prefer the smallest sufficient need set.",
+                "3. If alert_type is memory, request memory_summary, related_incidents, and alert_history.",
+                "4. If alert_type is disk_io, request disk_io_summary, related_incidents, and alert_history.",
+                "5. If alert_type is host_down, request availability_summary, related_incidents, and alert_history.",
+                "6. If service or topology may affect blast radius, request topology.",
+                "7. For resolved alerts, still request related_incidents and alert_history so downstream can decide closure or suppression.",
+                "8. Prefer the smallest sufficient need set.",
                 f"Current alert_type: {alert.get('alert_type', 'generic')}",
                 f"Current status: {alert.get('status', 'problem')}",
                 f"Current resource_scope: {alert.get('resource_scope', {})}",
@@ -99,9 +102,12 @@ class AIClient:
                 "3. Disk alerts must consider used_percent, free_gb, total_gb, and growth_gb_24h.",
                 "4. For disk alerts, rapid consumption is more urgent than slow consumption at the same percentage.",
                 "5. CPU alerts must consider cpu_avg, cpu_max, and load_avg together.",
-                "6. Production environment should raise priority by one level compared with non-prod when impact is equivalent.",
-                "7. If evidence is incomplete, use observe instead of over-escalating.",
-                "8. Ignore only when context clearly shows low risk or recovery.",
+                "6. Memory alerts must consider memory_used_percent, available_gb, swap_used_percent, and trend.",
+                "7. Disk IO alerts must consider utilization_percent, await_ms, queue_size, and sustained duration.",
+                "8. Host-down alerts must consider ping status, agent status, and recent availability history.",
+                "9. Production environment should raise priority by one level compared with non-prod when impact is equivalent.",
+                "10. If evidence is incomplete, use observe instead of over-escalating.",
+                "11. Ignore only when context clearly shows low risk or recovery.",
                 f"Current alert_type: {alert.get('alert_type', 'generic')}",
                 f"Current status: {alert.get('status', 'problem')}",
                 f"Current tags: {alert.get('tags', {})}",
@@ -116,12 +122,14 @@ class AIClient:
         service = alert.get("tags", {}).get("service")
         alert_type = alert.get("alert_type", "generic")
 
-        if alert_type == "disk":
-            needs = ["disk_summary", "related_incidents", "alert_history"]
-        elif alert_type == "cpu":
-            needs = ["metric_summary", "related_incidents", "alert_history"]
-        else:
-            needs = ["metric_summary", "related_incidents"]
+        needs_map = {
+            "disk": ["disk_summary", "related_incidents", "alert_history"],
+            "cpu": ["metric_summary", "related_incidents", "alert_history"],
+            "memory": ["memory_summary", "related_incidents", "alert_history"],
+            "disk_io": ["disk_io_summary", "related_incidents", "alert_history"],
+            "host_down": ["availability_summary", "related_incidents", "alert_history"],
+        }
+        needs = needs_map.get(alert_type, ["metric_summary", "related_incidents"])
 
         if service:
             needs.append("topology")
@@ -151,6 +159,12 @@ class AIClient:
             return AIClient._judge_disk(alert, context)
         if alert_type == "cpu":
             return AIClient._judge_cpu(alert, context)
+        if alert_type == "memory":
+            return AIClient._judge_memory(alert, context)
+        if alert_type == "disk_io":
+            return AIClient._judge_disk_io(alert, context)
+        if alert_type == "host_down":
+            return AIClient._judge_host_down(alert, context)
 
         return {
             "decision": "observe",
@@ -172,14 +186,12 @@ class AIClient:
                 "priority": "P1" if env == "prod" else "P2",
                 "reason": "Disk usage is critically high or free space is nearly exhausted.",
             }
-
         if used_percent >= 93 and growth >= 20:
             return {
                 "decision": "notify",
                 "priority": "P2",
                 "reason": "Disk usage is high and recent growth indicates rapid consumption.",
             }
-
         return {
             "decision": "observe",
             "priority": "P3",
@@ -200,16 +212,85 @@ class AIClient:
                 "priority": "P1" if env == "prod" else "P2",
                 "reason": "CPU is sustained at a very high level with elevated load.",
             }
-
         if cpu_max >= 90:
             return {
                 "decision": "observe",
                 "priority": "P3",
                 "reason": "CPU spike needs observation but is not yet severe enough for paging.",
             }
-
         return {
             "decision": "ignore",
             "priority": "P4",
             "reason": "Current CPU context does not support escalation.",
+        }
+
+    @staticmethod
+    def _judge_memory(alert: dict, context: dict) -> dict:
+        env = alert.get("tags", {}).get("env", "").lower()
+        summary = context.get("memory_summary", {})
+        used_percent = float(summary.get("memory_used_percent", 0))
+        available_gb = float(summary.get("available_gb", 0))
+        swap_used_percent = float(summary.get("swap_used_percent", 0))
+
+        if used_percent >= 95 or available_gb <= 2 or swap_used_percent >= 60:
+            return {
+                "decision": "notify",
+                "priority": "P1" if env == "prod" else "P2",
+                "reason": "Memory pressure is severe and may soon cause service instability.",
+            }
+        if used_percent >= 90:
+            return {
+                "decision": "observe",
+                "priority": "P3",
+                "reason": "Memory usage is high but immediate exhaustion risk is not yet proven.",
+            }
+        return {
+            "decision": "ignore",
+            "priority": "P4",
+            "reason": "Current memory context does not support escalation.",
+        }
+
+    @staticmethod
+    def _judge_disk_io(alert: dict, context: dict) -> dict:
+        env = alert.get("tags", {}).get("env", "").lower()
+        summary = context.get("disk_io_summary", {})
+        utilization = float(summary.get("utilization_percent", 0))
+        await_ms = float(summary.get("await_ms", 0))
+        queue_size = float(summary.get("queue_size", 0))
+
+        if utilization >= 95 and await_ms >= 50:
+            return {
+                "decision": "notify",
+                "priority": "P1" if env == "prod" else "P2",
+                "reason": "Disk IO is saturated with high wait latency.",
+            }
+        if utilization >= 85 or queue_size >= 3:
+            return {
+                "decision": "observe",
+                "priority": "P3",
+                "reason": "Disk IO is elevated and should be watched for sustained degradation.",
+            }
+        return {
+            "decision": "ignore",
+            "priority": "P4",
+            "reason": "Disk IO context does not show critical contention.",
+        }
+
+    @staticmethod
+    def _judge_host_down(alert: dict, context: dict) -> dict:
+        env = alert.get("tags", {}).get("env", "").lower()
+        summary = context.get("availability_summary", {})
+        ping = summary.get("ping_status", "down")
+        agent = summary.get("agent_status", "down")
+
+        if ping == "down" and agent == "down":
+            return {
+                "decision": "notify",
+                "priority": "P1" if env == "prod" else "P2",
+                "reason": "Host appears unavailable from both ping and agent perspectives.",
+            }
+        return {
+            "decision": "observe",
+            "priority": "P3",
+            "reason": "Availability signals are mixed and need observation.",
         }

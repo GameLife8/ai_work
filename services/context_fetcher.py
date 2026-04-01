@@ -16,6 +16,15 @@ class ContextFetcher:
         if "disk_summary" in needs:
             context["disk_summary"] = self.zabbix_client.get_disk_summary(alert)
 
+        if "memory_summary" in needs:
+            context["memory_summary"] = self.zabbix_client.get_memory_summary(alert)
+
+        if "disk_io_summary" in needs:
+            context["disk_io_summary"] = self.zabbix_client.get_disk_io_summary(alert)
+
+        if "availability_summary" in needs:
+            context["availability_summary"] = self.zabbix_client.get_availability_summary(alert)
+
         if "topology" in needs:
             context["topology"] = self.graph_client.resolve_topology(alert)
 

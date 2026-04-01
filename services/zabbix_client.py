@@ -126,6 +126,100 @@ class ZabbixClient:
 
         return self._stub_disk_summary(alert)
 
+    def get_memory_summary(self, alert: dict) -> dict:
+        if self.use_stub:
+            return self._stub_memory_summary(alert)
+
+        try:
+            host_id = self._resolve_host_id(alert)
+            if not host_id:
+                return self._stub_memory_summary(alert)
+
+            items = self._get_host_items(host_id)
+            util_item = self._find_metric_item(items, ["vm.memory.util"])
+            free_item = self._find_metric_item(items, ["vm.memory.size[free]"])
+            total_item = self._find_metric_item(items, ["vm.memory.size[total]"])
+
+            util_values = self._get_numeric_history(util_item["itemid"], util_item["value_type"]) if util_item else []
+            free_values = self._get_numeric_history(free_item["itemid"], free_item["value_type"]) if free_item else []
+            total_values = self._get_numeric_history(total_item["itemid"], total_item["value_type"]) if total_item else []
+            if util_values:
+                latest_free = free_values[-1] if free_values else 0
+                latest_total = total_values[-1] if total_values else 0
+                return {
+                    "memory_used_percent": round(util_values[-1], 2),
+                    "available_gb": round(latest_free / 1024 / 1024 / 1024, 2) if latest_free else 0,
+                    "total_gb": round(latest_total / 1024 / 1024 / 1024, 2) if latest_total else 0,
+                    "swap_used_percent": 0.0,
+                    "trend": "rising_fast" if len(util_values) > 1 and util_values[-1] - util_values[0] >= 8 else "stable",
+                }
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Zabbix memory query failed, falling back to stub: %s", exc)
+
+        return self._stub_memory_summary(alert)
+
+    def get_disk_io_summary(self, alert: dict) -> dict:
+        if self.use_stub:
+            return self._stub_disk_io_summary(alert)
+
+        try:
+            host_id = self._resolve_host_id(alert)
+            if not host_id:
+                return self._stub_disk_io_summary(alert)
+
+            items = self._get_host_items(host_id)
+            queue_item = self._find_metric_item(items, ['Current Disk Queue Length'])
+            idle_item = self._find_metric_item(items, ['% Idle Time'])
+            read_await_item = self._find_metric_item(items, ['Avg. Disk sec/Read'])
+            write_await_item = self._find_metric_item(items, ['Avg. Disk sec/Write'])
+
+            queue_values = self._get_numeric_history(queue_item["itemid"], queue_item["value_type"]) if queue_item else []
+            idle_values = self._get_numeric_history(idle_item["itemid"], idle_item["value_type"]) if idle_item else []
+            read_await_values = self._get_numeric_history(read_await_item["itemid"], read_await_item["value_type"]) if read_await_item else []
+            write_await_values = self._get_numeric_history(write_await_item["itemid"], write_await_item["value_type"]) if write_await_item else []
+
+            if queue_values or idle_values:
+                latest_idle = idle_values[-1] if idle_values else 100.0
+                latest_read = read_await_values[-1] if read_await_values else 0.0
+                latest_write = write_await_values[-1] if write_await_values else 0.0
+                await_ms = max(latest_read, latest_write) * 1000
+                return {
+                    "utilization_percent": round(max(0.0, 100.0 - latest_idle), 2),
+                    "await_ms": round(await_ms, 2),
+                    "queue_size": round(queue_values[-1], 2) if queue_values else 0.0,
+                    "trend": "sustained_high" if len(queue_values) > 1 and max(queue_values) >= 3 else "moderate",
+                }
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Zabbix disk IO query failed, falling back to stub: %s", exc)
+
+        return self._stub_disk_io_summary(alert)
+
+    def get_availability_summary(self, alert: dict) -> dict:
+        if self.use_stub:
+            return self._stub_availability_summary(alert)
+
+        try:
+            host_id = self._resolve_host_id(alert)
+            if not host_id:
+                return self._stub_availability_summary(alert)
+
+            items = self._get_host_items(host_id)
+            agent_ping_item = self._find_metric_item(items, ["agent.ping"])
+            uptime_item = self._find_metric_item(items, ["system.uptime"])
+            ping_values = self._get_numeric_history(agent_ping_item["itemid"], agent_ping_item["value_type"]) if agent_ping_item else []
+            uptime_values = self._get_numeric_history(uptime_item["itemid"], uptime_item["value_type"]) if uptime_item else []
+            ping_status = "up" if ping_values and ping_values[-1] >= 1 else "down"
+            agent_status = ping_status
+            return {
+                "ping_status": ping_status,
+                "agent_status": agent_status,
+                "last_seen_minutes_ago": 0 if uptime_values else 10,
+            }
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Zabbix availability query failed, falling back to stub: %s", exc)
+
+        return self._stub_availability_summary(alert)
+
     def debug_metric_summary(self, alert: dict) -> dict:
         if self.use_stub:
             summary = self._stub_metric_summary(alert)
@@ -284,4 +378,48 @@ class ZabbixClient:
             "total_gb": 1024.0,
             "growth_gb_24h": 4.3,
             "trend": "gradual",
+        }
+
+    @staticmethod
+    def _stub_memory_summary(alert: dict) -> dict:
+        host_name = alert.get("host_name", "").lower()
+        if "db" in host_name or "tidb" in host_name:
+            return {
+                "memory_used_percent": 96.1,
+                "available_gb": 1.4,
+                "total_gb": 64.0,
+                "swap_used_percent": 68.0,
+                "trend": "rising_fast",
+            }
+        return {
+            "memory_used_percent": 88.0,
+            "available_gb": 9.8,
+            "total_gb": 32.0,
+            "swap_used_percent": 10.0,
+            "trend": "stable",
+        }
+
+    @staticmethod
+    def _stub_disk_io_summary(alert: dict) -> dict:
+        host_name = alert.get("host_name", "").lower()
+        if "db" in host_name or "tidb" in host_name:
+            return {
+                "utilization_percent": 97.0,
+                "await_ms": 88.0,
+                "queue_size": 5.2,
+                "trend": "sustained_high",
+            }
+        return {
+            "utilization_percent": 72.0,
+            "await_ms": 18.0,
+            "queue_size": 1.2,
+            "trend": "moderate",
+        }
+
+    @staticmethod
+    def _stub_availability_summary(alert: dict) -> dict:
+        return {
+            "ping_status": "down",
+            "agent_status": "down",
+            "last_seen_minutes_ago": 6,
         }

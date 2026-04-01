@@ -52,3 +52,20 @@ def test_rejects_invalid_payload(client):
     assert response.status_code == 400
     body = response.get_json()
     assert body["code"] == 400
+
+
+def test_accepts_notification_style_payload(client):
+    response = client.post(
+        "/api/v1/alerts/notification",
+        json={
+            "to_user": "77301",
+            "subject": "Zabbix告警通知",
+            "alert_message": "/mnt/data01: 磁盘空间严重不足 (used > 90%)",
+            "alert_detail": "WYY-DB09 (169.24.7.117) Problem in 2026.04.01 11:25:15",
+        },
+    )
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["code"] == 0
+    assert body["decision"]["decision"] in {"notify", "observe"}

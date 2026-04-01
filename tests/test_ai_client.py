@@ -49,3 +49,19 @@ def test_stub_judge_notifies_for_critical_disk_exhaustion():
 
     assert decision["decision"] == "notify"
     assert decision["priority"] == "P1"
+
+
+def test_stub_plan_requests_memory_summary_for_memory_alert():
+    plan = AIClient._stub_plan({"alert_type": "memory", "tags": {}})
+
+    assert "memory_summary" in plan["needs"]
+
+
+def test_stub_judge_notifies_for_host_down():
+    decision = AIClient._stub_judge(
+        {"alert_type": "host_down", "status": "problem", "tags": {"env": "prod"}},
+        {"availability_summary": {"ping_status": "down", "agent_status": "down"}},
+    )
+
+    assert decision["decision"] == "notify"
+    assert decision["priority"] == "P1"

@@ -13,6 +13,7 @@ class AlertParser:
             tags = {}
 
         alert_name = AlertParser._coalesce(
+            raw_payload.get("alert_message"),
             raw_payload.get("alert_name"),
             raw_payload.get("alert_level"),
             raw_payload.get("alert_title"),
@@ -21,8 +22,8 @@ class AlertParser:
             "unknown alert",
         )
         alert_message = AlertParser._coalesce(
-            raw_payload.get("message"),
             raw_payload.get("alert_detail"),
+            raw_payload.get("message"),
             raw_payload.get("content"),
             raw_payload.get("description"),
             "",
@@ -52,6 +53,8 @@ class AlertParser:
             "alert_message": alert_message,
             "tags": deepcopy(tags),
             "event_time": event_time,
+            "notify_target": str(raw_payload.get("to_user", "")),
+            "source_subject": str(raw_payload.get("subject", "")),
         }
         normalized.update(AlertParser._extract_signal_fields(normalized))
         return normalized
@@ -78,13 +81,15 @@ class AlertParser:
         lowered = text.lower()
         if "resolved" in lowered or "恢复" in text:
             return "resolved"
-        if "problem" in lowered or "严重不足" in text or "高 cpu" in text.lower():
+        if "problem" in lowered or "严重不足" in text or "高 cpu" in lowered:
             return "problem"
         return "problem"
 
     @staticmethod
     def _infer_severity(alert_name: str, alert_message: str) -> str:
         text = f"{alert_name} {alert_message}".lower()
+        if any(token in text for token in ["关机", "down", "unreachable", "not available"]):
+            return "critical"
         if any(token in text for token in ["critical", "严重", "> 95%", ">95%"]):
             return "critical"
         if any(token in text for token in ["high", "严重不足", "> 90%", ">90%"]):
@@ -96,13 +101,9 @@ class AlertParser:
         text = f"{alert['alert_name']} {alert['alert_message']}"
         lowered = text.lower()
 
-        signal = {
-            "alert_type": "generic",
-            "resource_scope": {},
-            "signal": {},
-        }
+        signal = {"alert_type": "generic", "resource_scope": {}, "signal": {}}
 
-        disk_match = re.search(r"(?P<mount>/[A-Za-z0-9._/-]+)\s*[:：].*磁盘空间.*?used\s*>\s*(?P<threshold>\d+)%", text)
+        disk_match = re.search(r"(?P<mount>/[A-Za-z0-9._/-]+)\s*[:：].*?(?:磁盘空间|disk).*?used\s*>\s*(?P<threshold>\d+)%", text)
         if disk_match:
             signal["alert_type"] = "disk"
             signal["resource_scope"] = {"mount_point": disk_match.group("mount")}
@@ -120,6 +121,28 @@ class AlertParser:
                 "duration_minutes": int(cpu_match.group("minutes")),
                 "symptom": "cpu_used_percent_high",
             }
+            return signal
+
+        memory_match = re.search(r"(?:内存|memory).*?(?:used|usage|利用率)?\s*>\s*(?P<threshold>\d+)%", lowered)
+        if memory_match or "内存" in text or "memory" in lowered:
+            signal["alert_type"] = "memory"
+            signal["signal"] = {
+                "threshold_percent": int(memory_match.group("threshold")) if memory_match else 90,
+                "symptom": "memory_used_percent_high",
+            }
+            return signal
+
+        if any(token in lowered for token in ["磁盘吞吐", "disk io", "i/o", "iowait", "avg. disk", "queue length"]):
+            signal["alert_type"] = "disk_io"
+            mount_match = re.search(r"([A-Za-z]:|/[A-Za-z0-9._/-]+)", text)
+            if mount_match:
+                signal["resource_scope"] = {"mount_point": mount_match.group(1)}
+            signal["signal"] = {"symptom": "disk_io_high"}
+            return signal
+
+        if any(token in lowered for token in ["agent is not available", "unreachable", "icmp ping", "is down"]) or "关机" in text:
+            signal["alert_type"] = "host_down"
+            signal["signal"] = {"symptom": "host_unreachable"}
             return signal
 
         if "磁盘空间" in text:

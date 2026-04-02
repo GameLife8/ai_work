@@ -35,7 +35,8 @@ class AIClient:
     def judge_alert(self, alert: dict, context: dict) -> dict:
         prompt = self._build_judge_prompt(alert, context)
         fallback = self._stub_judge(alert, context)
-        return self._call_model_json(prompt=prompt, fallback=fallback)
+        result = self._call_model_json(prompt=prompt, fallback=fallback)
+        return self._normalize_judge_result(alert, context, result)
 
     def _call_model_json(self, prompt: str, fallback: dict) -> dict:
         if self.use_stub:
@@ -131,9 +132,13 @@ class AIClient:
         return "\n".join(
             [
                 "You are an infrastructure alert judge.",
-                'Return JSON only with keys: {"decision":"...", "priority":"...", "reason":"...", "merge_target_incident_no":"optional"}',
+                'Return JSON only with keys: {"decision":"...", "priority":"...", "reason":"...", "merge_target_incident_no":"optional", "report": {...}}',
                 "Allowed decision values: notify, observe, merge, ignore.",
                 "Allowed priority values: P1, P2, P3, P4.",
+                "The report object must contain: summary, checks_performed, evidence, priority_rationale, recommendations.",
+                "checks_performed must be a string array.",
+                "evidence must be an object summarizing the key metrics you relied on.",
+                "recommendations must be a string array with concrete next actions.",
                 "Decision rules:",
                 "1. If related_incidents already contains a matching open incident, prefer merge.",
                 "2. If alert status is resolved, prefer ignore unless it should merge into an open incident.",
@@ -175,6 +180,121 @@ class AIClient:
             if match:
                 return json.loads(match.group(0))
             raise
+
+    def _normalize_judge_result(self, alert: dict, context: dict, result: dict) -> dict:
+        normalized = dict(result)
+        normalized.setdefault("decision", "observe")
+        normalized.setdefault("priority", "P3")
+        normalized.setdefault("reason", "Alert needs further observation.")
+        normalized["report"] = self._normalize_report(alert, context, normalized)
+        return normalized
+
+    def _normalize_report(self, alert: dict, context: dict, result: dict) -> dict:
+        report = result.get("report")
+        fallback = self._build_fallback_report(alert, context, result)
+        if not isinstance(report, dict):
+            return fallback
+
+        return {
+            "summary": report.get("summary") or fallback["summary"],
+            "checks_performed": report.get("checks_performed") or fallback["checks_performed"],
+            "evidence": report.get("evidence") or fallback["evidence"],
+            "priority_rationale": report.get("priority_rationale") or fallback["priority_rationale"],
+            "recommendations": report.get("recommendations") or fallback["recommendations"],
+        }
+
+    def _build_fallback_report(self, alert: dict, context: dict, result: dict) -> dict:
+        alert_type = alert.get("alert_type", "generic")
+        evidence = {}
+        checks = []
+        recommendations = []
+
+        if alert_type == "disk":
+            disk = context.get("disk_summary", {})
+            evidence = {
+                "mount_point": disk.get("mount_point") or alert.get("resource_scope", {}).get("mount_point"),
+                "used_percent": disk.get("used_percent"),
+                "free_gb": disk.get("free_gb"),
+                "total_gb": disk.get("total_gb"),
+                "growth_gb_24h": disk.get("growth_gb_24h"),
+                "trend": disk.get("trend"),
+            }
+            checks = [
+                "Parsed disk mount point and usage threshold from alert content.",
+                "Fetched disk usage, free capacity, total capacity, and growth trend from Zabbix.",
+                "Checked whether there are already related open incidents.",
+            ]
+            recommendations = [
+                "Check the largest directories and recent file growth under the affected mount.",
+                "Confirm whether the recent growth is expected batch output, logs, or runaway data.",
+                "Prepare cleanup or capacity expansion if free space keeps dropping.",
+            ]
+        elif alert_type == "cpu":
+            metric = context.get("metric_summary", {})
+            evidence = metric
+            checks = [
+                "Fetched CPU average, peak usage, and load information from Zabbix.",
+                "Compared sustained CPU pressure against local and model rules.",
+            ]
+            recommendations = [
+                "Check top CPU-consuming processes on the host.",
+                "Confirm whether workload growth or stuck processes caused the spike.",
+                "Consider throttling, restart, or scaling if the load remains sustained.",
+            ]
+        elif alert_type == "memory":
+            memory = context.get("memory_summary", {})
+            evidence = memory
+            checks = [
+                "Fetched memory utilization and available capacity from Zabbix.",
+                "Checked whether memory pressure is likely to impact stability soon.",
+            ]
+            recommendations = [
+                "Inspect top memory-consuming processes and cache growth.",
+                "Check for swap activity and recent memory leak patterns.",
+                "Prepare restart or scale-out if available memory keeps shrinking.",
+            ]
+        elif alert_type == "disk_io":
+            disk_io = context.get("disk_io_summary", {})
+            evidence = disk_io
+            checks = [
+                "Fetched disk utilization, wait latency, and queue depth from Zabbix.",
+                "Checked whether the contention looks sustained or temporary.",
+            ]
+            recommendations = [
+                "Inspect the busiest disks and processes generating IO.",
+                "Check backup, compaction, or batch tasks running during the alert window.",
+                "Consider workload throttling or storage optimization if latency stays high.",
+            ]
+        elif alert_type == "host_down":
+            availability = context.get("availability_summary", {})
+            evidence = availability
+            checks = [
+                "Checked agent availability and uptime-related host signals.",
+                "Compared the host-down symptom against recent availability context.",
+            ]
+            recommendations = [
+                "Verify network connectivity and host power state first.",
+                "Check whether the Zabbix agent or firewall is blocking reachability.",
+                "Escalate to infrastructure support if the host remains unreachable.",
+            ]
+        else:
+            evidence = context
+            checks = [
+                "Collected available context from local systems and Zabbix.",
+                "Applied generic alert evaluation rules because the alert type was uncertain.",
+            ]
+            recommendations = [
+                "Review the raw alert text and improve alert classification if needed.",
+                "Check the affected host and recent incidents for correlated symptoms.",
+            ]
+
+        return {
+            "summary": result.get("reason", "Alert evaluated with available context."),
+            "checks_performed": checks,
+            "evidence": evidence,
+            "priority_rationale": f"Decision={result.get('decision')} and priority={result.get('priority')} based on the collected evidence and alert context.",
+            "recommendations": recommendations,
+        }
 
     @staticmethod
     def _stub_plan(alert: dict) -> dict:

@@ -38,17 +38,28 @@ def test_judge_prompt_mentions_disk_and_cpu_guidelines():
 
 
 def test_stub_judge_notifies_for_critical_disk_exhaustion():
-    decision = AIClient._stub_judge(
+    decision = AIClient(provider="volcengine_coding", base_url="http://example.com", api_key="", model="", timeout_seconds=10, use_stub=True)._normalize_judge_result(
         {
             "alert_type": "disk",
             "status": "problem",
             "tags": {"env": "prod"},
+            "resource_scope": {"mount_point": "/mnt/data01"},
         },
-        {"disk_summary": {"used_percent": 98.0, "free_gb": 5.0, "growth_gb_24h": 30.0}},
+        {"disk_summary": {"mount_point": "/mnt/data01", "used_percent": 98.0, "free_gb": 5.0, "growth_gb_24h": 30.0}},
+        AIClient._stub_judge(
+            {
+                "alert_type": "disk",
+                "status": "problem",
+                "tags": {"env": "prod"},
+            },
+            {"disk_summary": {"used_percent": 98.0, "free_gb": 5.0, "growth_gb_24h": 30.0}},
+        ),
     )
 
     assert decision["decision"] == "notify"
     assert decision["priority"] == "P1"
+    assert "report" in decision
+    assert decision["report"]["evidence"]["mount_point"] == "/mnt/data01"
 
 
 def test_stub_plan_requests_memory_summary_for_memory_alert():
@@ -65,6 +76,23 @@ def test_stub_judge_notifies_for_host_down():
 
     assert decision["decision"] == "notify"
     assert decision["priority"] == "P1"
+
+
+def test_normalize_judge_result_builds_report_when_model_omits_it():
+    client = AIClient(provider="volcengine_coding", base_url="http://example.com", api_key="", model="", timeout_seconds=10, use_stub=True)
+
+    result = client._normalize_judge_result(
+        {
+            "alert_type": "cpu",
+            "host_name": "APP01",
+            "tags": {},
+        },
+        {"metric_summary": {"cpu_avg": 92, "cpu_max": 97, "load_avg": 9}},
+        {"decision": "notify", "priority": "P2", "reason": "CPU is sustained at a high level."},
+    )
+
+    assert result["report"]["summary"] == "CPU is sustained at a high level."
+    assert result["report"]["evidence"]["cpu_max"] == 97
 
 
 def test_extract_json_object_supports_wrapped_text():

@@ -69,3 +69,6 @@ def test_accepts_notification_style_payload(client):
     body = response.get_json()
     assert body["code"] == 0
     assert body["decision"]["decision"] in {"notify", "observe"}
+    assert "plan" in body
+    assert "context" in body
+    assert "report" in body["decision"]

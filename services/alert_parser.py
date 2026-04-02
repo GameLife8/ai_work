@@ -70,7 +70,6 @@ class AlertParser:
     def _extract_host_from_text(text: str) -> tuple[str, str]:
         if not text:
             return "", ""
-
         match = re.search(r"([A-Za-z0-9._-]+)\s*\((\d{1,3}(?:\.\d{1,3}){3})\)", text)
         if match:
             return match.group(1), match.group(2)
@@ -79,20 +78,18 @@ class AlertParser:
     @staticmethod
     def _infer_status(text: str) -> str:
         lowered = text.lower()
-        if "resolved" in lowered or "恢复" in text:
+        if "resolved" in lowered:
             return "resolved"
-        if "problem" in lowered or "严重不足" in text or "高 cpu" in lowered:
+        if "problem" in lowered:
             return "problem"
         return "problem"
 
     @staticmethod
     def _infer_severity(alert_name: str, alert_message: str) -> str:
         text = f"{alert_name} {alert_message}".lower()
-        if any(token in text for token in ["关机", "down", "unreachable", "not available"]):
+        if any(token in text for token in ["down", "unreachable", "not available", "> 95%", ">95%"]):
             return "critical"
-        if any(token in text for token in ["critical", "严重", "> 95%", ">95%"]):
-            return "critical"
-        if any(token in text for token in ["high", "严重不足", "> 90%", ">90%"]):
+        if any(token in text for token in ["high", "> 90%", ">90%", "over 90%"]):
             return "high"
         return "warning"
 
@@ -100,56 +97,63 @@ class AlertParser:
     def _extract_signal_fields(alert: dict) -> dict:
         text = f"{alert['alert_name']} {alert['alert_message']}"
         lowered = text.lower()
-
         signal = {"alert_type": "generic", "resource_scope": {}, "signal": {}}
 
-        disk_match = re.search(r"(?P<mount>/[A-Za-z0-9._/-]+)\s*[:：].*?(?:磁盘空间|disk).*?used\s*>\s*(?P<threshold>\d+)%", text)
-        if disk_match:
+        mount = AlertParser._extract_mount_point(text)
+        threshold = AlertParser._extract_threshold_percent(text)
+        duration_minutes = AlertParser._extract_duration_minutes(lowered)
+
+        is_disk = bool(mount and threshold is not None and "used" in lowered)
+        is_cpu = duration_minutes is not None and threshold is not None
+        is_memory = threshold is not None and ("memory" in lowered or "内存" in text)
+        is_disk_io = any(token in lowered for token in ["disk io", "i/o", "iowait", "avg. disk", "queue length"])
+        is_host_down = any(token in lowered for token in ["agent is not available", "unreachable", "icmp ping", "is down"])
+
+        if is_disk:
             signal["alert_type"] = "disk"
-            signal["resource_scope"] = {"mount_point": disk_match.group("mount")}
+            signal["resource_scope"] = {"mount_point": mount}
             signal["signal"] = {
-                "threshold_percent": int(disk_match.group("threshold")),
+                "threshold_percent": threshold,
                 "symptom": "disk_used_percent_high",
             }
             return signal
 
-        cpu_match = re.search(r"over\s*(?P<threshold>\d+)%\s*for\s*(?P<minutes>\d+)m", lowered)
-        if cpu_match:
+        if is_cpu:
             signal["alert_type"] = "cpu"
             signal["signal"] = {
-                "threshold_percent": int(cpu_match.group("threshold")),
-                "duration_minutes": int(cpu_match.group("minutes")),
+                "threshold_percent": threshold,
+                "duration_minutes": duration_minutes,
                 "symptom": "cpu_used_percent_high",
             }
             return signal
 
-        memory_match = re.search(r"(?:内存|memory).*?(?:used|usage|利用率)?\s*>\s*(?P<threshold>\d+)%", lowered)
-        if memory_match or "内存" in text or "memory" in lowered:
+        if is_memory:
             signal["alert_type"] = "memory"
             signal["signal"] = {
-                "threshold_percent": int(memory_match.group("threshold")) if memory_match else 90,
+                "threshold_percent": threshold,
                 "symptom": "memory_used_percent_high",
             }
             return signal
 
-        if any(token in lowered for token in ["磁盘吞吐", "disk io", "i/o", "iowait", "avg. disk", "queue length"]):
+        if is_disk_io:
             signal["alert_type"] = "disk_io"
-            mount_match = re.search(r"([A-Za-z]:|/[A-Za-z0-9._/-]+)", text)
-            if mount_match:
-                signal["resource_scope"] = {"mount_point": mount_match.group(1)}
+            if mount:
+                signal["resource_scope"] = {"mount_point": mount}
             signal["signal"] = {"symptom": "disk_io_high"}
             return signal
 
-        if any(token in lowered for token in ["agent is not available", "unreachable", "icmp ping", "is down"]) or "关机" in text:
+        if is_host_down:
             signal["alert_type"] = "host_down"
             signal["signal"] = {"symptom": "host_unreachable"}
             return signal
 
-        if "磁盘空间" in text:
+        if mount and threshold is not None:
             signal["alert_type"] = "disk"
-            mount_match = re.search(r"(?P<mount>/[A-Za-z0-9._/-]+)", text)
-            if mount_match:
-                signal["resource_scope"] = {"mount_point": mount_match.group("mount")}
+            signal["resource_scope"] = {"mount_point": mount}
+            signal["signal"] = {
+                "threshold_percent": threshold,
+                "symptom": "disk_used_percent_high",
+            }
             return signal
 
         if "cpu" in lowered:
@@ -157,3 +161,24 @@ class AlertParser:
             return signal
 
         return signal
+
+    @staticmethod
+    def _extract_mount_point(text: str) -> str | None:
+        match = re.search(r"([A-Za-z]:|/[A-Za-z0-9._/-]+)\s*[:：]?", text)
+        if match:
+            return match.group(1)
+        return None
+
+    @staticmethod
+    def _extract_threshold_percent(text: str) -> int | None:
+        match = re.search(r"(?:>\s*|over\s+)(\d+)%", text.lower())
+        if match:
+            return int(match.group(1))
+        return None
+
+    @staticmethod
+    def _extract_duration_minutes(text: str) -> int | None:
+        match = re.search(r"for\s*(\d+)m", text)
+        if match:
+            return int(match.group(1))
+        return None

@@ -20,6 +20,19 @@ def test_parses_disk_notification_from_mobile_style_payload():
     assert alert["status"] == "resolved"
 
 
+def test_parses_disk_notification_even_when_text_is_mojibake_like():
+    payload = {
+        "alert_message": "/mnt/data01: ???????? (used > 90%)",
+        "alert_detail": "WYY-DB09 (169.24.7.117) Problem in 2026.04.01 11:25:15",
+    }
+
+    alert = AlertParser.parse(payload)
+
+    assert alert["alert_type"] == "disk"
+    assert alert["resource_scope"]["mount_point"] == "/mnt/data01"
+    assert alert["signal"]["threshold_percent"] == 90
+
+
 def test_parses_cpu_notification_threshold_and_duration():
     payload = {
         "alert_level": "高 CPU 利用率 (over 90% for 5m)",

@@ -13,6 +13,9 @@ def _handle_incoming_payload(payload: dict):
             "code": 0,
             "message": "accepted",
             "alert_id": result["alert_event_id"],
+            "alert": result["alert"],
+            "plan": result["plan"],
+            "context": result["context"],
             "decision": result["decision"],
         }
     )

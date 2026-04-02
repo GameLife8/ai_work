@@ -43,4 +43,6 @@ class AlertService:
             "alert_event_id": alert_event_id,
             "decision": merged_decision,
             "context": context,
+            "plan": plan,
+            "alert": alert,
         }

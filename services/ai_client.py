@@ -143,57 +143,50 @@ class AIClient:
     def _build_judge_prompt(self, alert: dict, context: dict) -> str:
         return "\n".join(
             [
-                "You are an infrastructure alert judge.",
-                'Return JSON only with keys: {"decision":"...", "priority":"...", "reason":"...", "merge_target_incident_no":"optional", "report": {...}}',
-                "Allowed decision values: notify, observe, merge, ignore.",
-                "Allowed priority values: P1, P2, P3, P4.",
-                "The report object must contain: summary, checks_performed, evidence, priority_rationale, recommendations.",
-                "checks_performed must be a string array.",
-                "evidence must be an object summarizing the key metrics you relied on.",
-                "recommendations must be a string array with concrete next actions.",
-                "Your response must be stable, concise, and operational.",
-                "Do not hedge with long essays. Use the evidence you have.",
-                "If a field is missing, do not invent it. Prefer observe when uncertainty is material.",
-                "Decision rules:",
-                "1. If related_incidents already contains a matching open incident, prefer merge.",
-                "2. If alert status is resolved, prefer ignore unless it should merge into an open incident.",
-                "3. Disk alerts must consider used_percent, free_gb, total_gb, growth_gb_24h, and trend.",
-                "4. Disk alerts with very low remaining free space or very rapid growth are urgent.",
-                "5. CPU alerts must consider cpu_avg, cpu_max, and load_avg together.",
-                "6. Memory alerts must consider memory_used_percent, available_gb, swap_used_percent, and trend.",
-                "7. Disk IO alerts must consider utilization_percent, await_ms, queue_size, and trend.",
-                "8. Host-down alerts must consider ping_status, agent_status, and last_seen_minutes_ago.",
-                "9. Production equivalent impact should have higher priority than non-prod.",
-                "10. If evidence is incomplete, prefer observe rather than over-escalating.",
-                "11. Keep reason concise, concrete, and operational.",
-                "Priority calibration:",
-                "- P1: immediate or imminent service-impact risk, likely urgent human action required.",
-                "- P2: serious degradation risk, needs timely action, but not yet immediate outage.",
-                "- P3: notable anomaly that should be watched or triaged soon.",
-                "- P4: resolved, low-risk, or insufficiently supported for escalation.",
-                "Decision calibration:",
-                "- notify: send human-visible escalation now.",
-                "- observe: do not ignore, but wait and continue monitoring.",
-                "- merge: attach to an existing active incident.",
-                "- ignore: recovery or clearly low-value signal.",
-                "Type-specific judgment guide:",
-                "- Disk: prioritize free_gb exhaustion risk over raw percentage when they disagree.",
-                "- Disk: high used_percent plus sharp growth should increase urgency.",
-                "- CPU: high cpu_max alone is weaker evidence than high cpu_avg plus high load_avg.",
-                "- Memory: low available_gb or high swap pressure increases urgency sharply.",
-                "- Disk IO: high queue_size with high await_ms suggests real contention, not just throughput.",
-                "- Host-down: if both ping and agent are down, assume stronger outage risk.",
-                "Report-writing rules:",
-                "- summary should be 1-2 sentences.",
-                "- checks_performed should describe the concrete validations you used.",
-                "- evidence should only contain fields actually present in context or alert.",
-                "- priority_rationale should explain why this priority, not just repeat the decision.",
-                "- recommendations should be concrete operator actions, not generic advice.",
-                "Recommendation style guide:",
-                "- Prefer 3-5 short, executable actions.",
-                "- Start with validation or containment, then remediation, then longer-term follow-up.",
-                "- Mention the specific host, mount, metric, or symptom when useful.",
-                "Alert payload:",
+                "你是基础设施告警研判助手。",
+                '只返回 JSON，键只能是: {"decision":"...", "priority":"...", "reason":"...", "merge_target_incident_no":"optional", "report": {...}}',
+                "decision 只能是: notify, observe, merge, ignore。",
+                "priority 只能是: P1, P2, P3, P4。",
+                "report 对象必须包含: summary, checks_performed, evidence, priority_rationale, recommendations。",
+                "reason、summary、priority_rationale、recommendations 必须使用中文。",
+                "checks_performed 必须是中文字符串数组。",
+                "evidence 必须是你实际依赖的证据对象，不要编造不存在的字段。",
+                "输出必须稳定、简洁、可执行，不要输出 markdown，不要解释 JSON 以外的内容。",
+                "如果证据不足，不要瞎猜，优先选择 observe。",
+                "研判规则:",
+                "1. 如果 related_incidents 中已有匹配的 open incident，优先 merge。",
+                "2. 如果 alert status 是 resolved，优先 ignore，除非它应该并入已有 incident。",
+                "3. 磁盘告警必须综合 used_percent、free_gb、total_gb、growth_gb_24h、trend。",
+                "4. 剩余空间很低或增长很快的磁盘告警优先级要更高。",
+                "5. CPU 告警必须综合 cpu_avg、cpu_max、load_avg，不能只看峰值。",
+                "6. 内存告警必须综合 memory_used_percent、available_gb、swap_used_percent、trend。",
+                "7. 磁盘 IO 告警必须综合 utilization_percent、await_ms、queue_size、trend。",
+                "8. 主机宕机类告警必须综合 ping_status、agent_status、last_seen_minutes_ago。",
+                "9. 同等影响下，生产环境优先级应高于非生产环境。",
+                "10. 证据不足时优先 observe，不要过度升级。",
+                "优先级口径:",
+                "- P1: 即将或已经造成明显业务风险，需要尽快人工处理。",
+                "- P2: 风险较高，需要及时处理，但还没到立刻中断。",
+                "- P3: 异常存在，需要观察或排查。",
+                "- P4: 已恢复、低价值或证据不足以升级。",
+                "决策口径:",
+                "- notify: 需要立即通知人工。",
+                "- observe: 暂不升级，但要继续观察。",
+                "- merge: 并入已有事件。",
+                "- ignore: 已恢复或无需处理。",
+                "分类研判提示:",
+                "- 磁盘: 如果 free_gb 很低，即使百分比略低也要偏高优先级。",
+                "- 磁盘: used_percent 很高且 growth 很快，应提高优先级。",
+                "- CPU: cpu_max 很高但 cpu_avg 不高时，通常弱于持续高负载。",
+                "- 内存: available_gb 很低或 swap_used_percent 很高时，优先级显著上升。",
+                "- 磁盘 IO: queue_size 高且 await_ms 高，说明是真正的存储争用。",
+                "- 宕机: ping 和 agent 都 down 时，按更高风险处理。",
+                "报告写作规则:",
+                "- summary 用 1 到 2 句中文总结。",
+                "- checks_performed 写你实际做过的检查项。",
+                "- priority_rationale 要解释为什么是这个优先级。",
+                "- recommendations 给 3 到 5 条可执行建议，先验证和止损，再修复和后续治理。",
+                "告警输入:",
                 json.dumps(
                     {
                         "alert_name": alert.get("alert_name"),
@@ -208,28 +201,28 @@ class AIClient:
                     },
                     ensure_ascii=False,
                 ),
-                "Context payload:",
+                "上下文输入:",
                 json.dumps(context, ensure_ascii=False),
-                "Output example skeleton:",
+                "输出示例骨架:",
                 json.dumps(
                     {
                         "decision": "notify",
                         "priority": "P2",
-                        "reason": "Short operational reason here.",
+                        "reason": "这里写简短中文原因。",
                         "merge_target_incident_no": None,
                         "report": {
-                            "summary": "One or two sentence conclusion.",
+                            "summary": "这里写 1 到 2 句中文总结。",
                             "checks_performed": [
-                                "Checked key metric A.",
-                                "Checked correlation metric B.",
+                                "检查了关键指标 A。",
+                                "检查了关联指标 B。"
                             ],
                             "evidence": {
                                 "example_metric": 123
                             },
-                            "priority_rationale": "Explain why this is P1/P2/P3/P4.",
+                            "priority_rationale": "这里解释为什么是这个优先级。",
                             "recommendations": [
-                                "Do first operator action.",
-                                "Do second operator action."
+                                "这里写第一条处理建议。",
+                                "这里写第二条处理建议。"
                             ]
                         }
                     },
@@ -252,7 +245,7 @@ class AIClient:
         normalized = dict(result)
         normalized.setdefault("decision", "observe")
         normalized.setdefault("priority", "P3")
-        normalized.setdefault("reason", "Alert needs further observation.")
+        normalized.setdefault("reason", "告警需要继续观察。")
         normalized["report"] = self._normalize_report(alert, context, normalized)
         return normalized
 
@@ -287,79 +280,79 @@ class AIClient:
                 "trend": disk.get("trend"),
             }
             checks = [
-                "Parsed disk mount point and usage threshold from alert content.",
-                "Fetched disk usage, free capacity, total capacity, and growth trend from Zabbix.",
-                "Checked whether there are already related open incidents.",
+                "从告警内容中解析了挂载点和阈值。",
+                "从 Zabbix 获取了磁盘使用率、剩余空间、总容量和增长趋势。",
+                "检查了是否存在相关的未关闭 incident。",
             ]
             recommendations = [
-                "Check the largest directories and recent file growth under the affected mount.",
-                "Confirm whether the recent growth is expected batch output, logs, or runaway data.",
-                "Prepare cleanup or capacity expansion if free space keeps dropping.",
+                "检查受影响挂载点下占用空间最大的目录和近期增长最快的文件。",
+                "确认增长是否来自批处理输出、日志膨胀或异常数据写入。",
+                "如果剩余空间持续下降，尽快执行清理或扩容。",
             ]
         elif alert_type == "cpu":
             metric = context.get("metric_summary", {})
             evidence = metric
             checks = [
-                "Fetched CPU average, peak usage, and load information from Zabbix.",
-                "Compared sustained CPU pressure against local and model rules.",
+                "从 Zabbix 获取了 CPU 平均值、峰值和负载信息。",
+                "对比了持续高负载和瞬时尖峰的差异。",
             ]
             recommendations = [
-                "Check top CPU-consuming processes on the host.",
-                "Confirm whether workload growth or stuck processes caused the spike.",
-                "Consider throttling, restart, or scaling if the load remains sustained.",
+                "检查主机上 CPU 占用最高的进程。",
+                "确认是业务流量增长还是异常进程导致的 CPU 升高。",
+                "如果高负载持续存在，考虑限流、重启或扩容。",
             ]
         elif alert_type == "memory":
             memory = context.get("memory_summary", {})
             evidence = memory
             checks = [
-                "Fetched memory utilization and available capacity from Zabbix.",
-                "Checked whether memory pressure is likely to impact stability soon.",
+                "从 Zabbix 获取了内存使用率和可用容量。",
+                "检查了内存压力是否已经接近影响稳定性的阈值。",
             ]
             recommendations = [
-                "Inspect top memory-consuming processes and cache growth.",
-                "Check for swap activity and recent memory leak patterns.",
-                "Prepare restart or scale-out if available memory keeps shrinking.",
+                "检查最占内存的进程和缓存增长情况。",
+                "确认是否存在 swap 压力和疑似内存泄漏。",
+                "如果可用内存继续下降，准备重启或扩容。",
             ]
         elif alert_type == "disk_io":
             disk_io = context.get("disk_io_summary", {})
             evidence = disk_io
             checks = [
-                "Fetched disk utilization, wait latency, and queue depth from Zabbix.",
-                "Checked whether the contention looks sustained or temporary.",
+                "从 Zabbix 获取了磁盘利用率、等待时间和队列长度。",
+                "检查了磁盘争用是持续存在还是短时波动。",
             ]
             recommendations = [
-                "Inspect the busiest disks and processes generating IO.",
-                "Check backup, compaction, or batch tasks running during the alert window.",
-                "Consider workload throttling or storage optimization if latency stays high.",
+                "检查最繁忙的磁盘和产生 IO 的关键进程。",
+                "确认告警窗口内是否有备份、压缩或批处理任务。",
+                "如果延迟持续偏高，考虑限流或存储优化。",
             ]
         elif alert_type == "host_down":
             availability = context.get("availability_summary", {})
             evidence = availability
             checks = [
-                "Checked agent availability and uptime-related host signals.",
-                "Compared the host-down symptom against recent availability context.",
+                "检查了 agent 可用性和主机运行状态相关信号。",
+                "结合最近可用性上下文判断是否为真实宕机。",
             ]
             recommendations = [
-                "Verify network connectivity and host power state first.",
-                "Check whether the Zabbix agent or firewall is blocking reachability.",
-                "Escalate to infrastructure support if the host remains unreachable.",
+                "先确认网络连通性和主机电源状态。",
+                "检查 Zabbix agent 或防火墙是否导致不可达。",
+                "如果主机持续不可达，升级给基础设施支持处理。",
             ]
         else:
             evidence = context
             checks = [
-                "Collected available context from local systems and Zabbix.",
-                "Applied generic alert evaluation rules because the alert type was uncertain.",
+                "收集了当前可获取的上下文信息。",
+                "由于告警类型不够明确，按通用规则进行了评估。",
             ]
             recommendations = [
-                "Review the raw alert text and improve alert classification if needed.",
-                "Check the affected host and recent incidents for correlated symptoms.",
+                "复核原始告警文本，必要时补强告警分类规则。",
+                "检查受影响主机和近期事件，确认是否存在关联症状。",
             ]
 
         return {
-            "summary": result.get("reason", "Alert evaluated with available context."),
+            "summary": result.get("reason", "已基于当前可用上下文完成告警评估。"),
             "checks_performed": checks,
             "evidence": evidence,
-            "priority_rationale": f"Decision={result.get('decision')} and priority={result.get('priority')} based on the collected evidence and alert context.",
+            "priority_rationale": f"根据当前证据和告警上下文，最终决策为 {result.get('decision')}，优先级为 {result.get('priority')}。",
             "recommendations": recommendations,
         }
 
@@ -388,7 +381,7 @@ class AIClient:
             return {
                 "decision": "ignore",
                 "priority": "P4",
-                "reason": "Resolved alert does not need escalation.",
+                "reason": "告警已恢复，当前无需升级处理。",
             }
 
         related = context.get("related_incidents", [])
@@ -396,7 +389,7 @@ class AIClient:
             return {
                 "decision": "merge",
                 "priority": "P2",
-                "reason": "Found open incident for same host or service.",
+                "reason": "发现同主机或同服务的未关闭 incident，建议并入已有事件。",
                 "merge_target_incident_no": related[0]["incident_no"],
             }
 
@@ -415,7 +408,7 @@ class AIClient:
         return {
             "decision": "observe",
             "priority": "P3",
-            "reason": "Alert should be observed before escalation.",
+            "reason": "当前更适合先观察，再决定是否升级。",
         }
 
     @staticmethod
@@ -430,18 +423,18 @@ class AIClient:
             return {
                 "decision": "notify",
                 "priority": "P1" if env == "prod" else "P2",
-                "reason": "Disk usage is critically high or free space is nearly exhausted.",
+                "reason": "磁盘使用率已经很高或剩余空间接近耗尽，需要尽快处理。",
             }
         if used_percent >= 93 and growth >= 20:
             return {
                 "decision": "notify",
                 "priority": "P2",
-                "reason": "Disk usage is high and recent growth indicates rapid consumption.",
+                "reason": "磁盘使用率偏高且近期增长很快，存在快速写满风险。",
             }
         return {
             "decision": "observe",
             "priority": "P3",
-            "reason": "Disk is filling gradually and should be monitored.",
+            "reason": "磁盘在缓慢增长，建议持续观察。",
         }
 
     @staticmethod
@@ -456,18 +449,18 @@ class AIClient:
             return {
                 "decision": "notify",
                 "priority": "P1" if env == "prod" else "P2",
-                "reason": "CPU is sustained at a very high level with elevated load.",
+                "reason": "CPU 持续高位运行且负载偏高，需要及时处理。",
             }
         if cpu_max >= 90:
             return {
                 "decision": "observe",
                 "priority": "P3",
-                "reason": "CPU spike needs observation but is not yet severe enough for paging.",
+                "reason": "CPU 出现高峰，但当前更适合先观察是否持续。",
             }
         return {
             "decision": "ignore",
             "priority": "P4",
-            "reason": "Current CPU context does not support escalation.",
+            "reason": "当前 CPU 上下文不足以支持升级处理。",
         }
 
     @staticmethod
@@ -482,18 +475,18 @@ class AIClient:
             return {
                 "decision": "notify",
                 "priority": "P1" if env == "prod" else "P2",
-                "reason": "Memory pressure is severe and may soon cause service instability.",
+                "reason": "内存压力较大，可能很快影响服务稳定性。",
             }
         if used_percent >= 90:
             return {
                 "decision": "observe",
                 "priority": "P3",
-                "reason": "Memory usage is high but immediate exhaustion risk is not yet proven.",
+                "reason": "内存使用率较高，但暂未证明即将耗尽，建议观察。",
             }
         return {
             "decision": "ignore",
             "priority": "P4",
-            "reason": "Current memory context does not support escalation.",
+            "reason": "当前内存上下文不足以支持升级处理。",
         }
 
     @staticmethod
@@ -508,18 +501,18 @@ class AIClient:
             return {
                 "decision": "notify",
                 "priority": "P1" if env == "prod" else "P2",
-                "reason": "Disk IO is saturated with high wait latency.",
+                "reason": "磁盘 IO 饱和且等待时间较高，需要尽快处理。",
             }
         if utilization >= 85 or queue_size >= 3:
             return {
                 "decision": "observe",
                 "priority": "P3",
-                "reason": "Disk IO is elevated and should be watched for sustained degradation.",
+                "reason": "磁盘 IO 偏高，建议观察是否持续恶化。",
             }
         return {
             "decision": "ignore",
             "priority": "P4",
-            "reason": "Disk IO context does not show critical contention.",
+            "reason": "当前磁盘 IO 上下文未显示严重争用。",
         }
 
     @staticmethod
@@ -533,10 +526,10 @@ class AIClient:
             return {
                 "decision": "notify",
                 "priority": "P1" if env == "prod" else "P2",
-                "reason": "Host appears unavailable from both ping and agent perspectives.",
+                "reason": "主机从 ping 和 agent 两个维度看都不可用，需要尽快处理。",
             }
         return {
             "decision": "observe",
             "priority": "P3",
-            "reason": "Availability signals are mixed and need observation.",
+            "reason": "可用性信号存在分歧，建议继续观察。",
         }

@@ -33,10 +33,10 @@ def test_judge_prompt_mentions_disk_and_cpu_guidelines():
         {"disk_summary": {"used_percent": 96.0}},
     )
 
-    assert "Disk alerts must consider used_percent" in prompt
-    assert "CPU alerts must consider cpu_avg" in prompt
-    assert "Priority calibration:" in prompt
-    assert "Report-writing rules:" in prompt
+    assert "磁盘告警必须综合 used_percent" in prompt
+    assert "CPU 告警必须综合 cpu_avg" in prompt
+    assert "优先级口径:" in prompt
+    assert "报告写作规则:" in prompt
 
 
 def test_stub_judge_notifies_for_critical_disk_exhaustion():

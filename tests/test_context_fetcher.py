@@ -19,6 +19,9 @@ class _FakeZabbixClient:
     def get_availability_summary(self, alert):
         return {"ping_status": "down"}
 
+    def get_raw_context(self, alert, needs):
+        return {"host": {"host_name": "demo"}, "items": {"metric_summary": [{"key": "system.cpu.util"}]}}
+
 
 class _FakeGraphClient:
     def resolve_topology(self, alert):
@@ -42,3 +45,4 @@ def test_fetch_context_supports_new_context_types():
     assert context["disk_io_summary"]["utilization_percent"] == 93
     assert context["availability_summary"]["ping_status"] == "down"
     assert context["alert_history"]["resolved"] is False
+    assert context["zabbix_raw"]["host"]["host_name"] == "demo"

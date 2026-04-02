@@ -87,6 +87,47 @@ class ZabbixClient:
 
         return self._stub_metric_summary(alert)
 
+    def get_raw_context(self, alert: dict, needs: list[str]) -> dict:
+        if self.use_stub:
+            return {}
+
+        try:
+            host_id = self._resolve_host_id(alert)
+            if not host_id:
+                return {}
+
+            items = self._get_host_items(host_id)
+            raw = {
+                "host": {
+                    "host_id": host_id,
+                    "host_name": alert.get("host_name"),
+                    "host_ip": alert.get("host_ip"),
+                },
+                "items": {},
+            }
+
+            if "metric_summary" in needs:
+                raw["items"]["metric_summary"] = self._collect_items(items, ["system.cpu.util", "system.cpu.load"])
+
+            if "disk_summary" in needs:
+                mount_point = alert.get("resource_scope", {}).get("mount_point")
+                if mount_point:
+                    raw["items"]["disk_summary"] = self._collect_items(items, [f"vfs.fs.size[{mount_point},"])
+
+            if "memory_summary" in needs:
+                raw["items"]["memory_summary"] = self._collect_items(items, ["vm.memory.util", "vm.memory.size["])
+
+            if "disk_io_summary" in needs:
+                raw["items"]["disk_io_summary"] = self._collect_items(items, ['perf_counter_en["\\\\PhysicalDisk'])
+
+            if "availability_summary" in needs:
+                raw["items"]["availability_summary"] = self._collect_items(items, ["agent.ping", "system.uptime"])
+
+            return raw
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Zabbix raw context query failed: %s", exc)
+            return {}
+
     def get_disk_summary(self, alert: dict) -> dict:
         if self.use_stub:
             return self._stub_disk_summary(alert)
@@ -103,16 +144,29 @@ class ZabbixClient:
             items = self._get_host_items(host_id)
             used_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},pused]"])
             free_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},free]"])
+            used_bytes_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},used]"])
             total_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},total]"])
 
             used_values = self._get_numeric_history(used_item["itemid"], used_item["value_type"]) if used_item else []
             free_values = self._get_numeric_history(free_item["itemid"], free_item["value_type"]) if free_item else []
+            used_bytes_values = self._get_numeric_history(used_bytes_item["itemid"], used_bytes_item["value_type"]) if used_bytes_item else []
             total_values = self._get_numeric_history(total_item["itemid"], total_item["value_type"]) if total_item else []
 
             if used_values:
-                latest_free = free_values[-1] if free_values else 0
-                free_24h_ago = free_values[0] if len(free_values) > 1 else latest_free
                 latest_total = total_values[-1] if total_values else 0
+                latest_used_bytes = used_bytes_values[-1] if used_bytes_values else 0
+                used_bytes_24h_ago = used_bytes_values[0] if len(used_bytes_values) > 1 else latest_used_bytes
+
+                if free_values:
+                    latest_free = free_values[-1]
+                    free_24h_ago = free_values[0] if len(free_values) > 1 else latest_free
+                elif latest_total and latest_used_bytes:
+                    latest_free = max(latest_total - latest_used_bytes, 0)
+                    free_24h_ago = max(latest_total - used_bytes_24h_ago, 0)
+                else:
+                    latest_free = 0
+                    free_24h_ago = 0
+
                 return {
                     "mount_point": mount_point,
                     "used_percent": round(used_values[-1], 2),
@@ -274,6 +328,20 @@ class ZabbixClient:
         if result:
             return result[0]["hostid"]
 
+        host_name = alert.get("host_name")
+        if host_name:
+            result = self._rpc(
+                "host.get",
+                params={
+                    "output": ["hostid", "host", "name"],
+                    "search": {"name": host_name},
+                    "searchByAny": True,
+                },
+                auth=self.login(),
+            )
+            if result:
+                return result[0]["hostid"]
+
         ip = alert.get("host_ip")
         if not ip:
             return None
@@ -295,12 +363,30 @@ class ZabbixClient:
         return self._rpc(
             "item.get",
             params={
-                "output": ["itemid", "key_", "name", "value_type"],
+                "output": ["itemid", "key_", "name", "value_type", "lastvalue", "units"],
                 "hostids": host_id,
                 "sortfield": "name",
             },
             auth=self.login(),
         )
+
+    @staticmethod
+    def _collect_items(items: list[dict], key_prefixes: list[str]) -> list[dict]:
+        collected = []
+        for item in items:
+            key_name = item.get("key_", "")
+            if any(key_name.startswith(prefix) for prefix in key_prefixes):
+                collected.append(
+                    {
+                        "itemid": item.get("itemid"),
+                        "name": item.get("name"),
+                        "key": key_name,
+                        "value_type": item.get("value_type"),
+                        "lastvalue": item.get("lastvalue"),
+                        "units": item.get("units"),
+                    }
+                )
+        return collected
 
     @staticmethod
     def _find_metric_item(items: list[dict], key_prefixes: list[str]) -> dict | None:

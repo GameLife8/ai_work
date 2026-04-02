@@ -34,6 +34,10 @@ class ContextFetcher:
         if "alert_history" in needs:
             context["alert_history"] = self._build_alert_history(alert)
 
+        raw_context = self.zabbix_client.get_raw_context(alert, needs)
+        if raw_context:
+            context["zabbix_raw"] = raw_context
+
         return context
 
     @staticmethod

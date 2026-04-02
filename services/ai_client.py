@@ -101,6 +101,9 @@ class AIClient:
                 'Return JSON only with shape: {"needs": [...]}',
                 "Allowed needs: metric_summary, disk_summary, memory_summary, disk_io_summary, availability_summary, topology, related_incidents, alert_history",
                 "Do not output markdown or extra keys.",
+                "You must choose needs conservatively and deterministically.",
+                "If the alert clearly matches one signal family, request the matching context family first.",
+                "Do not request unrelated context blocks just because they might be interesting.",
                 "Planning rules:",
                 "1. Disk alerts need disk_summary, related_incidents, and alert_history.",
                 "2. CPU alerts need metric_summary, related_incidents, and alert_history.",
@@ -110,6 +113,15 @@ class AIClient:
                 "6. If service or cluster blast radius may matter, add topology.",
                 "7. Resolved alerts should still request related_incidents and alert_history.",
                 "8. Request the minimum sufficient set.",
+                "Need-selection hints:",
+                "- disk_summary is for filesystem capacity risk, remaining space, and growth trend.",
+                "- metric_summary is for CPU pressure and load correlation.",
+                "- memory_summary is for memory pressure, available capacity, and swap pressure.",
+                "- disk_io_summary is for storage contention, wait latency, and queue backlog.",
+                "- availability_summary is for host or agent reachability.",
+                "- related_incidents is for merge or suppression decisions.",
+                "- alert_history is for distinguishing fresh faults from recoveries.",
+                "- topology is for blast-radius and service impact decisions.",
                 "Alert payload:",
                 json.dumps(
                     {
@@ -139,6 +151,9 @@ class AIClient:
                 "checks_performed must be a string array.",
                 "evidence must be an object summarizing the key metrics you relied on.",
                 "recommendations must be a string array with concrete next actions.",
+                "Your response must be stable, concise, and operational.",
+                "Do not hedge with long essays. Use the evidence you have.",
+                "If a field is missing, do not invent it. Prefer observe when uncertainty is material.",
                 "Decision rules:",
                 "1. If related_incidents already contains a matching open incident, prefer merge.",
                 "2. If alert status is resolved, prefer ignore unless it should merge into an open incident.",
@@ -151,6 +166,33 @@ class AIClient:
                 "9. Production equivalent impact should have higher priority than non-prod.",
                 "10. If evidence is incomplete, prefer observe rather than over-escalating.",
                 "11. Keep reason concise, concrete, and operational.",
+                "Priority calibration:",
+                "- P1: immediate or imminent service-impact risk, likely urgent human action required.",
+                "- P2: serious degradation risk, needs timely action, but not yet immediate outage.",
+                "- P3: notable anomaly that should be watched or triaged soon.",
+                "- P4: resolved, low-risk, or insufficiently supported for escalation.",
+                "Decision calibration:",
+                "- notify: send human-visible escalation now.",
+                "- observe: do not ignore, but wait and continue monitoring.",
+                "- merge: attach to an existing active incident.",
+                "- ignore: recovery or clearly low-value signal.",
+                "Type-specific judgment guide:",
+                "- Disk: prioritize free_gb exhaustion risk over raw percentage when they disagree.",
+                "- Disk: high used_percent plus sharp growth should increase urgency.",
+                "- CPU: high cpu_max alone is weaker evidence than high cpu_avg plus high load_avg.",
+                "- Memory: low available_gb or high swap pressure increases urgency sharply.",
+                "- Disk IO: high queue_size with high await_ms suggests real contention, not just throughput.",
+                "- Host-down: if both ping and agent are down, assume stronger outage risk.",
+                "Report-writing rules:",
+                "- summary should be 1-2 sentences.",
+                "- checks_performed should describe the concrete validations you used.",
+                "- evidence should only contain fields actually present in context or alert.",
+                "- priority_rationale should explain why this priority, not just repeat the decision.",
+                "- recommendations should be concrete operator actions, not generic advice.",
+                "Recommendation style guide:",
+                "- Prefer 3-5 short, executable actions.",
+                "- Start with validation or containment, then remediation, then longer-term follow-up.",
+                "- Mention the specific host, mount, metric, or symptom when useful.",
                 "Alert payload:",
                 json.dumps(
                     {
@@ -168,6 +210,31 @@ class AIClient:
                 ),
                 "Context payload:",
                 json.dumps(context, ensure_ascii=False),
+                "Output example skeleton:",
+                json.dumps(
+                    {
+                        "decision": "notify",
+                        "priority": "P2",
+                        "reason": "Short operational reason here.",
+                        "merge_target_incident_no": None,
+                        "report": {
+                            "summary": "One or two sentence conclusion.",
+                            "checks_performed": [
+                                "Checked key metric A.",
+                                "Checked correlation metric B.",
+                            ],
+                            "evidence": {
+                                "example_metric": 123
+                            },
+                            "priority_rationale": "Explain why this is P1/P2/P3/P4.",
+                            "recommendations": [
+                                "Do first operator action.",
+                                "Do second operator action."
+                            ]
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
             ]
         )
 

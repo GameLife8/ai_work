@@ -190,8 +190,8 @@ class ZabbixClient:
                 return self._stub_memory_summary(alert)
 
             items = self._get_host_items(host_id)
-            util_item = self._find_metric_item(items, ["vm.memory.util"])
-            free_item = self._find_metric_item(items, ["vm.memory.size[free]"])
+            util_item = self._find_metric_item(items, ["vm.memory.util", "vm.memory.utilization"])
+            free_item = self._find_metric_item(items, ["vm.memory.size[free]", "vm.memory.size[available]"])
             total_item = self._find_metric_item(items, ["vm.memory.size[total]"])
 
             util_values = self._get_numeric_history(util_item["itemid"], util_item["value_type"]) if util_item else []
@@ -317,6 +317,10 @@ class ZabbixClient:
         return token
 
     def _resolve_host_id(self, alert: dict) -> str | None:
+        host_id = str(alert.get("host_id", "")).strip()
+        if host_id:
+            return host_id
+
         result = self._rpc(
             "host.get",
             params={

@@ -17,7 +17,7 @@ class _DiskClient(ZabbixClient):
             {"itemid": "3", "key_": "vfs.fs.size[/mnt/data01,total]", "name": "", "value_type": "3"},
         ]
 
-    def _get_numeric_history(self, item_id, value_type):
+    def _get_numeric_history(self, item_id, value_type, alert=None):
         history = {
             "1": [88.9, 88.91],
             "2": [1717986918400, 1954210111488],

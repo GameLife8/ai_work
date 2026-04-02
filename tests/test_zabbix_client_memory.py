@@ -17,7 +17,7 @@ class _MemoryClient(ZabbixClient):
             {"itemid": "3", "key_": "vm.memory.size[total]", "name": "", "value_type": "3"},
         ]
 
-    def _get_numeric_history(self, item_id, value_type):
+    def _get_numeric_history(self, item_id, value_type, alert=None):
         history = {
             "1": [80.12, 83.21],
             "2": [6442450944, 5651509248],

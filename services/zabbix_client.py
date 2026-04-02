@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import logging
+from datetime import UTC, datetime
 from statistics import mean
+from zoneinfo import ZoneInfo
 
 import requests
 
 
 logger = logging.getLogger(__name__)
+
+SAMPLE_INTERVAL_SECONDS = 300
+SAMPLE_POINTS = 12
+DEFAULT_EVENT_TIMEZONE = ZoneInfo("Asia/Shanghai")
 
 
 class ZabbixClient:
@@ -69,18 +75,19 @@ class ZabbixClient:
 
             item = self._find_metric_item(items, ["system.cpu.util", "system.cpu.util[,system,avg1]"])
             if item:
-                values = self._get_numeric_history(item["itemid"], item["value_type"])
+                values = self._get_numeric_history(item["itemid"], item["value_type"], alert)
                 if values:
                     summary["cpu_avg"] = round(mean(values), 2)
                     summary["cpu_max"] = round(max(values), 2)
 
             load_item = self._find_metric_item(items, ["system.cpu.load", "system.cpu.load[all,avg1]"])
             if load_item:
-                values = self._get_numeric_history(load_item["itemid"], load_item["value_type"])
+                values = self._get_numeric_history(load_item["itemid"], load_item["value_type"], alert)
                 if values:
                     summary["load_avg"] = round(mean(values), 2)
 
             if {"cpu_avg", "cpu_max", "load_avg"} <= summary.keys():
+                summary.update(self._sample_window_metadata())
                 return summary
         except Exception as exc:  # pragma: no cover
             logger.warning("Zabbix metric query failed, falling back to stub: %s", exc)
@@ -107,21 +114,23 @@ class ZabbixClient:
             }
 
             if "metric_summary" in needs:
-                raw["items"]["metric_summary"] = self._collect_items(items, ["system.cpu.util", "system.cpu.load"])
+                raw["items"]["metric_summary"] = self._collect_items(items, ["system.cpu.util", "system.cpu.load"], alert)
 
             if "disk_summary" in needs:
                 mount_point = alert.get("resource_scope", {}).get("mount_point")
                 if mount_point:
-                    raw["items"]["disk_summary"] = self._collect_items(items, [f"vfs.fs.size[{mount_point},"])
+                    raw["items"]["disk_summary"] = self._collect_items(items, [f"vfs.fs.size[{mount_point},"], alert)
 
             if "memory_summary" in needs:
-                raw["items"]["memory_summary"] = self._collect_items(items, ["vm.memory.util", "vm.memory.size["])
+                raw["items"]["memory_summary"] = self._collect_items(items, ["vm.memory.util", "vm.memory.size["], alert)
 
             if "disk_io_summary" in needs:
-                raw["items"]["disk_io_summary"] = self._collect_items(items, ['perf_counter_en["\\\\PhysicalDisk'])
+                raw["items"]["disk_io_summary"] = self._collect_items(items, ['perf_counter_en["\\\\PhysicalDisk'], alert)
 
             if "availability_summary" in needs:
-                raw["items"]["availability_summary"] = self._collect_items(items, ["agent.ping", "system.uptime"])
+                raw["items"]["availability_summary"] = self._collect_items(items, ["agent.ping", "system.uptime"], alert)
+
+            raw["sample_window"] = self._sample_window_metadata()
 
             return raw
         except Exception as exc:  # pragma: no cover
@@ -147,10 +156,10 @@ class ZabbixClient:
             used_bytes_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},used]"])
             total_item = self._find_metric_item(items, [f"vfs.fs.size[{mount_point},total]"])
 
-            used_values = self._get_numeric_history(used_item["itemid"], used_item["value_type"]) if used_item else []
-            free_values = self._get_numeric_history(free_item["itemid"], free_item["value_type"]) if free_item else []
-            used_bytes_values = self._get_numeric_history(used_bytes_item["itemid"], used_bytes_item["value_type"]) if used_bytes_item else []
-            total_values = self._get_numeric_history(total_item["itemid"], total_item["value_type"]) if total_item else []
+            used_values = self._get_numeric_history(used_item["itemid"], used_item["value_type"], alert) if used_item else []
+            free_values = self._get_numeric_history(free_item["itemid"], free_item["value_type"], alert) if free_item else []
+            used_bytes_values = self._get_numeric_history(used_bytes_item["itemid"], used_bytes_item["value_type"], alert) if used_bytes_item else []
+            total_values = self._get_numeric_history(total_item["itemid"], total_item["value_type"], alert) if total_item else []
 
             if used_values:
                 latest_total = total_values[-1] if total_values else 0
@@ -174,6 +183,7 @@ class ZabbixClient:
                     "total_gb": round(latest_total / 1024 / 1024 / 1024, 2) if latest_total else 0,
                     "growth_gb_24h": round((free_24h_ago - latest_free) / 1024 / 1024 / 1024, 2),
                     "trend": "sharp_increase" if free_24h_ago - latest_free > 20 * 1024 * 1024 * 1024 else "gradual",
+                    **self._sample_window_metadata(),
                 }
         except Exception as exc:  # pragma: no cover
             logger.warning("Zabbix disk query failed, falling back to stub: %s", exc)
@@ -194,9 +204,9 @@ class ZabbixClient:
             free_item = self._find_metric_item(items, ["vm.memory.size[free]", "vm.memory.size[available]"])
             total_item = self._find_metric_item(items, ["vm.memory.size[total]"])
 
-            util_values = self._get_numeric_history(util_item["itemid"], util_item["value_type"]) if util_item else []
-            free_values = self._get_numeric_history(free_item["itemid"], free_item["value_type"]) if free_item else []
-            total_values = self._get_numeric_history(total_item["itemid"], total_item["value_type"]) if total_item else []
+            util_values = self._get_numeric_history(util_item["itemid"], util_item["value_type"], alert) if util_item else []
+            free_values = self._get_numeric_history(free_item["itemid"], free_item["value_type"], alert) if free_item else []
+            total_values = self._get_numeric_history(total_item["itemid"], total_item["value_type"], alert) if total_item else []
             if util_values:
                 latest_free = free_values[-1] if free_values else 0
                 latest_total = total_values[-1] if total_values else 0
@@ -206,6 +216,7 @@ class ZabbixClient:
                     "total_gb": round(latest_total / 1024 / 1024 / 1024, 2) if latest_total else 0,
                     "swap_used_percent": 0.0,
                     "trend": "rising_fast" if len(util_values) > 1 and util_values[-1] - util_values[0] >= 8 else "stable",
+                    **self._sample_window_metadata(),
                 }
         except Exception as exc:  # pragma: no cover
             logger.warning("Zabbix memory query failed, falling back to stub: %s", exc)
@@ -227,10 +238,10 @@ class ZabbixClient:
             read_await_item = self._find_metric_item(items, ['Avg. Disk sec/Read'])
             write_await_item = self._find_metric_item(items, ['Avg. Disk sec/Write'])
 
-            queue_values = self._get_numeric_history(queue_item["itemid"], queue_item["value_type"]) if queue_item else []
-            idle_values = self._get_numeric_history(idle_item["itemid"], idle_item["value_type"]) if idle_item else []
-            read_await_values = self._get_numeric_history(read_await_item["itemid"], read_await_item["value_type"]) if read_await_item else []
-            write_await_values = self._get_numeric_history(write_await_item["itemid"], write_await_item["value_type"]) if write_await_item else []
+            queue_values = self._get_numeric_history(queue_item["itemid"], queue_item["value_type"], alert) if queue_item else []
+            idle_values = self._get_numeric_history(idle_item["itemid"], idle_item["value_type"], alert) if idle_item else []
+            read_await_values = self._get_numeric_history(read_await_item["itemid"], read_await_item["value_type"], alert) if read_await_item else []
+            write_await_values = self._get_numeric_history(write_await_item["itemid"], write_await_item["value_type"], alert) if write_await_item else []
 
             if queue_values or idle_values:
                 latest_idle = idle_values[-1] if idle_values else 100.0
@@ -242,6 +253,7 @@ class ZabbixClient:
                     "await_ms": round(await_ms, 2),
                     "queue_size": round(queue_values[-1], 2) if queue_values else 0.0,
                     "trend": "sustained_high" if len(queue_values) > 1 and max(queue_values) >= 3 else "moderate",
+                    **self._sample_window_metadata(),
                 }
         except Exception as exc:  # pragma: no cover
             logger.warning("Zabbix disk IO query failed, falling back to stub: %s", exc)
@@ -260,14 +272,15 @@ class ZabbixClient:
             items = self._get_host_items(host_id)
             agent_ping_item = self._find_metric_item(items, ["agent.ping"])
             uptime_item = self._find_metric_item(items, ["system.uptime"])
-            ping_values = self._get_numeric_history(agent_ping_item["itemid"], agent_ping_item["value_type"]) if agent_ping_item else []
-            uptime_values = self._get_numeric_history(uptime_item["itemid"], uptime_item["value_type"]) if uptime_item else []
+            ping_values = self._get_numeric_history(agent_ping_item["itemid"], agent_ping_item["value_type"], alert) if agent_ping_item else []
+            uptime_values = self._get_numeric_history(uptime_item["itemid"], uptime_item["value_type"], alert) if uptime_item else []
             ping_status = "up" if ping_values and ping_values[-1] >= 1 else "down"
             agent_status = ping_status
             return {
                 "ping_status": ping_status,
                 "agent_status": agent_status,
                 "last_seen_minutes_ago": 0 if uptime_values else 10,
+                **self._sample_window_metadata(),
             }
         except Exception as exc:  # pragma: no cover
             logger.warning("Zabbix availability query failed, falling back to stub: %s", exc)
@@ -374,12 +387,12 @@ class ZabbixClient:
             auth=self.login(),
         )
 
-    @staticmethod
-    def _collect_items(items: list[dict], key_prefixes: list[str]) -> list[dict]:
+    def _collect_items(self, items: list[dict], key_prefixes: list[str], alert: dict) -> list[dict]:
         collected = []
         for item in items:
             key_name = item.get("key_", "")
             if any(key_name.startswith(prefix) for prefix in key_prefixes):
+                samples = self._get_sampled_history(item.get("itemid", ""), item.get("value_type", 0), alert)
                 collected.append(
                     {
                         "itemid": item.get("itemid"),
@@ -388,6 +401,7 @@ class ZabbixClient:
                         "value_type": item.get("value_type"),
                         "lastvalue": item.get("lastvalue"),
                         "units": item.get("units"),
+                        "samples": samples,
                     }
                 )
         return collected
@@ -400,7 +414,14 @@ class ZabbixClient:
                 return item
         return None
 
-    def _get_numeric_history(self, item_id: str, value_type: int | str) -> list[float]:
+    def _get_numeric_history(self, item_id: str, value_type: int | str, alert: dict | None = None) -> list[float]:
+        samples = self._get_sampled_history(item_id, value_type, alert)
+        if samples:
+            return [sample["value"] for sample in samples]
+
+        if alert is None:
+            return []
+
         history_type = int(value_type)
         result = self._rpc(
             "history.get",
@@ -421,6 +442,101 @@ class ZabbixClient:
             except (KeyError, TypeError, ValueError):
                 continue
         return list(reversed(values))
+
+    @staticmethod
+    def _sample_window_metadata() -> dict:
+        return {
+            "sample_window_minutes": int(SAMPLE_INTERVAL_SECONDS * SAMPLE_POINTS / 60),
+            "sample_interval_minutes": int(SAMPLE_INTERVAL_SECONDS / 60),
+            "sample_count": SAMPLE_POINTS,
+        }
+
+    def _get_sampled_history(self, item_id: str, value_type: int | str, alert: dict | None) -> list[dict]:
+        if not item_id:
+            return []
+
+        history_type = int(value_type)
+        sample_times = self._build_sample_times(alert)
+        window_start = sample_times[0] - SAMPLE_INTERVAL_SECONDS
+        result = self._rpc(
+            "history.get",
+            params={
+                "output": "extend",
+                "history": history_type,
+                "itemids": [item_id],
+                "sortfield": "clock",
+                "sortorder": "ASC",
+                "time_from": window_start,
+                "time_till": sample_times[-1],
+                "limit": 2000,
+            },
+            auth=self.login(),
+        )
+
+        rows = []
+        for row in result:
+            try:
+                rows.append({"clock": int(row["clock"]), "value": float(row["value"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        if not rows:
+            return []
+
+        samples = []
+        row_index = 0
+        last_seen = None
+        for sample_clock in sample_times:
+            while row_index < len(rows) and rows[row_index]["clock"] <= sample_clock:
+                last_seen = rows[row_index]
+                row_index += 1
+            if last_seen is None:
+                continue
+            samples.append(
+                {
+                    "clock": sample_clock,
+                    "time": datetime.fromtimestamp(sample_clock, UTC).isoformat(),
+                    "value": round(last_seen["value"], 6),
+                    "source_clock": last_seen["clock"],
+                    "source_time": datetime.fromtimestamp(last_seen["clock"], UTC).isoformat(),
+                }
+            )
+        return samples
+
+    def _build_sample_times(self, alert: dict | None) -> list[int]:
+        end_ts = self._resolve_reference_timestamp(alert)
+        start_ts = end_ts - (SAMPLE_POINTS - 1) * SAMPLE_INTERVAL_SECONDS
+        return [start_ts + index * SAMPLE_INTERVAL_SECONDS for index in range(SAMPLE_POINTS)]
+
+    @staticmethod
+    def _resolve_reference_timestamp(alert: dict | None) -> int:
+        if not alert:
+            return int(datetime.now(UTC).timestamp())
+
+        raw_event_time = str(alert.get("event_time", "")).strip()
+        if not raw_event_time:
+            return int(datetime.now(UTC).timestamp())
+
+        parsed = ZabbixClient._parse_event_time(raw_event_time)
+        return int(parsed.timestamp())
+
+    @staticmethod
+    def _parse_event_time(raw_event_time: str) -> datetime:
+        try:
+            parsed = datetime.fromisoformat(raw_event_time)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=DEFAULT_EVENT_TIMEZONE)
+            return parsed.astimezone(UTC)
+        except ValueError:
+            pass
+
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y.%m.%d %H:%M:%S"):
+            try:
+                parsed = datetime.strptime(raw_event_time, fmt)
+                return parsed.replace(tzinfo=DEFAULT_EVENT_TIMEZONE).astimezone(UTC)
+            except ValueError:
+                continue
+        return datetime.now(UTC)
 
     def _rpc(self, method: str, params: dict, auth: str | None = None):
         self._request_id += 1

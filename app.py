@@ -34,7 +34,10 @@ def create_app() -> Flask:
     incident_service = IncidentService(store)
     context_fetcher = ContextFetcher(zabbix_client, graph_client, incident_service)
     ai_client = AIClient(
+        provider=app.config["AI_PROVIDER"],
         base_url=app.config["AI_BASE_URL"],
+        api_key=app.config["AI_API_KEY"],
+        model=app.config["AI_MODEL"],
         timeout_seconds=app.config["AI_TIMEOUT_SECONDS"],
         use_stub=app.config["USE_STUB_AI"],
     )

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import logging
+import re
 
 import requests
 
@@ -9,82 +11,119 @@ logger = logging.getLogger(__name__)
 
 
 class AIClient:
-    def __init__(self, base_url: str, timeout_seconds: int, use_stub: bool = True) -> None:
+    def __init__(
+        self,
+        provider: str,
+        base_url: str,
+        api_key: str,
+        model: str,
+        timeout_seconds: int,
+        use_stub: bool = True,
+    ) -> None:
+        self.provider = provider
         self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.model = model
         self.timeout_seconds = timeout_seconds
         self.use_stub = use_stub
 
     def plan_context(self, alert: dict) -> dict:
-        payload = {
-            "prompt": self._build_plan_prompt(alert),
-            "alert": {
-                "alert_name": alert["alert_name"],
-                "host_name": alert["host_name"],
-                "host_ip": alert["host_ip"],
-                "severity": alert["severity"],
-                "status": alert["status"],
-                "tags": alert["tags"],
-                "alert_type": alert.get("alert_type"),
-                "resource_scope": alert.get("resource_scope", {}),
-                "signal": alert.get("signal", {}),
-            },
-        }
-        return self._post_json("/plan_context", payload, fallback=self._stub_plan(alert))
+        prompt = self._build_plan_prompt(alert)
+        fallback = self._stub_plan(alert)
+        return self._call_model_json(prompt=prompt, fallback=fallback)
 
     def judge_alert(self, alert: dict, context: dict) -> dict:
-        payload = {
-            "prompt": self._build_judge_prompt(alert, context),
-            "alert": {
-                "alert_name": alert["alert_name"],
-                "host_name": alert["host_name"],
-                "host_ip": alert["host_ip"],
-                "severity": alert["severity"],
-                "status": alert["status"],
-                "tags": alert["tags"],
-                "alert_type": alert.get("alert_type"),
-                "resource_scope": alert.get("resource_scope", {}),
-                "signal": alert.get("signal", {}),
-            },
-            "context": context,
-        }
-        return self._post_json("/judge_alert", payload, fallback=self._stub_judge(alert, context))
+        prompt = self._build_judge_prompt(alert, context)
+        fallback = self._stub_judge(alert, context)
+        return self._call_model_json(prompt=prompt, fallback=fallback)
 
-    def _post_json(self, path: str, payload: dict, fallback: dict) -> dict:
+    def _call_model_json(self, prompt: str, fallback: dict) -> dict:
         if self.use_stub:
             return fallback
+        if self.provider != "volcengine_coding":
+            return self._call_legacy_json(prompt, fallback)
+        if not self.api_key or not self.model:
+            logger.warning("AI API key or model is missing, falling back to local rule.")
+            return fallback
 
-        url = f"{self.base_url}{path}"
+        url = f"{self.base_url}/chat/completions"
+        payload = {
+            "model": self.model,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are a strict JSON-only infrastructure alert assistant.",
+                },
+                {
+                    "role": "user",
+                    "content": prompt,
+                },
+            ],
+            "temperature": 0.1,
+        }
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
         try:
-            response = requests.post(url, json=payload, timeout=self.timeout_seconds)
+            response = requests.post(url, json=payload, headers=headers, timeout=self.timeout_seconds)
+            response.raise_for_status()
+            data = response.json()
+            message = data["choices"][0]["message"]["content"]
+            parsed = self._extract_json_object(message)
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Volcengine AI call failed, falling back to local rule: %s", exc)
+        return fallback
+
+    def _call_legacy_json(self, prompt: str, fallback: dict) -> dict:
+        try:
+            response = requests.post(
+                self.base_url,
+                json={"prompt": prompt},
+                timeout=self.timeout_seconds,
+            )
             response.raise_for_status()
             data = response.json()
             if isinstance(data, dict):
                 return data
         except Exception as exc:  # pragma: no cover
-            logger.warning("AI call failed, falling back to local rule: %s", exc)
+            logger.warning("Legacy AI call failed, falling back to local rule: %s", exc)
         return fallback
 
     def _build_plan_prompt(self, alert: dict) -> str:
         return "\n".join(
             [
                 "You are an alert-context planner for infrastructure incidents.",
-                "Your task is to decide which local context blocks are required before final judgment.",
                 'Return JSON only with shape: {"needs": [...]}',
                 "Allowed needs: metric_summary, disk_summary, memory_summary, disk_io_summary, availability_summary, topology, related_incidents, alert_history",
-                "Do not give explanations, markdown, or extra keys.",
+                "Do not output markdown or extra keys.",
                 "Planning rules:",
-                "1. If alert_type is disk, request disk_summary, related_incidents, and alert_history.",
-                "2. If alert_type is cpu, request metric_summary, related_incidents, and alert_history.",
-                "3. If alert_type is memory, request memory_summary, related_incidents, and alert_history.",
-                "4. If alert_type is disk_io, request disk_io_summary, related_incidents, and alert_history.",
-                "5. If alert_type is host_down, request availability_summary, related_incidents, and alert_history.",
-                "6. If service or topology may affect blast radius, request topology.",
-                "7. For resolved alerts, still request related_incidents and alert_history so downstream can decide closure or suppression.",
-                "8. Prefer the smallest sufficient need set.",
-                f"Current alert_type: {alert.get('alert_type', 'generic')}",
-                f"Current status: {alert.get('status', 'problem')}",
-                f"Current resource_scope: {alert.get('resource_scope', {})}",
-                f"Current signal: {alert.get('signal', {})}",
+                "1. Disk alerts need disk_summary, related_incidents, and alert_history.",
+                "2. CPU alerts need metric_summary, related_incidents, and alert_history.",
+                "3. Memory alerts need memory_summary, related_incidents, and alert_history.",
+                "4. Disk IO alerts need disk_io_summary, related_incidents, and alert_history.",
+                "5. Host-down alerts need availability_summary, related_incidents, and alert_history.",
+                "6. If service or cluster blast radius may matter, add topology.",
+                "7. Resolved alerts should still request related_incidents and alert_history.",
+                "8. Request the minimum sufficient set.",
+                "Alert payload:",
+                json.dumps(
+                    {
+                        "alert_name": alert.get("alert_name"),
+                        "host_name": alert.get("host_name"),
+                        "host_ip": alert.get("host_ip"),
+                        "severity": alert.get("severity"),
+                        "status": alert.get("status"),
+                        "tags": alert.get("tags", {}),
+                        "alert_type": alert.get("alert_type"),
+                        "resource_scope": alert.get("resource_scope", {}),
+                        "signal": alert.get("signal", {}),
+                    },
+                    ensure_ascii=False,
+                ),
             ]
         )
 
@@ -92,30 +131,50 @@ class AIClient:
         return "\n".join(
             [
                 "You are an infrastructure alert judge.",
-                "Return JSON only with keys: decision, priority, reason, merge_target_incident_no (optional).",
+                'Return JSON only with keys: {"decision":"...", "priority":"...", "reason":"...", "merge_target_incident_no":"optional"}',
                 "Allowed decision values: notify, observe, merge, ignore.",
                 "Allowed priority values: P1, P2, P3, P4.",
-                "Reason must be concise and action-oriented.",
-                "Judgment rules:",
+                "Decision rules:",
                 "1. If related_incidents already contains a matching open incident, prefer merge.",
-                "2. If alert status is resolved, prefer ignore unless it clearly updates an open incident.",
-                "3. Disk alerts must consider used_percent, free_gb, total_gb, and growth_gb_24h.",
-                "4. For disk alerts, rapid consumption is more urgent than slow consumption at the same percentage.",
+                "2. If alert status is resolved, prefer ignore unless it should merge into an open incident.",
+                "3. Disk alerts must consider used_percent, free_gb, total_gb, growth_gb_24h, and trend.",
+                "4. Disk alerts with very low remaining free space or very rapid growth are urgent.",
                 "5. CPU alerts must consider cpu_avg, cpu_max, and load_avg together.",
                 "6. Memory alerts must consider memory_used_percent, available_gb, swap_used_percent, and trend.",
-                "7. Disk IO alerts must consider utilization_percent, await_ms, queue_size, and sustained duration.",
-                "8. Host-down alerts must consider ping status, agent status, and recent availability history.",
-                "9. Production environment should raise priority by one level compared with non-prod when impact is equivalent.",
-                "10. If evidence is incomplete, use observe instead of over-escalating.",
-                "11. Ignore only when context clearly shows low risk or recovery.",
-                f"Current alert_type: {alert.get('alert_type', 'generic')}",
-                f"Current status: {alert.get('status', 'problem')}",
-                f"Current tags: {alert.get('tags', {})}",
-                f"Current resource_scope: {alert.get('resource_scope', {})}",
-                f"Current signal: {alert.get('signal', {})}",
-                f"Context keys: {list(context.keys())}",
+                "7. Disk IO alerts must consider utilization_percent, await_ms, queue_size, and trend.",
+                "8. Host-down alerts must consider ping_status, agent_status, and last_seen_minutes_ago.",
+                "9. Production equivalent impact should have higher priority than non-prod.",
+                "10. If evidence is incomplete, prefer observe rather than over-escalating.",
+                "11. Keep reason concise, concrete, and operational.",
+                "Alert payload:",
+                json.dumps(
+                    {
+                        "alert_name": alert.get("alert_name"),
+                        "host_name": alert.get("host_name"),
+                        "host_ip": alert.get("host_ip"),
+                        "severity": alert.get("severity"),
+                        "status": alert.get("status"),
+                        "tags": alert.get("tags", {}),
+                        "alert_type": alert.get("alert_type"),
+                        "resource_scope": alert.get("resource_scope", {}),
+                        "signal": alert.get("signal", {}),
+                    },
+                    ensure_ascii=False,
+                ),
+                "Context payload:",
+                json.dumps(context, ensure_ascii=False),
             ]
         )
+
+    @staticmethod
+    def _extract_json_object(text: str) -> dict:
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", text, re.DOTALL)
+            if match:
+                return json.loads(match.group(0))
+            raise
 
     @staticmethod
     def _stub_plan(alert: dict) -> dict:

@@ -102,6 +102,28 @@ POST /api/v1/alerts/notification
 - 磁盘 IO / 磁盘吞吐异常
 - 主机不可达 / 关机 / agent 不可用
 
+## 火山引擎 AI 接入
+
+当前默认按火山引擎 Coding Plan 的 OpenAI 兼容接口配置：
+
+```text
+AI_PROVIDER=volcengine_coding
+AI_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+AI_MODEL=ark-code-latest
+```
+
+启用真实 AI 时只需要把 `.env` 或环境变量里的这几个值补上：
+
+```powershell
+$env:USE_STUB_AI="false"
+$env:AI_API_KEY="your-api-key"
+$env:AI_PROVIDER="volcengine_coding"
+$env:AI_BASE_URL="https://ark.cn-beijing.volces.com/api/coding/v3"
+$env:AI_MODEL="ark-code-latest"
+```
+
+当前实现会把详细的 Planner/Judge 提示词直接发给模型，并要求返回 JSON；如果火山接口失败，会自动回退到本地规则。
+
 ## 测试
 
 ```powershell

@@ -4,7 +4,7 @@ from services.ai_client import AIClient
 
 
 def test_plan_prompt_mentions_disk_specific_requirements():
-    client = AIClient(base_url="http://example.com", timeout_seconds=10, use_stub=True)
+    client = AIClient(provider="volcengine_coding", base_url="http://example.com", api_key="", model="", timeout_seconds=10, use_stub=True)
 
     prompt = client._build_plan_prompt(
         {
@@ -16,11 +16,11 @@ def test_plan_prompt_mentions_disk_specific_requirements():
     )
 
     assert "disk_summary" in prompt
-    assert "alert_type is disk" in prompt
+    assert "Disk alerts need disk_summary" in prompt
 
 
 def test_judge_prompt_mentions_disk_and_cpu_guidelines():
-    client = AIClient(base_url="http://example.com", timeout_seconds=10, use_stub=True)
+    client = AIClient(provider="volcengine_coding", base_url="http://example.com", api_key="", model="", timeout_seconds=10, use_stub=True)
 
     prompt = client._build_judge_prompt(
         {
@@ -65,3 +65,9 @@ def test_stub_judge_notifies_for_host_down():
 
     assert decision["decision"] == "notify"
     assert decision["priority"] == "P1"
+
+
+def test_extract_json_object_supports_wrapped_text():
+    parsed = AIClient._extract_json_object('result is {"needs":["disk_summary"]}')
+
+    assert parsed["needs"] == ["disk_summary"]

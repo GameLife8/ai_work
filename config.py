@@ -30,7 +30,10 @@ class Config:
     )
     STORE_BACKEND = os.getenv("STORE_BACKEND", "memory")
 
-    AI_BASE_URL = os.getenv("AI_BASE_URL", "http://127.0.0.1:8000")
+    AI_PROVIDER = os.getenv("AI_PROVIDER", "volcengine_coding")
+    AI_BASE_URL = os.getenv("AI_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
+    AI_API_KEY = os.getenv("AI_API_KEY", "")
+    AI_MODEL = os.getenv("AI_MODEL", "ark-code-latest")
     AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "10"))
 
     DEFAULT_CONTEXT_NEEDS = ["metric_summary", "topology", "related_incidents"]

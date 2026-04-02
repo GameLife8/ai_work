@@ -48,14 +48,14 @@ def test_stub_judge_notifies_for_critical_disk_exhaustion():
             "tags": {"env": "prod"},
             "resource_scope": {"mount_point": "/mnt/data01"},
         },
-        {"disk_summary": {"mount_point": "/mnt/data01", "used_percent": 98.0, "free_gb": 5.0, "growth_gb_24h": 30.0}},
+        {"disk_summary": {"mount_point": "/mnt/data01", "used_percent": 98.0, "free_gb": 5.0, "growth_gb_1h": 30.0}},
         AIClient._stub_judge(
             {
                 "alert_type": "disk",
                 "status": "problem",
                 "tags": {"env": "prod"},
             },
-            {"disk_summary": {"used_percent": 98.0, "free_gb": 5.0, "growth_gb_24h": 30.0}},
+            {"disk_summary": {"used_percent": 98.0, "free_gb": 5.0, "growth_gb_1h": 30.0}},
         ),
     )
 
@@ -117,4 +117,4 @@ def test_plan_prompt_mentions_need_selection_hints():
     prompt = client._build_plan_prompt({"alert_type": "host_down", "status": "problem", "tags": {}})
 
     assert "Need-selection hints:" in prompt
-    assert "availability_summary is for host or agent reachability." in prompt
+    assert "availability_summary is for host or agent reachability in the same sample window." in prompt

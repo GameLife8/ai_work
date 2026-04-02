@@ -113,13 +113,13 @@ class AIClient:
                 "6. If service or cluster blast radius may matter, add topology.",
                 "7. Resolved alerts should still request related_incidents and alert_history.",
                 "8. Request the minimum sufficient set.",
-                "9. If later context contains zabbix_raw, prefer using those original items for final reasoning.",
+                "9. If later context contains zabbix_raw, prefer using those original items and sampled history for final reasoning.",
                 "Need-selection hints:",
-                "- disk_summary is for filesystem capacity risk, remaining space, and growth trend.",
-                "- metric_summary is for CPU pressure and load correlation.",
-                "- memory_summary is for memory pressure, available capacity, and swap pressure.",
-                "- disk_io_summary is for storage contention, wait latency, and queue backlog.",
-                "- availability_summary is for host or agent reachability.",
+                "- disk_summary is for filesystem capacity risk, remaining space, and one-hour growth trend from 12 samples.",
+                "- metric_summary is for CPU pressure and load correlation over the previous one-hour sample window.",
+                "- memory_summary is for memory pressure, available capacity, and one-hour trend.",
+                "- disk_io_summary is for storage contention, wait latency, and queue backlog over the previous one-hour sample window.",
+                "- availability_summary is for host or agent reachability in the same sample window.",
                 "- related_incidents is for merge or suppression decisions.",
                 "- alert_history is for distinguishing fresh faults from recoveries.",
                 "- topology is for blast-radius and service impact decisions.",
@@ -157,12 +157,13 @@ class AIClient:
                 "1. If context contains zabbix_raw, treat zabbix_raw as the primary source of truth for every alert type.",
                 "2. Treat disk_summary, metric_summary, memory_summary, disk_io_summary, and availability_summary as convenience summaries only.",
                 "3. If a convenience summary conflicts with zabbix_raw, trust zabbix_raw and explicitly mention the discrepancy in Chinese.",
-                "4. In report.evidence, include the raw Zabbix items or the most relevant subset when zabbix_raw is available.",
-                "5. If zabbix_raw is unavailable, use the available summaries and say evidence is limited.",
+                "4. zabbix_raw item samples represent the previous one hour, sampled every five minutes for a total of twelve points unless the context says otherwise.",
+                "5. In report.evidence, include the raw Zabbix items or the most relevant subset when zabbix_raw is available.",
+                "6. If zabbix_raw is unavailable, use the available summaries and say evidence is limited.",
                 "Decision rules:",
                 "1. If related_incidents already contains a matching open incident, prefer merge.",
                 "2. If alert status is resolved, prefer ignore unless it should merge into an existing incident.",
-                "3. For disk alerts, evaluate mount usage, remaining capacity, total capacity, recent growth, and raw filesystem items together.",
+                "3. For disk alerts, evaluate mount usage, remaining capacity, total capacity, recent one-hour growth, and raw filesystem items together.",
                 "4. For CPU alerts, evaluate cpu_avg, cpu_max, load_avg, and raw CPU/load items together.",
                 "5. For memory alerts, evaluate memory_used_percent, available_gb, swap_used_percent, trend, and raw memory items together.",
                 "6. For disk IO alerts, evaluate utilization_percent, await_ms, queue_size, trend, and raw storage items together.",
@@ -180,7 +181,7 @@ class AIClient:
                 "- ignore: No further action is needed now.",
                 "Alert-specific heuristics:",
                 "- Disk: low free space can outweigh a slightly lower used_percent.",
-                "- Disk: rapid growth increases urgency even if current percentage is borderline.",
+                "- Disk: rapid one-hour growth increases urgency even if current percentage is borderline.",
                 "- CPU: sustained high average is usually more serious than a short spike.",
                 "- Memory: low available memory or heavy swap pressure increases urgency.",
                 "- Disk IO: high queue_size plus high await_ms indicates real storage contention.",
@@ -220,9 +221,7 @@ class AIClient:
                                 "检查了关键指标 A。",
                                 "检查了关联指标 B。",
                             ],
-                            "evidence": {
-                                "example_metric": 123,
-                            },
+                            "evidence": {"example_metric": 123},
                             "priority_rationale": "这里解释为什么是这个优先级。",
                             "recommendations": [
                                 "这里写第一条处理建议。",
@@ -281,28 +280,28 @@ class AIClient:
                 "used_percent": disk.get("used_percent"),
                 "free_gb": disk.get("free_gb"),
                 "total_gb": disk.get("total_gb"),
-                "growth_gb_24h": disk.get("growth_gb_24h"),
+                "growth_gb_1h": disk.get("growth_gb_1h"),
+                "sample_window_minutes": disk.get("sample_window_minutes"),
+                "sample_interval_minutes": disk.get("sample_interval_minutes"),
+                "sample_count": disk.get("sample_count"),
                 "trend": disk.get("trend"),
                 "zabbix_raw": context.get("zabbix_raw"),
             }
             checks = [
                 "从告警内容中解析了挂载点和阈值。",
-                "获取了磁盘使用率、剩余空间、总容量和趋势信息。",
+                "获取了最近一小时的磁盘使用率、剩余空间、总容量和趋势信息。",
                 "检查了是否存在相关的未关闭 incident。",
             ]
             recommendations = [
                 "检查受影响挂载点下占用空间最大的目录和最近增长最快的文件。",
-                "确认增长是否来自批处理输出、日志膨胀或异常数据写入。",
+                "确认最近一小时的增长是否来自批处理输出、日志膨胀或异常数据写入。",
                 "如果剩余空间继续下降，尽快执行清理或扩容。",
             ]
         elif alert_type == "cpu":
             metric = context.get("metric_summary", {})
-            evidence = {
-                **metric,
-                "zabbix_raw": context.get("zabbix_raw"),
-            }
+            evidence = {**metric, "zabbix_raw": context.get("zabbix_raw")}
             checks = [
-                "获取了 CPU 平均值、峰值和负载信息。",
+                "获取了最近一小时的 CPU 平均值、峰值和负载信息。",
                 "对比了持续高负载和瞬时尖峰的差异。",
             ]
             recommendations = [
@@ -312,12 +311,9 @@ class AIClient:
             ]
         elif alert_type == "memory":
             memory = context.get("memory_summary", {})
-            evidence = {
-                **memory,
-                "zabbix_raw": context.get("zabbix_raw"),
-            }
+            evidence = {**memory, "zabbix_raw": context.get("zabbix_raw")}
             checks = [
-                "获取了内存使用率和可用容量。",
+                "获取了最近一小时的内存使用率和可用容量。",
                 "检查了内存压力是否已经接近影响稳定性的阈值。",
             ]
             recommendations = [
@@ -327,12 +323,9 @@ class AIClient:
             ]
         elif alert_type == "disk_io":
             disk_io = context.get("disk_io_summary", {})
-            evidence = {
-                **disk_io,
-                "zabbix_raw": context.get("zabbix_raw"),
-            }
+            evidence = {**disk_io, "zabbix_raw": context.get("zabbix_raw")}
             checks = [
-                "获取了磁盘利用率、等待时间和队列长度。",
+                "获取了最近一小时的磁盘利用率、等待时间和队列长度。",
                 "检查了磁盘争用是持续存在还是短时波动。",
             ]
             recommendations = [
@@ -342,13 +335,10 @@ class AIClient:
             ]
         elif alert_type == "host_down":
             availability = context.get("availability_summary", {})
-            evidence = {
-                **availability,
-                "zabbix_raw": context.get("zabbix_raw"),
-            }
+            evidence = {**availability, "zabbix_raw": context.get("zabbix_raw")}
             checks = [
-                "检查了 agent 可用性和主机运行状态相关信号。",
-                "结合最近可用性上下文判断是否为真实宕机。",
+                "检查了最近一小时的 agent 可用性和主机运行状态相关信号。",
+                "结合最近一小时的可用性上下文判断是否为真实宕机。",
             ]
             recommendations = [
                 "先确认网络连通性和主机电源状态。",
@@ -356,10 +346,7 @@ class AIClient:
                 "如果主机持续不可达，升级给基础设施支持处理。",
             ]
         else:
-            evidence = {
-                "context": context,
-                "zabbix_raw": context.get("zabbix_raw"),
-            }
+            evidence = {"context": context, "zabbix_raw": context.get("zabbix_raw")}
             checks = [
                 "收集了当前可获取的上下文信息。",
                 "由于告警类型不够明确，按通用规则进行了评估。",
@@ -438,7 +425,7 @@ class AIClient:
         env = alert.get("tags", {}).get("env", "").lower()
         used_percent = float(disk.get("used_percent", 0))
         free_gb = float(disk.get("free_gb", 0))
-        growth = float(disk.get("growth_gb_24h", 0))
+        growth = float(disk.get("growth_gb_1h", 0))
 
         if used_percent >= 97 or free_gb <= 10:
             return {
@@ -450,12 +437,12 @@ class AIClient:
             return {
                 "decision": "notify",
                 "priority": "P2",
-                "reason": "磁盘使用率偏高且近期增长很快，存在快速写满风险。",
+                "reason": "磁盘使用率偏高且最近一小时增长很快，存在快速写满风险。",
             }
         return {
             "decision": "observe",
             "priority": "P3",
-            "reason": "磁盘在缓慢增长，建议持续观察。",
+            "reason": "磁盘在最近一小时内增长平缓，建议持续观察。",
         }
 
     @staticmethod

@@ -164,25 +164,25 @@ class ZabbixClient:
             if used_values:
                 latest_total = total_values[-1] if total_values else 0
                 latest_used_bytes = used_bytes_values[-1] if used_bytes_values else 0
-                used_bytes_24h_ago = used_bytes_values[0] if len(used_bytes_values) > 1 else latest_used_bytes
+                used_bytes_window_start = used_bytes_values[0] if len(used_bytes_values) > 1 else latest_used_bytes
 
                 if free_values:
                     latest_free = free_values[-1]
-                    free_24h_ago = free_values[0] if len(free_values) > 1 else latest_free
+                    free_window_start = free_values[0] if len(free_values) > 1 else latest_free
                 elif latest_total and latest_used_bytes:
                     latest_free = max(latest_total - latest_used_bytes, 0)
-                    free_24h_ago = max(latest_total - used_bytes_24h_ago, 0)
+                    free_window_start = max(latest_total - used_bytes_window_start, 0)
                 else:
                     latest_free = 0
-                    free_24h_ago = 0
+                    free_window_start = 0
 
                 return {
                     "mount_point": mount_point,
                     "used_percent": round(used_values[-1], 2),
                     "free_gb": round(latest_free / 1024 / 1024 / 1024, 2) if latest_free else 0,
                     "total_gb": round(latest_total / 1024 / 1024 / 1024, 2) if latest_total else 0,
-                    "growth_gb_24h": round((free_24h_ago - latest_free) / 1024 / 1024 / 1024, 2),
-                    "trend": "sharp_increase" if free_24h_ago - latest_free > 20 * 1024 * 1024 * 1024 else "gradual",
+                    "growth_gb_1h": round((free_window_start - latest_free) / 1024 / 1024 / 1024, 2),
+                    "trend": "sharp_increase" if free_window_start - latest_free > 20 * 1024 * 1024 * 1024 else "gradual",
                     **self._sample_window_metadata(),
                 }
         except Exception as exc:  # pragma: no cover
@@ -574,7 +574,7 @@ class ZabbixClient:
                 "used_percent": 96.4,
                 "free_gb": 8.5,
                 "total_gb": 512.0,
-                "growth_gb_24h": 36.8,
+                "growth_gb_1h": 36.8,
                 "trend": "sharp_increase",
             }
         return {
@@ -582,7 +582,7 @@ class ZabbixClient:
             "used_percent": 91.2,
             "free_gb": 42.0,
             "total_gb": 1024.0,
-            "growth_gb_24h": 4.3,
+            "growth_gb_1h": 4.3,
             "trend": "gradual",
         }
 

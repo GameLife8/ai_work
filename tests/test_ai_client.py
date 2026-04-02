@@ -19,7 +19,7 @@ def test_plan_prompt_mentions_disk_specific_requirements():
     assert "Disk alerts need disk_summary" in prompt
 
 
-def test_judge_prompt_mentions_disk_and_cpu_guidelines():
+def test_judge_prompt_mentions_raw_evidence_priority_for_all_types():
     client = AIClient(provider="volcengine_coding", base_url="http://example.com", api_key="", model="", timeout_seconds=10, use_stub=True)
 
     prompt = client._build_judge_prompt(
@@ -33,10 +33,11 @@ def test_judge_prompt_mentions_disk_and_cpu_guidelines():
         {"disk_summary": {"used_percent": 96.0}},
     )
 
-    assert "磁盘告警必须综合 used_percent" in prompt
-    assert "CPU 告警必须综合 cpu_avg" in prompt
-    assert "优先级口径:" in prompt
-    assert "报告写作规则:" in prompt
+    assert "For disk alerts, evaluate mount usage" in prompt
+    assert "For CPU alerts, evaluate cpu_avg, cpu_max, load_avg" in prompt
+    assert "Priority definitions:" in prompt
+    assert "Report writing rules:" in prompt
+    assert "treat zabbix_raw as the primary source of truth" in prompt
 
 
 def test_stub_judge_notifies_for_critical_disk_exhaustion():
@@ -101,6 +102,13 @@ def test_extract_json_object_supports_wrapped_text():
     parsed = AIClient._extract_json_object('result is {"needs":["disk_summary"]}')
 
     assert parsed["needs"] == ["disk_summary"]
+
+
+def test_extract_json_object_ignores_trailing_noise():
+    parsed = AIClient._extract_json_object('prefix {"decision":"observe","priority":"P3"} trailing text')
+
+    assert parsed["decision"] == "observe"
+    assert parsed["priority"] == "P3"
 
 
 def test_plan_prompt_mentions_need_selection_hints():

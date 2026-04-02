@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from flask import Blueprint, current_app, jsonify
+from flask import Blueprint, current_app, jsonify, request
 
 system_bp = Blueprint("system", __name__)
 
@@ -54,3 +54,17 @@ def storage_status():
             ),
             503,
         )
+
+
+@system_bp.post("/api/v1/system/storage/cleanup")
+def cleanup_storage():
+    store = current_app.extensions["store"]
+    confirm = str((request.get_json(silent=True) or {}).get("confirm", "")).lower()
+    if confirm not in {"yes", "true", "1"}:
+        return jsonify({"code": 400, "message": "confirmation required"}), 400
+
+    try:
+        cleared = store.clear_runtime_data()
+        return jsonify({"code": 0, "message": "cleared", "cleared": cleared})
+    except Exception as exc:  # pragma: no cover
+        return jsonify({"code": 500, "message": str(exc)}), 500

@@ -29,15 +29,15 @@ class AlertService:
 
         context = self.context_fetcher.fetch_context(needs, alert)
         decision = self.ai_client.judge_alert(alert, context)
+        decision["ai_plan"] = plan
 
         action_result = self.decision_engine.execute_action(alert, decision)
         merged_decision = {**decision, **action_result}
 
-        incident_no = self.incident_service.apply_decision(alert_event_id, alert, merged_decision)
-        if incident_no:
-            merged_decision["incident_no"] = incident_no
+        incident_result = self.incident_service.apply_decision(alert_event_id, alert, merged_decision)
+        merged_decision.update(incident_result)
 
-        self.store.save_alert_decision(alert_event_id, merged_decision)
+        self.store.save_alert_decision(alert_event_id, merged_decision, plan=plan, context=context)
 
         return {
             "alert_event_id": alert_event_id,

@@ -28,6 +28,9 @@ def test_accepts_zabbix_alert_and_creates_incident(client):
     assert body["code"] == 0
     assert body["alert_id"] == 1
     assert body["decision"]["decision"] == "notify"
+    assert body["decision"]["need_push"] is True
+    assert body["decision"]["transfer_to_ticket"] is True
+    assert body["decision"]["ticket_status"] == "pending"
     assert body["decision"]["incident_no"].startswith("INC")
 
 
@@ -44,6 +47,57 @@ def test_merges_when_related_incident_exists(client):
     body = second.get_json()
     assert body["decision"]["decision"] == "merge"
     assert "merge_target_incident_no" in body["decision"]
+    assert body["decision"]["need_push"] is False
+    assert body["decision"]["push_suppressed"] is True
+
+
+def test_repeats_push_after_24_hours_if_incident_still_open(client):
+    first = client.post("/api/v1/alerts/zabbix", json=_sample_payload(event_time="2026-04-01T10:02:00"))
+    assert first.status_code == 200
+
+    second = client.post(
+        "/api/v1/alerts/zabbix",
+        json=_sample_payload(event_id="123458", problem_id="654323", event_time="2026-04-02T10:03:00"),
+    )
+
+    assert second.status_code == 200
+    body = second.get_json()
+    assert body["decision"]["decision"] == "merge"
+    assert body["decision"]["need_push"] is True
+    assert body["decision"]["push_count"] == 2
+
+
+def test_resolved_alert_closes_incident_and_resets_future_push(client):
+    first = client.post("/api/v1/alerts/zabbix", json=_sample_payload(event_time="2026-04-01T10:02:00"))
+    assert first.status_code == 200
+
+    resolved = client.post(
+        "/api/v1/alerts/zabbix",
+        json=_sample_payload(
+            event_id="123459",
+            problem_id="654324",
+            status="resolved",
+            event_time="2026-04-01T11:02:00",
+        ),
+    )
+    assert resolved.status_code == 200
+    assert resolved.get_json()["decision"]["ticket_status"] == "resolved"
+
+    third = client.post(
+        "/api/v1/alerts/zabbix",
+        json=_sample_payload(
+            event_id="123460",
+            problem_id="654325",
+            status="problem",
+            event_time="2026-04-01T12:02:00",
+        ),
+    )
+
+    assert third.status_code == 200
+    body = third.get_json()
+    assert body["decision"]["decision"] == "notify"
+    assert body["decision"]["need_push"] is True
+    assert body["decision"]["push_count"] == 1
 
 
 def test_rejects_invalid_payload(client):

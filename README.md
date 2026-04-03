@@ -1,128 +1,81 @@
 # AI Alert Flask
 
-一个按 `ai_alert_flask_project.md` 搭出来的最小可运行版本，目标是先把告警接入、AI 规划/研判、上下文查询、incident 管理和存储切换链路跑通。
+这是一个告警接入与智能研判服务。
 
-目前已经内置两类更细的研判：
+它的职责是：
 
-- `磁盘空间不足`：会解析挂载点，并补充空间大小、剩余空间、最近 1 小时内每 5 分钟 1 次、共 12 次的增长趋势
-- `高 CPU`：会补充平均值、峰值和负载信息
+- 接收 Zabbix 或通知脚本发来的告警
+- 到 Zabbix 查询相关真实上下文
+- 把告警和上下文发给火山模型做研判
+- 处理去重、并单、恢复关闭、工单字段
+- 把告警、AI 计划、上下文、决策、incident 信息落库
 
-## 运行
+## 快速开始
 
 1. 安装依赖
+
 ```powershell
 python -m pip install -r requirements.txt
 ```
 
-2. 复制环境变量
+2. 复制环境变量模板
+
 ```powershell
 Copy-Item .env.example .env
 ```
 
-3. 启动服务
+3. 修改 `.env`
+
+至少需要关注：
+
+- `STORE_BACKEND`
+- `DATABASE_URL`
+- `USE_STUB_ZABBIX`
+- `ZABBIX_BASE_URL`
+- `ZABBIX_USERNAME`
+- `ZABBIX_PASSWORD`
+- `USE_STUB_AI`
+- `AI_API_KEY`
+
+4. 启动服务
+
 ```powershell
 python app.py
 ```
 
-## 关键接口
+## 常用接口
 
 - `POST /api/v1/alerts/zabbix`
 - `POST /api/v1/alerts/notification`
 - `POST /api/v1/alerts/wechat`
 - `GET /health`
 - `GET /api/v1/system/storage`
+- `POST /api/v1/system/storage/cleanup`
 
-## 数据库模式
+## 运行机制
 
-默认使用内存模式。
+当前系统的核心特点：
 
-如果要切到真实数据库：
+- 告警进入后会先解析成结构化对象
+- 会从 Zabbix 查询最近 1 小时、每 5 分钟 1 次、共 12 个点的样本
+- 程序负责查准数据，火山模型负责做研判
+- 同一类告警 24 小时内只推一次
+- 超过 24 小时未恢复，再次收到会重新推送
+- 已恢复告警会关闭对应 incident
+- `notify/merge` 且高优先级告警默认会保留转工单字段
 
-```powershell
-$env:STORE_BACKEND="sql"
-$env:DATABASE_URL="sqlite:///local.db"
-python scripts/init_db.py
-python scripts/check_storage.py
-```
+## 详细说明
 
-如果要接 TiDB，把 `.env` 里的 `DATABASE_URL` 改成：
+完整操作文档见：
 
-```text
-mysql+pymysql://ai_alert:ai_alert@169.24.1.87:4000/ai_alert?charset=utf8mb4
-```
+- [项目操作与模型交互说明](C:\Users\fengxiuli\Desktop\ai_alert\docs\项目操作与模型交互说明.md)
 
-## Zabbix
+这份文档包含：
 
-默认使用 stub 指标。
-
-如果要接真实 Zabbix：
-
-```powershell
-$env:USE_STUB_ZABBIX="false"
-$env:ZABBIX_BASE_URL="http://169.24.2.90:80/zabbix/api_jsonrpc.php"
-$env:ZABBIX_USERNAME="your-user"
-$env:ZABBIX_PASSWORD="your-password"
-python scripts/check_zabbix.py
-```
-
-拉某台主机的指标摘要可以用：
-
-```powershell
-$env:USE_STUB_ZABBIX="false"
-$env:ZABBIX_BASE_URL="http://169.24.2.90:80/zabbix/api_jsonrpc.php"
-$env:ZABBIX_USERNAME="your-user"
-$env:ZABBIX_PASSWORD="your-password"
-python scripts/check_metric_summary.py "app-prod-01" "10.0.0.12"
-```
-
-## 通知脚本接入
-
-如果你把原来的企业微信脚本改成调用本服务，推荐直接发 JSON 到：
-
-```text
-POST /api/v1/alerts/notification
-```
-
-示例字段：
-
-```json
-{
-  "to_user": "77301",
-  "subject": "Zabbix告警通知",
-  "alert_message": "/mnt/data01: 磁盘空间严重不足 (used > 90%)",
-  "alert_detail": "WYY-DB09 (169.24.7.117) Problem in 2026.04.01 11:25:15"
-}
-```
-
-当前系统已内置更细的处理类型：
-
-- 磁盘空间不足
-- 高 CPU
-- 内存使用率过高
-- 磁盘 IO / 磁盘吞吐异常
-- 主机不可达 / 关机 / agent 不可用
-
-## 火山引擎 AI 接入
-
-当前默认按火山引擎 Coding Plan 的 OpenAI 兼容接口配置：
-
-```text
-AI_PROVIDER=volcengine_coding
-AI_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
-AI_MODEL=ark-code-latest
-```
-
-启用真实 AI 时只需要把 `.env` 或环境变量里的这几个值补上：
-
-```powershell
-$env:USE_STUB_AI="false"
-$env:AI_API_KEY="your-api-key"
-$env:AI_PROVIDER="volcengine_coding"
-$env:AI_BASE_URL="https://ark.cn-beijing.volces.com/api/coding/v3"
-$env:AI_MODEL="ark-code-latest"
-```
-
-当前实现会把详细的 Planner/Judge 提示词直接发给模型，并要求返回 JSON；如果火山接口失败，会自动回退到本地规则。
+- 项目怎么启动和配置
+- 程序和火山模型的交互方式
+- 服务上线后是否还需要人工介入
+- 当前去重、incident、工单字段和数据库存储规则
 
 ## 测试
 

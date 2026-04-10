@@ -1,0 +1,54 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: swarm-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: swarm-agent
+  template:
+    metadata:
+      labels:
+        app: swarm-agent
+    spec:
+      containers:
+        - name: swarm-agent
+          image: swarm-agent:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8000
+          env:
+            - name: DOCKER_HOST
+              value: "tcp://169.24.216.227:3389"
+            - name: DOCKER_BIN
+              value: "docker"
+            - name: CHAINLIT_PORT
+              value: "8000"
+            - name: MODEL_BASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: swarm-agent-secret
+                  key: model-base-url
+            - name: MODEL_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: swarm-agent-secret
+                  key: model-api-key
+            - name: MODEL_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: swarm-agent-secret
+                  key: model-name
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: swarm-agent
+spec:
+  selector:
+    app: swarm-agent
+  ports:
+    - name: http
+      port: 8000
+      targetPort: 8000

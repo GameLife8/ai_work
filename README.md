@@ -47,6 +47,9 @@ chainlit run chainlit_app.py --host 0.0.0.0 --port 8000
 
 模型会自动调用 Docker Swarm skill，检查服务健康、失败任务、错误日志、服务详情，并给出中文诊断报告。
 
+4. 会话存储
+前端 Chainlit 会话、用户消息、助手回复和 skill 调用轨迹现在都会通过当前 store 落库，默认优先使用 SQL/TiDB，不再只放在内存里。
+
 ## 统一架构
 
 - [app.py](C:\Users\fengxiuli\Desktop\ai_alert\app.py)：Flask API 入口

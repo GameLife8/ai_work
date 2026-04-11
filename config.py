@@ -36,7 +36,7 @@ class Config:
         "DATABASE_URL",
         f"mysql+pymysql://{TIDB_USERNAME}:{TIDB_PASSWORD}@{TIDB_HOST}:{TIDB_PORT}/{TIDB_DATABASE}?charset=utf8mb4",
     )
-    STORE_BACKEND = os.getenv("STORE_BACKEND", "memory")
+    STORE_BACKEND = os.getenv("STORE_BACKEND", "sql")
 
     AI_PROVIDER = os.getenv("AI_PROVIDER", "volcengine_coding")
     AI_BASE_URL = os.getenv("AI_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")

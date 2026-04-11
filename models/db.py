@@ -38,6 +38,8 @@ class InMemoryStore:
         self.alert_decisions: list[dict] = []
         self.incidents: dict[str, dict] = {}
         self.incident_alert_rels: list[dict] = []
+        self.chat_sessions: dict[str, dict] = {}
+        self.chat_messages: list[dict] = []
 
     def save_alert_event(self, alert: dict, raw_payload: dict) -> int:
         alert_event_id = len(self.alert_events) + 1
@@ -62,6 +64,8 @@ class InMemoryStore:
                 "alert_events": len(self.alert_events),
                 "alert_decisions": len(self.alert_decisions),
                 "incidents": len(self.incidents),
+                "chat_sessions": len(self.chat_sessions),
+                "chat_messages": len(self.chat_messages),
             },
         }
 
@@ -193,11 +197,15 @@ class InMemoryStore:
             "alert_decisions": len(self.alert_decisions),
             "incidents": len(self.incidents),
             "incident_alert_rels": len(self.incident_alert_rels),
+            "chat_sessions": len(self.chat_sessions),
+            "chat_messages": len(self.chat_messages),
         }
         self.alert_events.clear()
         self.alert_decisions.clear()
         self.incidents.clear()
         self.incident_alert_rels.clear()
+        self.chat_sessions.clear()
+        self.chat_messages.clear()
         return result
 
     def link_alert_to_incident(self, incident_no: str, alert_event_id: int) -> None:
@@ -209,6 +217,51 @@ class InMemoryStore:
                 "created_at": _utc_now_iso(),
             }
         )
+
+    def save_chat_session(self, session_id: str, metadata: dict | None = None) -> None:
+        now = _utc_now_iso()
+        existing = self.chat_sessions.get(session_id)
+        if existing:
+            existing["updated_at"] = now
+            existing["last_message_at"] = now
+            if metadata is not None:
+                existing["metadata_json"] = deepcopy(metadata)
+            return
+        self.chat_sessions[session_id] = {
+            "session_id": session_id,
+            "status": "open",
+            "metadata_json": deepcopy(metadata or {}),
+            "created_at": now,
+            "updated_at": now,
+            "last_message_at": now,
+        }
+
+    def save_chat_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        trace: list[dict] | None = None,
+        metadata: dict | None = None,
+    ) -> int:
+        self.save_chat_session(session_id)
+        message_id = len(self.chat_messages) + 1
+        now = _utc_now_iso()
+        self.chat_messages.append(
+            {
+                "id": message_id,
+                "session_id": session_id,
+                "role": role,
+                "content": content,
+                "trace_json": deepcopy(trace or []),
+                "metadata_json": deepcopy(metadata or {}),
+                "created_at": now,
+            }
+        )
+        if session_id in self.chat_sessions:
+            self.chat_sessions[session_id]["updated_at"] = now
+            self.chat_sessions[session_id]["last_message_at"] = now
+        return message_id
 
     @staticmethod
     def _build_root_key(alert: dict) -> str:
@@ -329,6 +382,28 @@ class SQLStore:
                 created_at VARCHAR(64)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_session (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id VARCHAR(128) NOT NULL UNIQUE,
+                status VARCHAR(32) NOT NULL DEFAULT 'open',
+                metadata_json TEXT,
+                created_at VARCHAR(64),
+                updated_at VARCHAR(64),
+                last_message_at VARCHAR(64)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_message (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id VARCHAR(128) NOT NULL,
+                role VARCHAR(32) NOT NULL,
+                content TEXT,
+                trace_json TEXT,
+                metadata_json TEXT,
+                created_at VARCHAR(64)
+            )
+            """,
         ]
 
         with self.engine.begin() as conn:
@@ -375,6 +450,16 @@ class SQLStore:
                 "last_report_json": "TEXT",
                 "resolved_at": "VARCHAR(64)",
             },
+            "chat_session": {
+                "status": "VARCHAR(32) NOT NULL DEFAULT 'open'",
+                "metadata_json": "TEXT",
+                "updated_at": "VARCHAR(64)",
+                "last_message_at": "VARCHAR(64)",
+            },
+            "chat_message": {
+                "trace_json": "TEXT",
+                "metadata_json": "TEXT",
+            },
         }
 
         from sqlalchemy import text
@@ -409,6 +494,8 @@ class SQLStore:
             conn.execute(text("SELECT 1"))
             alert_events = conn.execute(text("SELECT COUNT(1) FROM alert_event")).scalar_one()
             incidents = conn.execute(text("SELECT COUNT(1) FROM incident")).scalar_one()
+            chat_sessions = conn.execute(text("SELECT COUNT(1) FROM chat_session")).scalar_one()
+            chat_messages = conn.execute(text("SELECT COUNT(1) FROM chat_message")).scalar_one()
         return {
             "backend": self.backend_name,
             "healthy": True,
@@ -416,6 +503,8 @@ class SQLStore:
                 "mode": "database",
                 "alert_events": int(alert_events),
                 "incidents": int(incidents),
+                "chat_sessions": int(chat_sessions),
+                "chat_messages": int(chat_messages),
             },
         }
 
@@ -789,12 +878,108 @@ class SQLStore:
                 "alert_decisions": int(conn.execute(text("SELECT COUNT(1) FROM alert_decision")).scalar_one()),
                 "incidents": int(conn.execute(text("SELECT COUNT(1) FROM incident")).scalar_one()),
                 "incident_alert_rels": int(conn.execute(text("SELECT COUNT(1) FROM incident_alert_rel")).scalar_one()),
+                "chat_sessions": int(conn.execute(text("SELECT COUNT(1) FROM chat_session")).scalar_one()),
+                "chat_messages": int(conn.execute(text("SELECT COUNT(1) FROM chat_message")).scalar_one()),
             }
+            conn.execute(text("DELETE FROM chat_message"))
+            conn.execute(text("DELETE FROM chat_session"))
             conn.execute(text("DELETE FROM incident_alert_rel"))
             conn.execute(text("DELETE FROM alert_decision"))
             conn.execute(text("DELETE FROM incident"))
             conn.execute(text("DELETE FROM alert_event"))
         return result
+
+    def save_chat_session(self, session_id: str, metadata: dict | None = None) -> None:
+        from sqlalchemy import text
+
+        now = _utc_now_iso()
+        payload = {
+            "session_id": session_id,
+            "status": "open",
+            "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
+            "created_at": now,
+            "updated_at": now,
+            "last_message_at": now,
+        }
+        with self.engine.begin() as conn:
+            exists = conn.execute(
+                text("SELECT 1 FROM chat_session WHERE session_id = :session_id LIMIT 1"),
+                {"session_id": session_id},
+            ).first()
+            if exists:
+                conn.execute(
+                    text(
+                        """
+                        UPDATE chat_session
+                        SET metadata_json = :metadata_json,
+                            updated_at = :updated_at,
+                            last_message_at = :last_message_at
+                        WHERE session_id = :session_id
+                        """
+                    ),
+                    payload,
+                )
+            else:
+                conn.execute(
+                    text(
+                        """
+                        INSERT INTO chat_session (
+                            session_id, status, metadata_json, created_at, updated_at, last_message_at
+                        ) VALUES (
+                            :session_id, :status, :metadata_json, :created_at, :updated_at, :last_message_at
+                        )
+                        """
+                    ),
+                    payload,
+                )
+
+    def save_chat_message(
+        self,
+        session_id: str,
+        role: str,
+        content: str,
+        trace: list[dict] | None = None,
+        metadata: dict | None = None,
+    ) -> int:
+        from sqlalchemy import text
+
+        self.save_chat_session(session_id)
+        now = _utc_now_iso()
+        with self.engine.begin() as conn:
+            result = conn.execute(
+                text(
+                    """
+                    INSERT INTO chat_message (
+                        session_id, role, content, trace_json, metadata_json, created_at
+                    ) VALUES (
+                        :session_id, :role, :content, :trace_json, :metadata_json, :created_at
+                    )
+                    """
+                ),
+                {
+                    "session_id": session_id,
+                    "role": role,
+                    "content": content,
+                    "trace_json": json.dumps(trace or [], ensure_ascii=False),
+                    "metadata_json": json.dumps(metadata or {}, ensure_ascii=False),
+                    "created_at": now,
+                },
+            )
+            conn.execute(
+                text(
+                    """
+                    UPDATE chat_session
+                    SET updated_at = :updated_at, last_message_at = :last_message_at
+                    WHERE session_id = :session_id
+                    """
+                ),
+                {
+                    "session_id": session_id,
+                    "updated_at": now,
+                    "last_message_at": now,
+                },
+            )
+            return int(result.lastrowid)
 
     @staticmethod
     def _generate_incident_no(conn: Any) -> str:

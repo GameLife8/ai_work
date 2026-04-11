@@ -4,3 +4,4 @@ PyMySQL==1.1.1
 requests==2.32.3
 python-dotenv==1.0.0
 pytest==8.3.3
+chainlit==2.5.5

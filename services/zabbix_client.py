@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import UTC, datetime
 from statistics import mean
 from zoneinfo import ZoneInfo
@@ -287,6 +288,127 @@ class ZabbixClient:
 
         return self._stub_availability_summary(alert)
 
+    def find_host(self, host_query: str) -> dict | None:
+        if self.use_stub:
+            return {"hostid": "stub-host", "host": host_query, "name": host_query, "interfaces": [{"ip": "127.0.0.1"}]}
+
+        query = host_query.strip()
+        if not query:
+            return None
+
+        by_host = self._rpc(
+            "host.get",
+            params={
+                "output": ["hostid", "host", "name"],
+                "selectInterfaces": ["ip"],
+                "filter": {"host": [query]},
+            },
+            auth=self.login(),
+        )
+        if by_host:
+            return by_host[0]
+
+        by_name = self._rpc(
+            "host.get",
+            params={
+                "output": ["hostid", "host", "name"],
+                "selectInterfaces": ["ip"],
+                "search": {"name": query},
+                "searchByAny": True,
+            },
+            auth=self.login(),
+        )
+        if by_name:
+            return by_name[0]
+
+        by_ip = self._rpc(
+            "host.get",
+            params={
+                "output": ["hostid", "host", "name"],
+                "selectInterfaces": ["ip"],
+                "search": {"ip": query},
+            },
+            auth=self.login(),
+        )
+        if by_ip:
+            return by_ip[0]
+        return None
+
+    def get_host_overview(self, host_query: str) -> dict:
+        host = self.find_host(host_query)
+        if not host:
+            raise ValueError(f"未找到主机: {host_query}")
+
+        alert = self._build_host_alert(host)
+        return {
+            "host": {
+                "host_id": host["hostid"],
+                "host_name": host.get("name") or host.get("host"),
+                "host_ip": self._extract_host_ip(host),
+            },
+            "metric_summary": self.get_metric_summary(alert),
+            "memory_summary": self.get_memory_summary(alert),
+            "availability_summary": self.get_availability_summary(alert),
+        }
+
+    def get_host_storage_overview(self, host_query: str) -> dict:
+        host = self.find_host(host_query)
+        if not host:
+            raise ValueError(f"未找到主机: {host_query}")
+        if self.use_stub:
+            return {
+                "host": {
+                    "host_id": host["hostid"],
+                    "host_name": host.get("name") or host.get("host"),
+                    "host_ip": self._extract_host_ip(host),
+                },
+                "filesystems": [
+                    {"mount_point": "/", "used_percent": 71.2, "free_gb": 120.0, "total_gb": 512.0},
+                    {"mount_point": "/data", "used_percent": 84.3, "free_gb": 227.0, "total_gb": 2047.0},
+                ],
+            }
+
+        items = self._get_host_items(host["hostid"])
+        filesystems: dict[str, dict] = {}
+        pattern = re.compile(r"^vfs\.fs\.size\[(?P<mount>.+?),(?P<metric>pused|free|used|total)\]$")
+        for item in items:
+            key_name = item.get("key_", "")
+            match = pattern.match(key_name)
+            if not match:
+                continue
+            mount = match.group("mount")
+            metric = match.group("metric")
+            bucket = filesystems.setdefault(mount, {"mount_point": mount})
+            try:
+                bucket[metric] = float(item.get("lastvalue") or 0)
+            except ValueError:
+                continue
+
+        result = []
+        for mount, values in sorted(filesystems.items()):
+            total = values.get("total", 0.0)
+            used = values.get("used", 0.0)
+            free = values.get("free")
+            if free is None and total and used:
+                free = max(total - used, 0.0)
+            result.append(
+                {
+                    "mount_point": mount,
+                    "used_percent": round(values.get("pused", 0.0), 2),
+                    "free_gb": round((free or 0.0) / 1024 / 1024 / 1024, 2),
+                    "total_gb": round(total / 1024 / 1024 / 1024, 2) if total else 0.0,
+                }
+            )
+
+        return {
+            "host": {
+                "host_id": host["hostid"],
+                "host_name": host.get("name") or host.get("host"),
+                "host_ip": self._extract_host_ip(host),
+            },
+            "filesystems": result,
+        }
+
     def debug_metric_summary(self, alert: dict) -> dict:
         if self.use_stub:
             summary = self._stub_metric_summary(alert)
@@ -375,6 +497,25 @@ class ZabbixClient:
         if result:
             return result[0]["hostid"]
         return None
+
+    @staticmethod
+    def _extract_host_ip(host: dict) -> str:
+        interfaces = host.get("interfaces") or []
+        if interfaces:
+            return interfaces[0].get("ip", "")
+        return ""
+
+    def _build_host_alert(self, host: dict) -> dict:
+        return {
+            "host_id": host["hostid"],
+            "host_name": host.get("name") or host.get("host"),
+            "host_ip": self._extract_host_ip(host),
+            "event_time": datetime.now(UTC).isoformat(),
+            "resource_scope": {},
+            "signal": {},
+            "status": "problem",
+            "severity": "info",
+        }
 
     def _get_host_items(self, host_id: str) -> list[dict]:
         return self._rpc(
@@ -549,7 +690,9 @@ class ZabbixClient:
         if auth:
             payload["auth"] = auth
 
-        response = requests.post(self.base_url, json=payload, timeout=self.timeout_seconds)
+        with requests.Session() as session:
+            session.trust_env = False
+            response = session.post(self.base_url, json=payload, timeout=self.timeout_seconds)
         response.raise_for_status()
         data = response.json()
         if "error" in data:

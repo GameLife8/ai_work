@@ -296,7 +296,21 @@ class SQLStore:
     def initialize(self) -> None:
         from sqlalchemy import text
 
-        statements = [
+        statements = self._build_create_statements()
+
+        with self.engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
+        self._ensure_columns()
+
+    def _build_create_statements(self) -> list[str]:
+        if self.engine.dialect.name == "sqlite":
+            return self._build_sqlite_statements()
+        return self._build_mysql_statements()
+
+    @staticmethod
+    def _build_sqlite_statements() -> list[str]:
+        return [
             """
             CREATE TABLE IF NOT EXISTS alert_event (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -406,10 +420,117 @@ class SQLStore:
             """,
         ]
 
-        with self.engine.begin() as conn:
-            for statement in statements:
-                conn.execute(text(statement))
-        self._ensure_columns()
+    @staticmethod
+    def _build_mysql_statements() -> list[str]:
+        return [
+            """
+            CREATE TABLE IF NOT EXISTS alert_event (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                source VARCHAR(32) NOT NULL DEFAULT 'zabbix',
+                source_event_id VARCHAR(128),
+                source_problem_id VARCHAR(128),
+                trigger_id VARCHAR(128),
+                host_id VARCHAR(128),
+                host_name VARCHAR(255),
+                host_ip VARCHAR(64),
+                severity VARCHAR(32),
+                status VARCHAR(32),
+                alert_name VARCHAR(512),
+                alert_message TEXT,
+                tags_json TEXT,
+                event_time VARCHAR(64),
+                ingest_time VARCHAR(64),
+                dedup_key VARCHAR(1024),
+                raw_payload_json TEXT,
+                created_at VARCHAR(64)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS alert_decision (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                alert_event_id BIGINT NOT NULL,
+                incident_no VARCHAR(128),
+                decision_type VARCHAR(32) NOT NULL,
+                priority VARCHAR(32),
+                need_push TINYINT NOT NULL DEFAULT 0,
+                push_suppressed TINYINT NOT NULL DEFAULT 0,
+                push_suppressed_reason TEXT,
+                dedup_window_until VARCHAR(64),
+                reason_summary TEXT,
+                merge_target_incident_no VARCHAR(128),
+                observe_until VARCHAR(64),
+                action VARCHAR(32),
+                transfer_to_ticket TINYINT NOT NULL DEFAULT 0,
+                ticket_no VARCHAR(128),
+                ticket_status VARCHAR(64),
+                ticket_payload_json TEXT,
+                ai_plan_json TEXT,
+                context_json TEXT,
+                model_decision_json LONGTEXT,
+                report_json LONGTEXT,
+                executed_at VARCHAR(64),
+                created_at VARCHAR(64)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS incident (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                incident_no VARCHAR(128) NOT NULL UNIQUE,
+                status VARCHAR(32) NOT NULL,
+                priority VARCHAR(32),
+                root_alert_event_id BIGINT,
+                root_node_key VARCHAR(255),
+                dedup_key VARCHAR(1024),
+                summary TEXT,
+                host_name VARCHAR(255),
+                service VARCHAR(255),
+                first_seen_at VARCHAR(64),
+                last_seen_at VARCHAR(64),
+                last_push_at VARCHAR(64),
+                push_count INT NOT NULL DEFAULT 0,
+                transfer_to_ticket TINYINT NOT NULL DEFAULT 0,
+                ticket_no VARCHAR(128),
+                ticket_status VARCHAR(64),
+                last_decision_type VARCHAR(32),
+                last_reason TEXT,
+                last_report_json LONGTEXT,
+                resolved_at VARCHAR(64),
+                created_at VARCHAR(64),
+                updated_at VARCHAR(64)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS incident_alert_rel (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                incident_no VARCHAR(128) NOT NULL,
+                alert_event_id BIGINT NOT NULL,
+                rel_type VARCHAR(32) NOT NULL DEFAULT 'member',
+                created_at VARCHAR(64)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_session (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                session_id VARCHAR(128) NOT NULL UNIQUE,
+                status VARCHAR(32) NOT NULL DEFAULT 'open',
+                metadata_json LONGTEXT,
+                created_at VARCHAR(64),
+                updated_at VARCHAR(64),
+                last_message_at VARCHAR(64)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS chat_message (
+                id BIGINT PRIMARY KEY AUTO_INCREMENT,
+                session_id VARCHAR(128) NOT NULL,
+                role VARCHAR(32) NOT NULL,
+                content LONGTEXT,
+                trace_json LONGTEXT,
+                metadata_json LONGTEXT,
+                created_at VARCHAR(64)
+            )
+            """,
+        ]
 
     @property
     def backend_name(self) -> str:
@@ -420,6 +541,8 @@ class SQLStore:
             "alert_event": self._list_columns("alert_event"),
             "alert_decision": self._list_columns("alert_decision"),
             "incident": self._list_columns("incident"),
+            "chat_session": self._list_columns("chat_session"),
+            "chat_message": self._list_columns("chat_message"),
         }
         expected = {
             "alert_event": {

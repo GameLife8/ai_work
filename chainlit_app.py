@@ -29,7 +29,7 @@ async def on_chat_start() -> None:
             "统一运维助手已就绪。\n\n"
             "这里是同一个项目的统一前端入口。你可以直接问：\n"
             "- 某个服务为什么起不来\n"
-            "- 某台主机所有磁盘当前情况\n"
+            "- 某台主机所有硬盘当前情况\n"
             "- 某条原始告警应该怎么研判\n"
             "模型会自动选择 Swarm、Zabbix、告警分析等 skill 去取证。"
         )
@@ -42,8 +42,10 @@ async def on_message(message: cl.Message) -> None:
     store = cl.user_session.get("store")
     session_id = cl.user_session.get("session_id")
     text = (message.content or "").strip()
+
     if store and session_id and text:
         store.save_chat_message(session_id, "user", text)
+
     try:
         outcome = agent.ask(text)
     except Exception as exc:
@@ -60,16 +62,18 @@ async def on_message(message: cl.Message) -> None:
             trace=outcome.trace,
             metadata={"trace_count": len(outcome.trace)},
         )
+
     await cl.Message(content=outcome.message).send()
+
     if outcome.trace:
         await cl.Message(
-            content=f"本次共调用 {len(outcome.trace)} 个 skill，详情已收起到侧边面板。",
-            elements=[
-                cl.Text(
-                    name="skill_trace.json",
-                    content=json.dumps(outcome.trace, ensure_ascii=False, indent=2),
-                    display="side",
-                    language="json",
-                )
-            ],
+            content=(
+                f"本次共调用 {len(outcome.trace)} 个 skill。\n\n"
+                "<details>\n"
+                "<summary>点击展开 skill 调用轨迹</summary>\n\n"
+                "```json\n"
+                f"{json.dumps(outcome.trace, ensure_ascii=False, indent=2)}\n"
+                "```\n"
+                "</details>"
+            )
         ).send()

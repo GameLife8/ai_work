@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 import os
-import shlex
 import subprocess
 from dataclasses import dataclass
 from typing import Any
@@ -21,23 +20,25 @@ class CommandResult:
 
 
 class DockerSwarmClient:
+    """直接调本地 ``docker`` 二进制 + 远端 DOCKER_HOST 操作 Swarm。
+
+    部署形态：本服务跑在容器里，容器镜像内置 docker CLI（仅 client，不带 daemon），
+    所有命令通过环境变量 DOCKER_HOST 指向真实 Swarm manager 节点。
+    """
+
     def __init__(
         self,
         docker_bin: str,
-        docker_runner: str,
         docker_host: str,
         docker_tls_verify: str = "",
         docker_cert_path: str = "",
-        wsl_distro: str = "",
         log_default_tail: int = 100,
         log_max_tail: int = 1000,
     ) -> None:
         self.docker_bin = docker_bin
-        self.docker_runner = docker_runner
         self.docker_host = docker_host
         self.docker_tls_verify = docker_tls_verify
         self.docker_cert_path = docker_cert_path
-        self.wsl_distro = wsl_distro
         self.log_default_tail = log_default_tail
         self.log_max_tail = log_max_tail
 
@@ -150,7 +151,7 @@ class DockerSwarmClient:
         }
 
     def run(self, args: list[str]) -> CommandResult:
-        command = self._build_command(args)
+        command = [self.docker_bin] + args
         completed = subprocess.run(
             command,
             capture_output=True,
@@ -192,18 +193,3 @@ class DockerSwarmClient:
         if self.docker_cert_path:
             env["DOCKER_CERT_PATH"] = self.docker_cert_path
         return env
-
-    def _build_command(self, args: list[str]) -> list[str]:
-        if self.docker_runner.lower() == "wsl":
-            exports = [f"export DOCKER_HOST={shlex.quote(self.docker_host)}"]
-            if self.docker_tls_verify:
-                exports.append(f"export DOCKER_TLS_VERIFY={shlex.quote(self.docker_tls_verify)}")
-            if self.docker_cert_path:
-                exports.append(f"export DOCKER_CERT_PATH={shlex.quote(self.docker_cert_path)}")
-            shell_command = "; ".join(exports + [shlex.join([self.docker_bin] + args)])
-            command = ["wsl"]
-            if self.wsl_distro:
-                command.extend(["-d", self.wsl_distro])
-            command.extend(["-e", "sh", "-lc", shell_command])
-            return command
-        return [self.docker_bin] + args

@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.git/
+.gitignore
+.idea/
+.vscode/
+*.log
+
+# 前端
+admin_ui/node_modules/
+admin_ui/dist/
+
+# 文档
+docs/
+
+# 测试输出
+htmlcov/
+.coverage

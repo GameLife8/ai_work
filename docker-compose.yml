@@ -1,0 +1,67 @@
+name: ai-ops-platform
+
+# 三服务架构：
+#   backend   ── Flask + Admin API（5000）
+#   chat      ── Chainlit 聊天前端（8000）
+#   admin-ui  ── Vue 静态后台 + nginx 反代到 backend（80）
+#
+# 数据库：默认连外部 TiDB（DATABASE_URL）。本地纯调试可设 STORE_BACKEND=memory。
+# 远端运维目标：通过 DOCKER_HOST 指向 Swarm manager；K8s 通过管理后台粘 kubeconfig。
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    image: ai-ops/backend:latest
+    container_name: ai-ops-backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      APP_HOST: 0.0.0.0
+      APP_PORT: "5000"
+      STORE_BACKEND: ${STORE_BACKEND:-sql}
+    ports:
+      - "${BACKEND_PORT:-5000}:5000"
+    networks: [opsnet]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  chat:
+    build:
+      context: .
+      dockerfile: Dockerfile.chat
+    image: ai-ops/chat:latest
+    container_name: ai-ops-chat
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      STORE_BACKEND: ${STORE_BACKEND:-sql}
+    ports:
+      - "${CHAT_PORT:-8000}:8000"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [opsnet]
+
+  admin-ui:
+    build:
+      context: .
+      dockerfile: Dockerfile.admin-ui
+    image: ai-ops/admin-ui:latest
+    container_name: ai-ops-admin-ui
+    restart: unless-stopped
+    ports:
+      - "${ADMIN_PORT:-8080}:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks: [opsnet]
+
+networks:
+  opsnet:
+    driver: bridge

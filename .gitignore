@@ -6,3 +6,18 @@ __pycache__/
 *.pyc
 local.db
 pytest-cache-files-*/
+
+# Claude Code / 编辑器本地配置
+.claude/
+.vscode/
+.cursor/
+
+# 前端构建产物 / 依赖
+admin_ui/node_modules/
+admin_ui/dist/
+admin_ui/.vite/
+
+# Chainlit 自动生成
+.files/
+chainlit-*.db
+.chainlit/translations/

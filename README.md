@@ -1,121 +1,172 @@
-# AI Ops Platform
+# AI 运维平台
 
-这是一个统一的智能运维平台项目，不再区分“告警项目”和“Swarm 项目”。
+> 面向运维场景的、可私有化部署的 Claude Code。模型默认走火山方舟，
+> 兼容通义千问 / 智谱 GLM / DeepSeek / Moonshot 等任意 OpenAI 协议兼容的国产模型。
 
-当前项目里有三类核心能力：
+---
 
-- 告警接入与智能研判
-- Zabbix 主机信息查询
-- Docker Swarm 服务排障与状态查询
+## 一句话说明
 
-这三类能力现在共用同一个模型入口、同一套运行时和同一批 skill。
+把"运维老司机"的查问题套路、动作执行能力、跨集群多接入、二次确认审批、统一审计，
+全部沉淀到一个平台里。运维同学和 AI 共用同一份 skill，AI 给思路、人给确认。
 
-## 当前入口
+---
 
-API 服务：
+## 它能干什么
 
-```powershell
-python app.py
+| 类型 | 例子 |
+|---|---|
+| 🔍 查信息 | "WYY-DB09 主机所有硬盘当前情况" |
+| 🩺 排障诊断 | "iiot-haitu_seatable 这个服务为什么起不来" — 跨容器 + 主机层联动 |
+| ☸️ K8s 巡检 | "dmz-cluster01 上 default 命名空间所有 pod 状态" |
+| 🌐 网络排障 | "worker-3 节点上 80 端口没人监听，帮我查一下" — 走 host_agent + nsenter，**不需要 SSH** |
+| 📥 告警研判 | 直接粘贴一段 Zabbix payload JSON |
+| ⚡ 执行操作 | "重启 my-app 这个 deployment" — 自动走二次确认 |
+
+## 三个服务、三个容器
+
+| 服务 | 端口 | 干啥 |
+|---|---|---|
+| `backend` | 5000 | Flask + Admin API + 告警接入 |
+| `chat` | 8000 | Chainlit 用户聊天 |
+| `admin-ui` | 8080 | Vue 静态后台 + nginx，反代到 backend |
+
+## 快速启动（在 WSL 或 Linux）
+
+```bash
+# 1. 装 docker compose 插件（第一次）
+sudo apt-get update && sudo apt-get install -y docker-compose-plugin
+
+# 2. 准备 .env
+cp .env.example .env
+# 编辑：
+#   ADMIN_JWT_SECRET    强随机串
+#   ADMIN_BOOTSTRAP_PASSWORD  生产改密
+#   AI_API_KEY / AI_BASE_URL / AI_MODEL  火山方舟实际值
+#   DATABASE_URL        指向 TiDB；调试可设 STORE_BACKEND=memory
+
+# 3. 起来
+docker compose build
+docker compose up -d
+
+# 4. 看日志
+docker compose logs -f backend chat admin-ui
 ```
 
-统一前端对话入口：
+访问：
 
-```powershell
-chainlit run chainlit_app.py --host 0.0.0.0 --port 8000
+| 入口 | URL | 默认账号 |
+|---|---|---|
+| 管理后台 | <http://localhost:8080> | admin / admin123 |
+| 聊天页 | <http://localhost:8000> | 同上 |
+| 后端 API（健康检查） | <http://localhost:5000/health> | — |
+
+## 几个关键概念
+
+| 维度 | 说明 |
+|---|---|
+| **Connection** | 接入。Zabbix / Swarm / K8s / host_agent 各一个 driver；同类型可存多份；`config_json` **Fernet 加密落库** |
+| **Skill** | 能力。`skills/<name>/__init__.py` 一个目录一个能力，**新增零代码改动** |
+| **Signals** | skill 主动发出结构化信号（OOM / 磁盘满 / 镜像拉不下来…），agent 自动渲染中文 hint 注入下一轮——**跨域 pivot 从软约束变硬约束** |
+| **Runbook（图执行）** | 平台**自动按 DAG 跑一连串 skill**，模型只写最终中文五段式报告。admin 后台 YAML 编辑 + 热加载。详见 [docs/runbook.md](docs/runbook.md) |
+| **写操作二次确认** | `read_only=False` 的 skill 走 pending_action 队列，先弹卡片再执行；admin-only 写 skill 走 visibility + approval 三重锁 |
+| **Prompt 段落库** | system prompt 拆 5 段落 DB，admin 后台 CodeMirror 编辑；**改完即时生效不重启** |
+| **Model** | 火山方舟（Code Plan）/ 通义 / 智谱 / DeepSeek 等任意 OpenAI 兼容模型 |
+| **host_agent** | 每节点一个特权 DaemonSet，**用 nsenter 替代 SSH 排障** |
+| **MCP server** | 平台 skill 暴露成 MCP，Claude Code / Cursor 可直接挂载使用 |
+
+详见 [`docs/platform.md`](docs/platform.md)。
+
+## 接外部 AI Agent（MCP）
+
+平台暴露一个 MCP server（streamable HTTP）：
+
+```
+URL:  http://your-host:8765/mcp
+Auth: Authorization: Bearer <MCP_API_KEYS 之一>
 ```
 
-## 能做什么
+Claude Code / Cursor 等 MCP 客户端配置后，可以直接调用平台的 22 个 skill 完成排障。详见
+[`docs/platform.md`](docs/platform.md) MCP 章节。
 
-1. 告警研判  
-接收 Zabbix 或通知脚本发来的告警，自动补充上下文，交给火山模型做优先级、处置建议和报告判断。
+## 部署 host_agent（替代 SSH）
 
-2. 主机查询  
-用户在前端直接问：
+```bash
+# K8s
+kubectl apply -f deploy/ai-ops-agent-k8s.yaml
 
-```text
-我想了解 WYY-DB09 主机的所有硬盘当前情况
+# 或 Swarm
+docker stack deploy -c deploy/ai-ops-agent-swarm.yml ai-ops
 ```
 
-模型会自动调用 Zabbix skill，返回主机磁盘、CPU、内存、可用性等信息。
+然后到 admin 后台 → 接入管理 → 新增"节点诊断 Agent"接入。详见
+[`docs/host-agent.md`](docs/host-agent.md)。
 
-3. 容器排障  
-用户在前端直接问：
+## 文档目录
 
-```text
-帮我看看 iiot-haitu_seatable 这个服务为什么起不来
+```
+docs/
+├── platform.md                       # 平台总览（推荐先读）
+├── runbook.md                        # 诊断剧本图执行引擎详解
+└── host-agent.md                     # 替代 SSH 的节点排障方案
 ```
 
-模型会自动调用 Docker Swarm skill，检查服务健康、失败任务、错误日志、服务详情，并给出中文诊断报告。
+## 目录结构
 
-4. 会话存储
-前端 Chainlit 会话、用户消息、助手回复和 skill 调用轨迹现在都会通过当前 store 落库，默认优先使用 SQL/TiDB，不再只放在内存里。
-
-## 统一架构
-
-- [app.py](C:\Users\fengxiuli\Desktop\ai_alert\app.py)：Flask API 入口
-- [chainlit_app.py](C:\Users\fengxiuli\Desktop\ai_alert\chainlit_app.py)：统一前端对话入口
-- [runtime.py](C:\Users\fengxiuli\Desktop\ai_alert\runtime.py)：统一运行时装配
-- [ops_agent/agent.py](C:\Users\fengxiuli\Desktop\ai_alert\ops_agent\agent.py)：统一模型调度器
-- [ops_agent/skills.py](C:\Users\fengxiuli\Desktop\ai_alert\ops_agent\skills.py)：统一 skill registry
-- [services/zabbix_client.py](C:\Users\fengxiuli\Desktop\ai_alert\services\zabbix_client.py)：Zabbix 数据查询
-- [services/docker_swarm_client.py](C:\Users\fengxiuli\Desktop\ai_alert\services\docker_swarm_client.py)：Docker Swarm 查询
-- [services/alert_service.py](C:\Users\fengxiuli\Desktop\ai_alert\services\alert_service.py)：落库版告警处理
-- [services/alert_analysis_service.py](C:\Users\fengxiuli\Desktop\ai_alert\services\alert_analysis_service.py)：不落库版告警分析 skill
-
-## 运行方式
-
-1. 安装依赖
-
-```powershell
-python -m pip install -r requirements.txt
+```
+ai_work/
+├── app.py                       # Flask 入口（被 backend 容器跑）
+├── chainlit_app.py              # Chainlit 入口（被 chat 容器跑）
+├── mcp_app.py                   # MCP server ASGI 入口（独立可选）
+├── runtime.py                   # 装配 connection_manager / model_manager / skill_registry / invoker
+├── config.py                    # 环境变量统一聚合
+├── ops_platform/                # 平台 kernel
+│   ├── registry.py              # SkillRegistry
+│   ├── loader.py                # 扫描 skills/ 目录
+│   ├── invoker.py               # 统一执行 + 二次确认链 + tool-loop digest
+│   ├── signals.py               # 结构化 signals 定义 + agent 注入 hint
+│   ├── runbook_engine.py        # 图执行引擎（DAG + DSL + executor）
+│   ├── runbook_seeds.py         # 默认出厂剧本（图形式）
+│   ├── connection_manager.py    # CRUD + client 缓存
+│   ├── model_manager.py
+│   ├── context.py               # SkillContext (connection_for 路由)
+│   ├── auth.py                  # 简版 JWT + PBKDF2
+│   ├── crypto.py                # Fernet 凭证加密
+│   ├── prompts.py               # 5 段 system prompt 默认值
+│   ├── runbooks.py              # legacy 文档型剧本（给模型读）
+│   ├── store.py                 # 平台表 + ORM 简版
+│   ├── mcp_server.py            # MCP tool 暴露
+│   └── drivers/                 # 接入驱动
+│       ├── zabbix.py · swarm.py · k8s.py · host_agent.py · alert_analysis.py
+├── skills/                      # 22 个 skill 插件（每目录一个）
+├── services/                    # 底层 client（zabbix / swarm / k8s / host_agent）
+├── admin_app/                   # Flask 后台蓝图（/admin/api/v1/*）
+├── admin_ui/                    # Vue 3 + Vite 后台（→ Dockerfile.admin-ui 出 nginx 镜像）
+├── routers/                     # 老的告警接入 router
+├── models/                      # 告警 / incident 业务表 ORM
+├── deploy/                      # host_agent K8s/Swarm 部署清单
+├── docs/                        # 文档
+├── Dockerfile.backend
+├── Dockerfile.chat
+├── Dockerfile.admin-ui
+├── docker-compose.yml
+└── .env.example
 ```
 
-2. 复制环境变量模板
+## 当前状态
 
-```powershell
-Copy-Item .env.example .env
-```
+✅ 已完成：
+- 平台 kernel（skill 插件机制 / 5 driver / 31 skill / 4 graph runbook）
+- 三入口（Chainlit + Admin + MCP）共用 invoker
+- 写操作二次确认链 + 三重锁（visibility + needs_confirmation + admin approval）
+- 国产模型兼容（火山方舟 Code Plan 为默认 + 通义/智谱/DeepSeek）
+- host_agent 替代 SSH 排障（K8s + Swarm，含 containerd 适配）
+- Connection 凭证 Fernet 加密 + 自动迁移
+- 结构化 Signals 系统（19 种内置类型，agent 自动注入跨域 pivot hint）
+- Tool-loop digest（每次 skill 返回自动压缩，节省 ~50% token）
+- DB-backed prompt 段落库（admin 后台 CodeMirror 编辑、热加载）
+- **诊断剧本图执行引擎**（DAG + 引用 DSL + 9 种条件 + 信号驱动 + 执行回放）
+- Vue 后台 UI 清新简约风格 + CodeMirror 编辑器
+- Docker 化（三个 Dockerfile + compose）
 
-3. 配置 `.env`
-
-至少要关注：
-
-- `ZABBIX_BASE_URL`
-- `ZABBIX_USERNAME`
-- `ZABBIX_PASSWORD`
-- `AI_BASE_URL`
-- `AI_API_KEY`
-- `AI_MODEL`
-- `DOCKER_RUNNER`
-- `DOCKER_HOST`
-
-如果本机没有 Windows Docker Client，但 WSL 里有：
-
-```ini
-DOCKER_RUNNER=wsl
-WSL_DISTRO=Ubuntu
-DOCKER_HOST=tcp://169.24.216.227:3389
-```
-
-## 常用接口
-
-- `POST /api/v1/alerts/zabbix`
-- `POST /api/v1/alerts/notification`
-- `POST /api/v1/alerts/wechat`
-- `GET /health`
-- `GET /api/v1/system/storage`
-- `POST /api/v1/system/storage/cleanup`
-
-## 命令行测试
-
-统一 agent 测试脚本：
-
-```powershell
-python scripts/run_ops_agent_case.py "帮我看看 iiot-haitu_seatable 这个服务为什么起不来"
-```
-
-## 当前已验证
-
-1. 统一 agent 已能用 Docker Swarm skill 诊断 `iiot-haitu_seatable`
-2. 已定位真实根因：`JAVA_OPTS` 缺少 `-D` 前的空格，导致 JVM 把参数当成主类名
-3. 已能通过 Zabbix skill 查询 `WYY-DB09` 的所有挂载点容量信息
+🚧 路线图：详见 [`docs/platform.md` § 路线图](docs/platform.md#11-路线图)。

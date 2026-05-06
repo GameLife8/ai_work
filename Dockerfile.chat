@@ -1,0 +1,43 @@
+# =====================================================================
+# Chat：Chainlit 前端
+# 与 backend 共享同一份 Python 代码（runtime/ops_platform/skills/...），
+# 因为 chainlit_app 在进程内直接 create_runtime() 复用 SkillRegistry。
+# 同样需要内置 docker CLI / kubectl 才能调远端集群。
+# =====================================================================
+FROM python:3.11-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    TZ=Asia/Shanghai \
+    CHAINLIT_HOST=0.0.0.0 \
+    CHAINLIT_PORT=8000
+
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        tzdata curl ca-certificates \
+ && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.3.1.tgz \
+        -o /tmp/docker.tgz \
+ && tar -xzf /tmp/docker.tgz -C /tmp \
+ && mv /tmp/docker/docker /usr/local/bin/docker \
+ && rm -rf /tmp/docker /tmp/docker.tgz
+
+RUN curl -fsSL https://dl.k8s.io/release/v1.30.5/bin/linux/amd64/kubectl \
+        -o /usr/local/bin/kubectl \
+ && chmod +x /usr/local/bin/kubectl
+
+WORKDIR /app
+COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements.txt
+
+COPY . .
+
+EXPOSE 8000
+
+CMD ["chainlit", "run", "chainlit_app.py", "--host", "0.0.0.0", "--port", "8000", "-h"]

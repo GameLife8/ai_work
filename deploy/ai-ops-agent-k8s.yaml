@@ -1,0 +1,144 @@
+# ============================================================================
+# ai-ops-agent (K8s DaemonSet)
+#
+# 在每个节点起一个特权诊断容器，内置 nsenter / ss / iptables / tcpdump / ip /
+# dmesg / netshoot 等工具。平台通过 ``kubectl exec`` 进入此容器，再用 nsenter
+# 进入宿主机 namespace 排障，**完全替代 SSH**。
+#
+# 部署：
+#   kubectl apply -f ai-ops-agent-k8s.yaml
+#
+# 卸载：
+#   kubectl delete -f ai-ops-agent-k8s.yaml
+#
+# 注意：
+#   1. 镜像 nicolaka/netshoot 自带网络排障工具集；如果集群拉不到，可换成
+#      内网镜像（确保里面有 nsenter, iputils, iproute2, tcpdump, iptables,
+#      net-tools, ipvsadm, dnsutils 即可）。
+#   2. tolerations: operator=Exists 让 agent 也覆盖 master/control-plane 节点。
+#   3. 默认部到 ``ai-ops`` namespace，平台 host_agent connection 里默认就找这个。
+#   4. 容器运行时探测：host_inspect_container_netns 默认按 docker → crictl → ctr
+#      顺序探测；containerd-only 集群（K8s 1.24+）需要镜像里有 ``crictl``。
+#      netshoot 默认 **不带 crictl**，建议用扩展镜像或在 agent 启动时 install。
+#      简单方案：用 ``ai-ops/netshoot-crictl:latest``（自打）；或者在下面 initContainer
+#      里把 crictl 静态二进制下到 /host/usr/local/bin。
+# ============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ai-ops
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: ai-ops-agent
+  namespace: ai-ops
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: ai-ops-agent
+  namespace: ai-ops
+  labels:
+    app: ai-ops-agent
+spec:
+  selector:
+    matchLabels:
+      app: ai-ops-agent
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        app: ai-ops-agent
+    spec:
+      serviceAccountName: ai-ops-agent
+
+      # 看到宿主机所有进程 / 网络栈 / IPC
+      hostPID: true
+      hostNetwork: true
+      hostIPC: true
+      dnsPolicy: ClusterFirstWithHostNet
+
+      # 每台都跑（含 master）
+      tolerations:
+        - operator: Exists
+
+      priorityClassName: system-node-critical
+
+      # 可选：在 agent 启动前把 crictl 二进制装到容器内（containerd 排障用）
+      # 取消下面 initContainers 的注释，并把版本号 / 镜像源改成你内网可达的地址。
+      #
+      # initContainers:
+      #   - name: install-crictl
+      #     image: curlimages/curl:8.10.1
+      #     command:
+      #       - sh
+      #       - -c
+      #       - |
+      #         set -e
+      #         cd /tmp
+      #         curl -fsSL -o crictl.tgz \
+      #           https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.0/crictl-v1.30.0-linux-amd64.tar.gz
+      #         tar -xzf crictl.tgz
+      #         mv crictl /shared/crictl
+      #         chmod +x /shared/crictl
+      #     volumeMounts:
+      #       - { name: shared-bin, mountPath: /shared }
+
+      containers:
+        - name: agent
+          image: nicolaka/netshoot:latest
+          imagePullPolicy: IfNotPresent
+          # 不监听任何端口，等待 kubectl exec
+          command: ["sleep", "infinity"]
+          env:
+            # crictl 在 containerd 下的运行时 socket
+            - name: CONTAINER_RUNTIME_ENDPOINT
+              value: unix:///run/containerd/containerd.sock
+            - name: IMAGE_SERVICE_ENDPOINT
+              value: unix:///run/containerd/containerd.sock
+          securityContext:
+            privileged: true
+            capabilities:
+              add:
+                - SYS_ADMIN
+                - SYS_PTRACE
+                - NET_ADMIN
+                - NET_RAW
+          resources:
+            requests:
+              cpu: "20m"
+              memory: "32Mi"
+            limits:
+              cpu: "500m"
+              memory: "256Mi"
+          volumeMounts:
+            # 整个宿主机文件系统只读挂到 /host，供 chroot/查文件用
+            - { name: host-root,  mountPath: /host,    readOnly: true,  mountPropagation: HostToContainer }
+            - { name: host-proc,  mountPath: /host/proc, readOnly: true }
+            - { name: host-sys,   mountPath: /host/sys,  readOnly: true }
+            # 给 host_inspect_container_netns 用：进容器需要其中之一
+            - { name: docker-sock, mountPath: /var/run/docker.sock }
+            - { name: containerd-sock, mountPath: /run/containerd, readOnly: false }
+            # 如果用上面的 initContainer 装 crictl，把 shared-bin 接到 PATH
+            # - { name: shared-bin, mountPath: /usr/local/bin/crictl, subPath: crictl }
+
+      volumes:
+        - name: host-root
+          hostPath: { path: / }
+        - name: host-proc
+          hostPath: { path: /proc }
+        - name: host-sys
+          hostPath: { path: /sys }
+        - name: docker-sock
+          hostPath: { path: /var/run/docker.sock, type: "" }
+        - name: containerd-sock
+          hostPath: { path: /run/containerd, type: "" }
+        # 用 initContainer 装 crictl 时启用
+        # - name: shared-bin
+        #   emptyDir: {}
+
+      # 确保不被驱逐
+      terminationGracePeriodSeconds: 5

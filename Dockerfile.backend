@@ -1,0 +1,46 @@
+# =====================================================================
+# Backend：Flask API + Admin API + (可选) MCP server
+# 镜像内置 docker CLI 和 kubectl，用于通过 DOCKER_HOST / kubeconfig
+# 间接操作远端集群（不在本容器内启动 docker daemon）。
+# =====================================================================
+FROM python:3.11-slim AS base
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple \
+    PIP_TRUSTED_HOST=pypi.tuna.tsinghua.edu.cn \
+    TZ=Asia/Shanghai
+
+# 系统依赖：tzdata（zoneinfo 需要）+ docker CLI + kubectl + curl(健康检查)
+RUN sed -i 's|deb.debian.org|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends \
+        tzdata curl ca-certificates gnupg \
+ && ln -sf /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+ && rm -rf /var/lib/apt/lists/*
+
+# Docker CLI（仅 client）
+RUN curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.3.1.tgz \
+        -o /tmp/docker.tgz \
+ && tar -xzf /tmp/docker.tgz -C /tmp \
+ && mv /tmp/docker/docker /usr/local/bin/docker \
+ && rm -rf /tmp/docker /tmp/docker.tgz
+
+# kubectl
+RUN curl -fsSL https://dl.k8s.io/release/v1.30.5/bin/linux/amd64/kubectl \
+        -o /usr/local/bin/kubectl \
+ && chmod +x /usr/local/bin/kubectl
+
+WORKDIR /app
+
+COPY requirements.txt ./
+RUN pip install --upgrade pip && pip install -r requirements.txt && pip install gunicorn
+
+COPY . .
+
+EXPOSE 5000
+
+# 5 个 worker 起 Flask；如需调试改 ``python app.py``
+CMD ["gunicorn", "-w", "4", "-k", "gthread", "--threads", "8", \
+     "-b", "0.0.0.0:5000", "--access-logfile", "-", "app:app"]

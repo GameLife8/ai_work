@@ -42,6 +42,12 @@
           </span>
           <span>Skill 注册表</span>
         </RouterLink>
+        <RouterLink v-if="auth.isAdmin" class="menu-item" to="/http-skills">
+          <span class="menu-icon">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h18M3 6h18M3 18h18"/><circle cx="6" cy="6" r="1.4" fill="currentColor"/><circle cx="6" cy="12" r="1.4" fill="currentColor"/><circle cx="6" cy="18" r="1.4" fill="currentColor"/></svg>
+          </span>
+          <span>HTTP Skill</span>
+        </RouterLink>
         <RouterLink v-if="auth.isAdmin" class="menu-item" to="/runbooks">
           <span class="menu-icon">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="6" cy="6" r="3"/><circle cx="18" cy="6" r="3"/><circle cx="12" cy="18" r="3"/><line x1="6" y1="9" x2="12" y2="15"/><line x1="18" y1="9" x2="12" y2="15"/></svg>

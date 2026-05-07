@@ -11,6 +11,7 @@ from ops_platform.drivers.zabbix import ZabbixDriver
 from ops_platform.drivers.swarm import SwarmDriver
 from ops_platform.drivers.k8s import K8sDriver
 from ops_platform.drivers.host_agent import HostAgentDriver
+from ops_platform.drivers.http_api import HttpApiDriver
 from ops_platform.drivers.alert_analysis import AlertAnalysisDriver
 
 
@@ -36,6 +37,7 @@ def bootstrap_default_drivers() -> None:
     register(SwarmDriver())
     register(K8sDriver())
     register(HostAgentDriver())
+    register(HttpApiDriver())
     register(AlertAnalysisDriver())
 
 

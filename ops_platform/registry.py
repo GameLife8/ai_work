@@ -21,6 +21,8 @@ class SkillSpec:
     enabled: bool = True
     requires_admin_approval: bool = False
     confirmation_ttl_seconds: int = 300
+    source: str = "python"         # 'python' | 'http' | 'mcp'（future）
+    source_id: str | None = None   # http skill 的 DB row id（便于热加载逐条管理）
 
     def to_openai_tool(self) -> dict[str, Any]:
         return {
@@ -45,6 +47,7 @@ class SkillSpec:
             "enabled": self.enabled,
             "requires_admin_approval": self.requires_admin_approval,
             "params_schema": self.params_schema,
+            "source": self.source,
         }
 
 
@@ -58,6 +61,17 @@ class SkillRegistry:
         if spec.code in self._skills:
             raise ValueError(f"skill code 重复：{spec.code}")
         self._skills[spec.code] = spec
+
+    def unregister(self, code: str) -> bool:
+        """从注册表移除。HTTP skill 热加载用。返回是否真的移除了。"""
+        return self._skills.pop(code, None) is not None
+
+    def unregister_by_source(self, source: str) -> int:
+        """批量移除某来源（如 'http'）的全部 skill。"""
+        codes = [c for c, s in self._skills.items() if s.source == source]
+        for c in codes:
+            del self._skills[c]
+        return len(codes)
 
     def get(self, code: str) -> SkillSpec:
         if code not in self._skills:

@@ -347,6 +347,7 @@ ai_work/
 | [`README.md`](../README.md) | 项目根 README，启动指引 |
 | **`platform.md` (本文)** | 平台总览 |
 | [`runbook.md`](runbook.md) | 诊断剧本图执行引擎详解（DSL / 条件 / 信号 / 调试） |
+| [`http-skill.md`](http-skill.md) | YAML 声明式接入外部系统（Tier 1 + Tier 2/3 路线图） |
 | [`host-agent.md`](host-agent.md) | host_agent 部署 + 8 个 host_* skill 详解 |
 
 ---
@@ -365,6 +366,9 @@ ai_work/
 | ✅ | **Tool-loop digest**（自动压缩节省 token） |
 | ✅ | **DB-backed prompt 段落库 + admin UI 编辑**（5 段 + CodeMirror） |
 | ✅ | **诊断剧本图执行引擎**（DAG + DSL + 信号驱动 + admin 编辑 + 执行回放） |
+| ✅ | **HTTP Skill (Tier 1)** — YAML 声明式接入外部系统，热加载，详见 [docs/http-skill.md](http-skill.md) |
+| 🚧 | HTTP Skill **Tier 2**：OpenAPI/Swagger 批量导入生成 YAML 草稿 |
+| 🚧 | HTTP Skill **Tier 3**：Remote MCP Connection（直接 wrap 外部 MCP server）|
 | 🚧 | 自定义 HTTP node-agent（替代每节点暴露 dockerd TCP）|
 | 🚧 | MCP per-API-key role 区分 |
 | 🚧 | 写操作 webhook hook → SIEM/syslog |

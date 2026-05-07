@@ -365,6 +365,48 @@ class InMemoryPlatformStore:
         rec = self.runbook_executions.get(execution_id)
         return deepcopy(rec) if rec else None
 
+    # ---- http skills ----
+    def __init_http_skills_attr__(self) -> None:
+        if not hasattr(self, "http_skills"):
+            self.http_skills: dict[str, dict] = {}
+
+    def list_http_skills(self) -> list[dict]:
+        self.__init_http_skills_attr__()
+        return [deepcopy(v) for v in self.http_skills.values()]
+
+    def get_http_skill(self, code: str) -> dict | None:
+        self.__init_http_skills_attr__()
+        rec = self.http_skills.get(code)
+        return deepcopy(rec) if rec else None
+
+    def upsert_http_skill(self, *, code: str, title: str, description: str,
+                          category: str, connection_id: str | None,
+                          definition: dict, enabled: bool = True,
+                          updated_by: str | None = None) -> dict:
+        self.__init_http_skills_attr__()
+        with self._lock:
+            existing = self.http_skills.get(code) or {}
+            rec = {
+                "key": code,
+                "code": code,
+                "title": title,
+                "description": description or "",
+                "category": category or "integration",
+                "connection_id": connection_id,
+                "definition": deepcopy(definition or {}),
+                "enabled": bool(enabled),
+                "version": int(existing.get("version", 0)) + 1,
+                "updated_by": updated_by,
+                "updated_at": _now(),
+            }
+            self.http_skills[code] = rec
+            return deepcopy(rec)
+
+    def delete_http_skill(self, code: str) -> None:
+        self.__init_http_skills_attr__()
+        with self._lock:
+            self.http_skills.pop(code, None)
+
 
 class SQLPlatformStore:
     """SQL 版本的平台存储；与 SQLStore 共用同一个 engine。"""
@@ -556,6 +598,20 @@ class SQLPlatformStore:
                 created_at VARCHAR(64)
             )
             """,
+            """
+            CREATE TABLE IF NOT EXISTS platform_http_skill (
+                skill_code VARCHAR(128) PRIMARY KEY,
+                title VARCHAR(255),
+                description TEXT,
+                category VARCHAR(64),
+                connection_id VARCHAR(64),
+                definition_json TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                version INTEGER NOT NULL DEFAULT 1,
+                updated_by VARCHAR(128),
+                updated_at VARCHAR(64)
+            )
+            """,
         ]
 
     @staticmethod
@@ -680,6 +736,20 @@ class SQLPlatformStore:
                 started_at VARCHAR(64),
                 ended_at VARCHAR(64),
                 created_at VARCHAR(64)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS platform_http_skill (
+                skill_code VARCHAR(128) PRIMARY KEY,
+                title VARCHAR(255),
+                description TEXT,
+                category VARCHAR(64),
+                connection_id VARCHAR(64),
+                definition_json LONGTEXT,
+                enabled TINYINT NOT NULL DEFAULT 1,
+                version INT NOT NULL DEFAULT 1,
+                updated_by VARCHAR(128),
+                updated_at VARCHAR(64)
             )
             """,
         ]
@@ -1275,6 +1345,84 @@ class SQLPlatformStore:
             ).mappings().first()
         return self._row_to_execution(row) if row else None
 
+    # ---------- http skills ----------
+
+    @staticmethod
+    def _row_to_http_skill(row) -> dict:
+        d = dict(row)
+        if "skill_code" in d:
+            d["key"] = d["skill_code"]
+            d["code"] = d.pop("skill_code")
+        d["definition"] = json.loads(d.pop("definition_json") or "{}")
+        d["enabled"] = bool(d.get("enabled", 1))
+        d["version"] = int(d.get("version") or 1)
+        return d
+
+    def list_http_skills(self) -> list[dict]:
+        from sqlalchemy import text
+        with self.engine.begin() as conn:
+            rows = conn.execute(text("SELECT * FROM platform_http_skill ORDER BY skill_code")).mappings().all()
+        return [self._row_to_http_skill(r) for r in rows]
+
+    def get_http_skill(self, code: str) -> dict | None:
+        from sqlalchemy import text
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT * FROM platform_http_skill WHERE skill_code=:c"),
+                {"c": code},
+            ).mappings().first()
+        return self._row_to_http_skill(row) if row else None
+
+    def upsert_http_skill(self, *, code: str, title: str, description: str,
+                          category: str, connection_id: str | None,
+                          definition: dict, enabled: bool = True,
+                          updated_by: str | None = None) -> dict:
+        from sqlalchemy import text
+        now = _now()
+        with self.engine.begin() as conn:
+            existing = conn.execute(
+                text("SELECT version FROM platform_http_skill WHERE skill_code=:c"),
+                {"c": code},
+            ).mappings().first()
+            params = {
+                "c": code,
+                "title": title,
+                "description": description or "",
+                "category": category or "integration",
+                "connection_id": connection_id,
+                "definition_json": json.dumps(definition or {}, ensure_ascii=False),
+                "enabled": 1 if enabled else 0,
+                "updated_by": updated_by,
+                "updated_at": now,
+            }
+            if existing:
+                params["version"] = int(existing["version"] or 1) + 1
+                conn.execute(
+                    text("""UPDATE platform_http_skill
+                            SET title=:title, description=:description, category=:category,
+                                connection_id=:connection_id, definition_json=:definition_json,
+                                enabled=:enabled, version=:version,
+                                updated_by=:updated_by, updated_at=:updated_at
+                            WHERE skill_code=:c"""),
+                    params,
+                )
+            else:
+                params["version"] = 1
+                conn.execute(
+                    text("""INSERT INTO platform_http_skill
+                            (skill_code, title, description, category, connection_id,
+                             definition_json, enabled, version, updated_by, updated_at)
+                            VALUES (:c, :title, :description, :category, :connection_id,
+                                    :definition_json, :enabled, :version, :updated_by, :updated_at)"""),
+                    params,
+                )
+        return self.get_http_skill(code)
+
+    def delete_http_skill(self, code: str) -> None:
+        from sqlalchemy import text
+        with self.engine.begin() as conn:
+            conn.execute(text("DELETE FROM platform_http_skill WHERE skill_code=:c"), {"c": code})
+
     def update_pending_action_status(self, token: str, *, status: str,
                                      decided_by: str | None = None,
                                      reject_reason: str | None = None,
@@ -1313,6 +1461,7 @@ def attach_platform_store(store: Any) -> Any:
         "list_prompt_segments", "get_prompt_segment", "upsert_prompt_segment", "delete_prompt_segment",
         "list_runbooks", "get_runbook", "upsert_runbook", "delete_runbook",
         "save_runbook_execution", "list_runbook_executions", "get_runbook_execution",
+        "list_http_skills", "get_http_skill", "upsert_http_skill", "delete_http_skill",
     ]
     for name in method_names:
         setattr(store, name, getattr(platform, name))

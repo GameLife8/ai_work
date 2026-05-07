@@ -11,6 +11,7 @@ from ops_platform import (
     SkillInvoker,
     SkillRegistry,
 )
+from ops_platform.http_skill_loader import HttpSkillLoader
 from ops_platform.loader import load_skills_from_package
 from ops_platform.runbook_engine import RunbookRegistry
 from ops_platform.runbook_seeds import seed_default_runbooks
@@ -47,6 +48,7 @@ class AppRuntime:
     skill_registry: SkillRegistry
     skill_invoker: SkillInvoker
     runbook_registry: RunbookRegistry
+    http_skill_loader: HttpSkillLoader
 
 
 def create_runtime(config_cls=Config) -> AppRuntime:
@@ -103,6 +105,7 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     model_manager = ModelManager(store)
 
     runbook_registry = RunbookRegistry(None)  # 先占位，下面把 runtime 灌进去
+    http_skill_loader = HttpSkillLoader.__new__(HttpSkillLoader)  # 同样先占位
 
     runtime = AppRuntime(
         store=store,
@@ -120,6 +123,7 @@ def create_runtime(config_cls=Config) -> AppRuntime:
         skill_registry=skill_registry,
         skill_invoker=SkillInvoker(skill_registry, store),
         runbook_registry=runbook_registry,
+        http_skill_loader=http_skill_loader,
     )
     connection_manager.attach_runtime(runtime)
     connection_manager.ensure_bootstrap(config_cls)
@@ -129,4 +133,8 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     runbook_registry.runtime = runtime
     seed_default_runbooks(store)
     runbook_registry.reload()
+
+    # 装配 http_skill_loader：从 DB 加载 admin 配置的所有 HTTP skill
+    HttpSkillLoader.__init__(http_skill_loader, runtime)
+    http_skill_loader.reload()
     return runtime

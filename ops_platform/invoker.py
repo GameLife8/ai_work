@@ -14,6 +14,23 @@ from ops_platform.registry import SkillRegistry, SkillSpec
 logger = logging.getLogger(__name__)
 
 
+def _contains_stub_data(obj: Any, depth: int = 0) -> bool:
+    """递归找 ``_stub_data: True`` 标记；最多看 5 层避免无限递归。"""
+    if depth > 5:
+        return False
+    if isinstance(obj, dict):
+        if obj.get("_stub_data") is True:
+            return True
+        for v in obj.values():
+            if _contains_stub_data(v, depth + 1):
+                return True
+    elif isinstance(obj, list):
+        for v in obj[:30]:  # 仅看前 30 个元素，防止大列表性能崩
+            if _contains_stub_data(v, depth + 1):
+                return True
+    return False
+
+
 class SkillInvoker:
     """统一执行入口；被 chainlit / Flask API / MCP server 共用。
 
@@ -170,6 +187,20 @@ class SkillInvoker:
             result = {"error": error, "skill": spec.code, "params": params}
             logger.exception("skill %s 执行失败", spec.code)
         latency_ms = int((time.time() - started) * 1000)
+
+        # 检测 stub 数据：如果 result 里出现 _stub_data: True，自动 emit 警告信号
+        # 让 agent 在最终报告里告诉用户"这是模拟数据"
+        if isinstance(result, dict) and _contains_stub_data(result):
+            from ops_platform.signals import attach as _attach, signal as _sig
+            _attach(result, [_sig(
+                "stub_data_returned",
+                severity="warning",
+                evidence=(
+                    f"skill {spec.code} 返回了 _stub_data=True 的模拟数据。"
+                    "这意味着 connection 处于 stub 模式，并非真实监控数据。"
+                    "请到管理后台关掉对应 connection 的 use_stub 开关并填真实凭证。"
+                ),
+            )])
 
         try:
             audit_args = dict(params)

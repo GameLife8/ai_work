@@ -40,6 +40,17 @@ MANIFEST = {
                 "default": True,
                 "description": "是否一并返回磁盘信息；默认 true",
             },
+            "lookback_hours": {
+                "type": "number",
+                "default": 1,
+                "minimum": 0.25,
+                "maximum": 720,
+                "description": (
+                    "分析回看窗口（小时）。影响 metric_summary / memory_summary 的 avg/max/trend 是基于多长时间算的。"
+                    "默认 1；用户问「24 小时数据」传 24，「近一周」传 168。窗口越大平台自动用越大的采样间隔（24h→1h间隔，"
+                    "7d→6h 间隔），始终保持 12-30 个采样点。"
+                ),
+            },
         },
         "required": ["host_query"],
     },
@@ -95,14 +106,14 @@ def _extract_signals(result: dict) -> list[dict]:
 
 
 def run(ctx, *, host_query: str, connection_id: str | None = None,
-        include_storage: bool = True) -> dict:
+        include_storage: bool = True, lookback_hours: float = 1) -> dict:
     client = ctx.connection_for("zabbix", connection_id)
-    overview = client.get_host_overview(host_query)
+    overview = client.get_host_overview(host_query, lookback_hours=lookback_hours)
 
     # 一并拿磁盘信息：放在同一份结果里，admin 看一次就够了
     if include_storage:
         try:
-            storage = client.get_host_storage_overview(host_query)
+            storage = client.get_host_storage_overview(host_query, lookback_hours=lookback_hours)
             overview["filesystems"] = storage.get("filesystems") or []
         except Exception as exc:
             logger.warning("zabbix_get_host_overview 拿磁盘失败：%s", exc)

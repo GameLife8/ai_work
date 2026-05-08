@@ -11,9 +11,43 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-SAMPLE_INTERVAL_SECONDS = 300
-SAMPLE_POINTS = 12
+SAMPLE_INTERVAL_SECONDS = 300       # 默认每 5 分钟一个采样点
+SAMPLE_POINTS = 12                  # 默认 12 个点 = 1 小时窗口
 DEFAULT_EVENT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+
+# 所有 stub 返回都通过本函数打标记，避免假数据被静默当真实数据用
+def _mark_stub(data: dict) -> dict:
+    """给 stub 数据加 ``_stub_data: True`` 标记。
+
+    上层（skill / agent / chainlit）应该看到这个标记后明确告诉用户"这是模拟数据"，
+    或干脆拒绝使用。生产环境绝对不该出现 ``_stub_data=True`` 的响应。
+    """
+    if not isinstance(data, dict):
+        return data
+    data.setdefault("_stub_data", True)
+    data.setdefault(
+        "_stub_warning",
+        "⚠️ 此为 stub 模拟数据，不是真实监控数据。请把 connection 的 use_stub 关掉并填真实凭证。",
+    )
+    return data
+
+
+def compute_window(lookback_hours: float | int) -> tuple[int, int]:
+    """根据用户想看的小时数，挑合理的 (interval_seconds, sample_points)。
+
+    始终保持采样点 12-30 个之间，避免 24h 跨度时拉 288 个点把 token 烧爆。
+    """
+    if not lookback_hours or lookback_hours <= 0:
+        return SAMPLE_INTERVAL_SECONDS, SAMPLE_POINTS
+    h = float(lookback_hours)
+    if h <= 1:        return 300, 12        # 5min × 12 = 1h（默认）
+    if h <= 3:        return 600, int(h * 6)  # 10min step
+    if h <= 12:       return 1800, int(h * 2)  # 30min step
+    if h <= 24:       return 3600, int(h)    # 1h step → 24 点
+    if h <= 72:       return 7200, int(h / 2)  # 2h step
+    if h <= 168:      return 21600, int(h / 6)  # 6h step（一周 = 28 点）
+    return 86400, max(int(h / 24), 7)        # 1d step
 
 
 class ZabbixClient:
@@ -28,18 +62,21 @@ class ZabbixClient:
         self.base_url = base_url
         self.username = username
         self.password = password
+        # 实例级窗口（默认从模块常量初始化），可被 _with_window 临时覆盖
+        self._sample_interval_seconds = SAMPLE_INTERVAL_SECONDS
+        self._sample_points = SAMPLE_POINTS
         self.timeout_seconds = timeout_seconds
         self.use_stub = use_stub
         self._auth_token: str | None = None
         self._request_id = 0
 
     def healthcheck(self) -> dict:
-        if self.use_stub:
-            return {
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
+            return _mark_stub({
                 "backend": "stub",
                 "healthy": True,
                 "details": {"mode": "stub", "base_url": self.base_url},
-            }
+            })
 
         try:
             version = self.apiinfo_version()
@@ -63,7 +100,7 @@ class ZabbixClient:
             }
 
     def get_metric_summary(self, alert: dict) -> dict:
-        if self.use_stub:
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             return self._stub_metric_summary(alert)
 
         try:
@@ -96,7 +133,7 @@ class ZabbixClient:
         return self._stub_metric_summary(alert)
 
     def get_raw_context(self, alert: dict, needs: list[str]) -> dict:
-        if self.use_stub:
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             return {}
 
         try:
@@ -139,7 +176,7 @@ class ZabbixClient:
             return {}
 
     def get_disk_summary(self, alert: dict) -> dict:
-        if self.use_stub:
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             return self._stub_disk_summary(alert)
 
         mount_point = alert.get("resource_scope", {}).get("mount_point")
@@ -192,7 +229,7 @@ class ZabbixClient:
         return self._stub_disk_summary(alert)
 
     def get_memory_summary(self, alert: dict) -> dict:
-        if self.use_stub:
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             return self._stub_memory_summary(alert)
 
         try:
@@ -225,7 +262,7 @@ class ZabbixClient:
         return self._stub_memory_summary(alert)
 
     def get_disk_io_summary(self, alert: dict) -> dict:
-        if self.use_stub:
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             return self._stub_disk_io_summary(alert)
 
         try:
@@ -262,7 +299,7 @@ class ZabbixClient:
         return self._stub_disk_io_summary(alert)
 
     def get_availability_summary(self, alert: dict) -> dict:
-        if self.use_stub:
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             return self._stub_availability_summary(alert)
 
         try:
@@ -289,8 +326,12 @@ class ZabbixClient:
         return self._stub_availability_summary(alert)
 
     def find_host(self, host_query: str) -> dict | None:
-        if self.use_stub:
-            return {"hostid": "stub-host", "host": host_query, "name": host_query, "interfaces": [{"ip": "127.0.0.1"}]}
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
+            return {
+                "hostid": "stub-host", "host": host_query, "name": host_query,
+                "interfaces": [{"ip": "127.0.0.1"}],
+                "_stub_data": True,
+            }
 
         query = host_query.strip()
         if not query:
@@ -334,29 +375,44 @@ class ZabbixClient:
             return by_ip[0]
         return None
 
-    def get_host_overview(self, host_query: str) -> dict:
+    def get_host_overview(self, host_query: str, *, lookback_hours: float | int = 1) -> dict:
+        """主机概览。
+
+        ``lookback_hours``：分析回看窗口，影响 metric_summary / memory_summary 里的
+        avg / max / trend 是基于多长时间算的；availability 也按这个时间窗扫问题事件。
+        默认 1h；用户问"24 小时"传 24；问"近一周"传 168 即可。
+        """
         host = self.find_host(host_query)
         if not host:
             raise ValueError(f"未找到主机: {host_query}")
 
         alert = self._build_host_alert(host)
-        return {
-            "host": {
-                "host_id": host["hostid"],
-                "host_name": host.get("name") or host.get("host"),
-                "host_ip": self._extract_host_ip(host),
-            },
-            "metric_summary": self.get_metric_summary(alert),
-            "memory_summary": self.get_memory_summary(alert),
-            "availability_summary": self.get_availability_summary(alert),
-        }
+        with self._with_window(lookback_hours):
+            payload = {
+                "host": {
+                    "host_id": host["hostid"],
+                    "host_name": host.get("name") or host.get("host"),
+                    "host_ip": self._extract_host_ip(host),
+                },
+                "lookback_hours": float(lookback_hours or 1),
+                "metric_summary": self.get_metric_summary(alert),
+                "memory_summary": self.get_memory_summary(alert),
+                "availability_summary": self.get_availability_summary(alert),
+            }
+        return payload
 
-    def get_host_storage_overview(self, host_query: str) -> dict:
+    def get_host_storage_overview(self, host_query: str, *, lookback_hours: float | int | None = None) -> dict:
+        """磁盘容量概览。
+
+        ``lookback_hours`` 当前对磁盘容量值无影响（容量是当下快照，不是趋势）；
+        保留参数是为了 skill 接口和 host_overview 一致，未来可加"24h 内最高使用率"
+        / "增长速率" 等趋势指标。
+        """
         host = self.find_host(host_query)
         if not host:
             raise ValueError(f"未找到主机: {host_query}")
-        if self.use_stub:
-            return {
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
+            return _mark_stub({
                 "host": {
                     "host_id": host["hostid"],
                     "host_name": host.get("name") or host.get("host"),
@@ -366,7 +422,7 @@ class ZabbixClient:
                     {"mount_point": "/", "used_percent": 71.2, "free_gb": 120.0, "total_gb": 512.0},
                     {"mount_point": "/data", "used_percent": 84.3, "free_gb": 227.0, "total_gb": 2047.0},
                 ],
-            }
+            })
 
         items = self._get_host_items(host["hostid"])
         filesystems: dict[str, dict] = {}
@@ -410,7 +466,7 @@ class ZabbixClient:
         }
 
     def debug_metric_summary(self, alert: dict) -> dict:
-        if self.use_stub:
+        if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             summary = self._stub_metric_summary(alert)
             return {"mode": "stub", "summary": summary, "host_id": None, "cpu_item": None, "load_item": None}
 
@@ -584,13 +640,35 @@ class ZabbixClient:
                 continue
         return list(reversed(values))
 
-    @staticmethod
-    def _sample_window_metadata() -> dict:
+    def _sample_window_metadata(self) -> dict:
         return {
-            "sample_window_minutes": int(SAMPLE_INTERVAL_SECONDS * SAMPLE_POINTS / 60),
-            "sample_interval_minutes": int(SAMPLE_INTERVAL_SECONDS / 60),
-            "sample_count": SAMPLE_POINTS,
+            "sample_window_minutes": int(self._sample_interval_seconds * self._sample_points / 60),
+            "sample_interval_minutes": int(self._sample_interval_seconds / 60),
+            "sample_count": self._sample_points,
         }
+
+    def _with_window(self, lookback_hours: float | int | None):
+        """临时切换实例的采样窗口，with 块结束后自动还原。
+
+        ``lookback_hours`` 为 None 或 <=0 时不动（保持默认 1h 行为）。
+        """
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _ctx():
+            if not lookback_hours or lookback_hours <= 0:
+                yield
+                return
+            old_interval = self._sample_interval_seconds
+            old_points = self._sample_points
+            self._sample_interval_seconds, self._sample_points = compute_window(lookback_hours)
+            try:
+                yield
+            finally:
+                self._sample_interval_seconds = old_interval
+                self._sample_points = old_points
+
+        return _ctx()
 
     def _get_sampled_history(self, item_id: str, value_type: int | str, alert: dict | None) -> list[dict]:
         if not item_id:
@@ -598,7 +676,7 @@ class ZabbixClient:
 
         history_type = int(value_type)
         sample_times = self._build_sample_times(alert)
-        window_start = sample_times[0] - SAMPLE_INTERVAL_SECONDS
+        window_start = sample_times[0] - self._sample_interval_seconds
         result = self._rpc(
             "history.get",
             params={
@@ -646,8 +724,8 @@ class ZabbixClient:
 
     def _build_sample_times(self, alert: dict | None) -> list[int]:
         end_ts = self._resolve_reference_timestamp(alert)
-        start_ts = end_ts - (SAMPLE_POINTS - 1) * SAMPLE_INTERVAL_SECONDS
-        return [start_ts + index * SAMPLE_INTERVAL_SECONDS for index in range(SAMPLE_POINTS)]
+        start_ts = end_ts - (self._sample_points - 1) * self._sample_interval_seconds
+        return [start_ts + index * self._sample_interval_seconds for index in range(self._sample_points)]
 
     @staticmethod
     def _resolve_reference_timestamp(alert: dict | None) -> int:
@@ -700,75 +778,60 @@ class ZabbixClient:
             raise RuntimeError(f"Zabbix API error {error.get('code')}: {error.get('data') or error.get('message')}")
         return data.get("result")
 
+    # 注意：以下所有 _stub_* 方法仅在 use_stub=true 时被调用，所有返回都打 _stub_data 标记。
+    # 这样即使数据流到 agent / 模型，模型也能识别"这是模拟数据"而不是真实监控值。
+
     @staticmethod
     def _stub_metric_summary(alert: dict) -> dict:
         severity = alert.get("severity", "").lower()
         if severity in {"high", "critical"}:
-            return {"cpu_avg": 94.1, "cpu_max": 97.6, "load_avg": 18.2}
-        return {"cpu_avg": 68.2, "cpu_max": 76.4, "load_avg": 3.4}
+            return _mark_stub({"cpu_avg": 94.1, "cpu_max": 97.6, "load_avg": 18.2})
+        return _mark_stub({"cpu_avg": 68.2, "cpu_max": 76.4, "load_avg": 3.4})
 
     @staticmethod
     def _stub_disk_summary(alert: dict) -> dict:
         mount_point = alert.get("resource_scope", {}).get("mount_point", "/")
         host_name = alert.get("host_name", "").lower()
         if "db" in host_name or "tidb" in host_name:
-            return {
+            return _mark_stub({
                 "mount_point": mount_point,
-                "used_percent": 96.4,
-                "free_gb": 8.5,
-                "total_gb": 512.0,
-                "growth_gb_1h": 36.8,
-                "trend": "sharp_increase",
-            }
-        return {
+                "used_percent": 96.4, "free_gb": 8.5, "total_gb": 512.0,
+                "growth_gb_1h": 36.8, "trend": "sharp_increase",
+            })
+        return _mark_stub({
             "mount_point": mount_point,
-            "used_percent": 91.2,
-            "free_gb": 42.0,
-            "total_gb": 1024.0,
-            "growth_gb_1h": 4.3,
-            "trend": "gradual",
-        }
+            "used_percent": 91.2, "free_gb": 42.0, "total_gb": 1024.0,
+            "growth_gb_1h": 4.3, "trend": "gradual",
+        })
 
     @staticmethod
     def _stub_memory_summary(alert: dict) -> dict:
         host_name = alert.get("host_name", "").lower()
         if "db" in host_name or "tidb" in host_name:
-            return {
-                "memory_used_percent": 96.1,
-                "available_gb": 1.4,
-                "total_gb": 64.0,
-                "swap_used_percent": 68.0,
-                "trend": "rising_fast",
-            }
-        return {
-            "memory_used_percent": 88.0,
-            "available_gb": 9.8,
-            "total_gb": 32.0,
-            "swap_used_percent": 10.0,
-            "trend": "stable",
-        }
+            return _mark_stub({
+                "memory_used_percent": 96.1, "available_gb": 1.4, "total_gb": 64.0,
+                "swap_used_percent": 68.0, "trend": "rising_fast",
+            })
+        return _mark_stub({
+            "memory_used_percent": 88.0, "available_gb": 9.8, "total_gb": 32.0,
+            "swap_used_percent": 10.0, "trend": "stable",
+        })
 
     @staticmethod
     def _stub_disk_io_summary(alert: dict) -> dict:
         host_name = alert.get("host_name", "").lower()
         if "db" in host_name or "tidb" in host_name:
-            return {
-                "utilization_percent": 97.0,
-                "await_ms": 88.0,
-                "queue_size": 5.2,
+            return _mark_stub({
+                "utilization_percent": 97.0, "await_ms": 88.0, "queue_size": 5.2,
                 "trend": "sustained_high",
-            }
-        return {
-            "utilization_percent": 72.0,
-            "await_ms": 18.0,
-            "queue_size": 1.2,
+            })
+        return _mark_stub({
+            "utilization_percent": 72.0, "await_ms": 18.0, "queue_size": 1.2,
             "trend": "moderate",
-        }
+        })
 
     @staticmethod
     def _stub_availability_summary(alert: dict) -> dict:
-        return {
-            "ping_status": "down",
-            "agent_status": "down",
-            "last_seen_minutes_ago": 6,
-        }
+        return _mark_stub({
+            "ping_status": "down", "agent_status": "down", "last_seen_minutes_ago": 6,
+        })

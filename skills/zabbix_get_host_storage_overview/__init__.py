@@ -21,11 +21,21 @@ MANIFEST = {
         "properties": {
             "host_query": {"type": "string"},
             "connection_id": {"type": "string"},
+            "lookback_hours": {
+                "type": "number",
+                "default": 1,
+                "minimum": 0.25,
+                "maximum": 720,
+                "description": "占位参数，与其它 zabbix skill 接口对齐；磁盘容量是当下快照，时间窗暂不影响返回值。",
+            },
         },
         "required": ["host_query"],
     },
 }
 
 
-def run(ctx, *, host_query: str, connection_id: str | None = None) -> dict:
-    return ctx.connection_for("zabbix", connection_id).get_host_storage_overview(host_query)
+def run(ctx, *, host_query: str, connection_id: str | None = None,
+        lookback_hours: float = 1) -> dict:
+    return ctx.connection_for("zabbix", connection_id).get_host_storage_overview(
+        host_query, lookback_hours=lookback_hours,
+    )

@@ -1123,6 +1123,7 @@ class SQLStore:
 def create_store(config: Any) -> InMemoryStore | SQLStore:
     backend = str(getattr(config, "STORE_BACKEND", "memory")).lower()
     database_url = getattr(config, "DATABASE_URL", "")
+    strict = str(getattr(config, "STORE_STRICT", "false")).lower() == "true"
 
     if backend in {"sql", "tidb"} and database_url:
         try:
@@ -1131,9 +1132,30 @@ def create_store(config: Any) -> InMemoryStore | SQLStore:
             logger.info("Using SQL store backend.")
             return store
         except Exception as exc:  # pragma: no cover
-            logger.warning("Falling back to in-memory store because SQL store init failed: %s", exc)
+            # 之前是 warning + 静默降级——隐患很大（用户以为数据落库实际进了内存）。
+            # 改成 ERROR 级别 + 给清晰的排查方向；STORE_STRICT=true 时直接抛异常，
+            # 让运维明确知道"DB 没通就别启动"。
+            logger.error(
+                "❌ SQL store 初始化失败：%s\n"
+                "   DATABASE_URL=%s\n"
+                "   排查：tcp 是否通？账号密码对不对？库是否存在？\n"
+                "   设 STORE_STRICT=true 让平台启动时直接 fail；现在按 fallback 走内存——"
+                "**用户/接入/runbook/审计/会话历史重启即丢**。",
+                exc, database_url,
+            )
+            if strict:
+                raise
+            logger.error("⚠️  Falling back to InMemoryStore — data is volatile!")
+        else:
+            return store
 
-    logger.info("Using in-memory store backend.")
+    if backend in {"sql", "tidb"} and not database_url:
+        logger.error(
+            "❌ STORE_BACKEND=%s 但 DATABASE_URL 为空。请补全 .env 后重启。",
+            backend,
+        )
+
+    logger.info("Using in-memory store backend (开发模式 / DB 未配置)。")
     return InMemoryStore()
 
 

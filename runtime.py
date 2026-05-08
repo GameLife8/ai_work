@@ -12,6 +12,7 @@ from ops_platform import (
     SkillRegistry,
 )
 from ops_platform.http_skill_loader import HttpSkillLoader
+from ops_platform.http_skill_seeds import seed_default_http_skills
 from ops_platform.loader import load_skills_from_package
 from ops_platform.runbook_engine import RunbookRegistry
 from ops_platform.runbook_seeds import seed_default_runbooks
@@ -134,7 +135,53 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     seed_default_runbooks(store)
     runbook_registry.reload()
 
-    # 装配 http_skill_loader：从 DB 加载 admin 配置的所有 HTTP skill
+    # 装配 http_skill_loader：先 seed 默认（如 zabbix_jsonrpc，默认 disabled），再 reload
     HttpSkillLoader.__init__(http_skill_loader, runtime)
+    seed_default_http_skills(store)
     http_skill_loader.reload()
+
+    _log_data_source_state(runtime, config_cls)
     return runtime
+
+
+def _log_data_source_state(runtime, config_cls) -> None:
+    """启动时把"数据源真不真"明确打印出来，避免悄悄走 stub / memory 的尴尬。"""
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+
+    store_kind = type(runtime.store).__name__
+    if "InMemory" in store_kind:
+        log.error(
+            "⚠️  数据库未连通，store 已降级到 InMemoryStore——所有用户/接入/skill_call/runbook "
+            "执行历史**重启即丢**。检查 DATABASE_URL 是否可达：%s",
+            getattr(config_cls, "DATABASE_URL", "<unset>"),
+        )
+    else:
+        log.info("✅ 持久化层：%s（DATABASE_URL=%s）",
+                  store_kind, getattr(config_cls, "DATABASE_URL", "<unset>"))
+
+    if getattr(config_cls, "USE_STUB_ZABBIX", False):
+        log.error(
+            "⚠️  USE_STUB_ZABBIX=true，Zabbix 返回的全是 mock 数据。"
+            "生产/演示前请关掉这个开关并填 ZABBIX_USERNAME/ZABBIX_PASSWORD。"
+        )
+    elif not (getattr(config_cls, "ZABBIX_USERNAME", "") and getattr(config_cls, "ZABBIX_PASSWORD", "")):
+        log.warning(
+            "⚠️  Zabbix 用户名/密码为空，下次调用 Zabbix API 时会 login 失败。"
+            "在 .env 或 admin 后台 connection 里补全 ZABBIX_USERNAME/ZABBIX_PASSWORD。"
+        )
+    else:
+        log.info("✅ Zabbix 接入：%s（账号 %s）",
+                  getattr(config_cls, "ZABBIX_BASE_URL", ""),
+                  getattr(config_cls, "ZABBIX_USERNAME", ""))
+
+    if getattr(config_cls, "USE_STUB_AI", False):
+        log.warning("⚠️  USE_STUB_AI=true，模型走 stub 不真实调用。")
+    elif not getattr(config_cls, "AI_API_KEY", ""):
+        log.error(
+            "⚠️  AI_API_KEY 未配置，模型调用必失败。生产前一定填火山方舟 / 通义 / 智谱 等真实 key。"
+        )
+    else:
+        log.info("✅ 默认模型：%s（base_url=%s）",
+                  getattr(config_cls, "AI_MODEL", ""),
+                  getattr(config_cls, "AI_BASE_URL", ""))

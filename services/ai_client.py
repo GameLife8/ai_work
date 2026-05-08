@@ -364,6 +364,9 @@ class AIClient:
             "recommendations": recommendations,
         }
 
+    # 注意：以下 _stub_* 方法仅在 use_stub=true 时被调用。返回会进 prompt/research，
+    # 真实部署务必把 USE_STUB_AI=false 并填 AI_API_KEY。
+
     @staticmethod
     def _stub_plan(alert: dict) -> dict:
         service = alert.get("tags", {}).get("service")

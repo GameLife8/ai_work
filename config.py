@@ -17,7 +17,9 @@ class Config:
     ZABBIX_USERNAME = os.getenv("ZABBIX_USERNAME", "")
     ZABBIX_PASSWORD = os.getenv("ZABBIX_PASSWORD", "")
     ZABBIX_TIMEOUT_SECONDS = int(os.getenv("ZABBIX_TIMEOUT_SECONDS", "10"))
-    USE_STUB_ZABBIX = os.getenv("USE_STUB_ZABBIX", "true").lower() == "true"
+    # ⚠️ 默认 false——stub 数据是开发兜底，不该作为默认；如果想跑无 zabbix 的纯演示，
+    # 显式设 USE_STUB_ZABBIX=true
+    USE_STUB_ZABBIX = os.getenv("USE_STUB_ZABBIX", "false").lower() == "true"
     DOCKER_BIN = os.getenv("DOCKER_BIN", "docker")
     DOCKER_HOST = os.getenv("DOCKER_HOST", "tcp://169.24.216.227:3389")
     DOCKER_TLS_VERIFY = os.getenv("DOCKER_TLS_VERIFY", "")
@@ -35,6 +37,9 @@ class Config:
         f"mysql+pymysql://{TIDB_USERNAME}:{TIDB_PASSWORD}@{TIDB_HOST}:{TIDB_PORT}/{TIDB_DATABASE}?charset=utf8mb4",
     )
     STORE_BACKEND = os.getenv("STORE_BACKEND", "sql")
+    # STORE_STRICT=true 时，DB 连接失败直接 raise（生产建议打开），
+    # 不会悄悄走内存 store 让用户以为数据落库了
+    STORE_STRICT = os.getenv("STORE_STRICT", "false").lower() == "true"
 
     AI_PROVIDER = os.getenv("AI_PROVIDER", "volcengine_coding")
     AI_BASE_URL = os.getenv("AI_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
@@ -43,7 +48,8 @@ class Config:
     AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "10"))
 
     DEFAULT_CONTEXT_NEEDS = ["metric_summary", "topology", "related_incidents"]
-    USE_STUB_AI = os.getenv("USE_STUB_AI", "true").lower() == "true"
+    # ⚠️ 默认 false：必须配真实 AI key 才工作。CI/单元测试再显式开 stub。
+    USE_STUB_AI = os.getenv("USE_STUB_AI", "false").lower() == "true"
     AGENT_MAX_REASONING_STEPS = int(os.getenv("AGENT_MAX_REASONING_STEPS", "8"))
 
     # ---- 平台后台 ----

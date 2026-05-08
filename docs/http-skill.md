@@ -423,6 +423,35 @@ HTTP skill 自动出现在 MCP server 的 tool list。Claude Code / Cursor 通�
 实现量预估 ~250 行 + 一个 admin UI 页面。等 Tier 1 实际接 3 个以上 OpenAPI 系统再做，
 避免过度设计。
 
+### 案例：把 Zabbix 接入也"统一"成 HTTP YAML（架构迁移路径）
+
+Zabbix 本质就是 JSON-RPC HTTP API，理论上完全可以走 `http_api` driver + YAML skill。
+平台已经 seed 了一条 `zabbix_jsonrpc` 通用 skill 作为示例（默认 disabled）。
+
+**为什么不一刀切替换 Python ZabbixClient？**——分情况看：
+
+| Skill 类型 | 走 YAML 行不行 | 推荐 |
+|---|---|---|
+| 单步 RPC（host.get / item.get / history.get / problem.get …）| ✅ 完美适合 | **`zabbix_jsonrpc` YAML 一个搞定**——admin 启用即可。 |
+| 复合查询（host_overview = 找 host → 取 item → 拉 history → 算 avg/max）| ⚠️ 部分 | YAML 不能算 mean()。**Python skill 留着**做聚合，但每一步底层 RPC 可以改写成调 `zabbix_jsonrpc`，再用 runbook 编排。 |
+| 自定义业务查询（"查 X 业务线最近一周告警次数"）| ✅ | admin 在后台直接写一份 YAML，复用 `zabbix_jsonrpc` 思路，零代码上线。 |
+
+**启用 zabbix_jsonrpc 的步骤**：
+
+1. 在 Zabbix 6.0+ 控制台：Administration → User → API tokens → 生成一个 token
+2. 平台后台 → 接入管理 → 新增接入 → 选 **HTTP API**：
+   - `base_url` = `http://your-zabbix/zabbix/api_jsonrpc.php`
+   - `auth_kind` = `bearer`
+   - `bearer_token` = 上一步生成的 token
+   - 验证连通
+3. 平台后台 → HTTP Skill → 编辑 `zabbix_jsonrpc`：
+   - 把 `connection_id` 设为上一步建的 connection
+   - `enabled: true`
+   - 保存
+4. 立即在 Chainlit 里能调：`zabbix_jsonrpc(method="host.get", params={...})`
+
+注意：Zabbix 5.x 及以下不支持 API token + Bearer，必须先调 `user.login` 拿 auth token 再放到 body 里。这种情况要等 `http_api` driver 加 `zabbix_login` 这种自定义 auth flow 支持，或者继续用 Python `ZabbixClient`。
+
 ### Tier 3 · Remote MCP Connection（计划中）
 
 未来如果对接的系统已经发了 MCP server（Atlassian、GitHub、Notion 等都在做），可以走：

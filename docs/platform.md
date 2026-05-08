@@ -317,6 +317,74 @@ docker compose up -d backend
 - `alert_event` / `alert_decision` / `incident` / `incident_alert_rel`
 - `chat_session` / `chat_message`
 
+### env 是种子，DB 是真相（single source of truth）
+
+> 一句话：`.env` 里的 `ZABBIX_*` / `AI_*` / `DOCKER_*` 只在第一次启动时被
+> `ensure_bootstrap` 写进 `platform_connection` / `platform_model_config` 表，
+> 之后**所有运行期决策都读 DB**。admin 在后台改完连接立即生效，无需重启进程。
+
+#### 启动时序（[`runtime.py`](../runtime.py) `create_runtime`）
+
+```
+1. 建 connection_manager / model_manager（持有 store）
+2. ensure_bootstrap(config_cls)：
+     - 第一次启动：把 env 里 ZABBIX_* / DOCKER_* 等读出来，落 DB（带 is_default=true）
+     - 之后启动：DB 里已有 row → 跳过，env 改了也不会覆盖 DB
+3. _build_legacy_clients(runtime, config_cls)：
+     - 从 DB 默认 connection 派生 zabbix_client / docker_swarm_client
+     - 从 DB 默认 model 派生 ai_client（alert pipeline 用的）
+     - context_fetcher / alert_service / alert_analysis_service 也跟着重建
+4. http_skill_loader.reload() / runbook_registry.reload()：从 DB 加载所有 YAML
+5. _attach_refresh_method：挂 runtime.refresh_legacy_clients()
+6. _kick_off_async_health_check：后台线程把每条 connection 拨号一次，状态写回 DB
+```
+
+**关键：第 3 步在第 2 步之后**——alert pipeline 老链路 (`POST /api/v1/alerts/*`) 看到的
+`zabbix_client.username` 跟 admin 后台 `connection_manager.get_default("zabbix")` 是同一份。
+
+#### 改了 connection 之后的传播路径
+
+```
+admin UI 改默认 zabbix connection
+   ↓
+PATCH /admin/api/v1/connections/<id>
+   ↓
+connection_manager.update(...)             # 写 DB（Fernet 加密）
+   ↓
+检测到 is_default=True → 自动调用
+runtime.refresh_legacy_clients()
+   ↓
+_build_legacy_clients(...)
+   ↓
+runtime.zabbix_client / .ai_client / .docker_swarm_client 全部换成新实例
+runtime.context_fetcher / .alert_service 也是新的
+   ↓
+下一次告警分析请求立即用新凭证
+```
+
+模型 (`platform_model_config`) 走同一条路径，PATCH `/admin/api/v1/models/<id>` 触发
+`refresh_legacy_clients`。
+
+#### 为什么 env 还留着
+
+- **首次部署的种子**：新装空 DB，需要一份"出厂默认"才能跑起来
+- **本地调试 fallback**：`STORE_BACKEND=memory` 没 DB 时，env 直接当配置用
+- **不可恢复降级**：DB 默认连接被误删时（极端场景），代码里有 env fallback 兜底
+
+但只要 DB 里有 row，**env 不再被读**——这是排查"我后台明明改了为什么没生效"问题的钥匙。
+
+#### 自检命令
+
+启动日志里会打印当前真正生效的来源（[`runtime._log_data_source_state`](../runtime.py)）：
+
+```
+✓ 默认 zabbix connection: dmz-cluster01 → http://169.24.2.90/zabbix/api_jsonrpc.php (use_stub=False)
+✓ 默认 model: ark-code-latest → https://ark.cn-beijing.volces.com/api/coding/v3 (api_key=ed7c***ab12)
+```
+
+如果看到 `use_stub=True` 或 `api_key 未配置`，去 admin UI **接入管理 / 模型管理** 改 row，
+不要去改 .env——env 现在是只读种子。
+
 ---
 
 ## 9. 部署

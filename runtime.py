@@ -53,72 +53,41 @@ class AppRuntime:
 
 
 def create_runtime(config_cls=Config) -> AppRuntime:
+    """构造平台 runtime。
+
+    启动顺序很重要——必须先把 connection_manager / model_manager 装好并 ensure_bootstrap
+    （这一步把 env 里的种子值写进 DB），**之后** 再从 DB 派生 alert pipeline 老链路用的
+    zabbix_client / ai_client / docker_swarm_client。这样 env 真的只是"种子"，
+    DB 才是 single source of truth。
+
+    admin 在后台修改默认 connection / model 之后调用 ``runtime.refresh_legacy_clients()``
+    可让 alert pipeline 立即拿到新凭证，无需重启进程。
+    """
     store = create_store(config_cls)
     attach_platform_store(store)
 
-    zabbix_client = ZabbixClient(
-        base_url=config_cls.ZABBIX_BASE_URL,
-        username=config_cls.ZABBIX_USERNAME,
-        password=config_cls.ZABBIX_PASSWORD,
-        timeout_seconds=config_cls.ZABBIX_TIMEOUT_SECONDS,
-        use_stub=config_cls.USE_STUB_ZABBIX,
-    )
-    graph_client = GraphClient()
-    incident_service = IncidentService(store)
-    context_fetcher = ContextFetcher(zabbix_client, graph_client, incident_service)
-    ai_client = AIClient(
-        provider=config_cls.AI_PROVIDER,
-        base_url=config_cls.AI_BASE_URL,
-        api_key=config_cls.AI_API_KEY,
-        model=config_cls.AI_MODEL,
-        timeout_seconds=config_cls.AI_TIMEOUT_SECONDS,
-        use_stub=config_cls.USE_STUB_AI,
-    )
-    decision_engine = DecisionEngine()
-    alert_service = AlertService(
-        store=store,
-        ai_client=ai_client,
-        context_fetcher=context_fetcher,
-        incident_service=incident_service,
-        decision_engine=decision_engine,
-        default_needs=config_cls.DEFAULT_CONTEXT_NEEDS,
-    )
-    alert_analysis_service = AlertAnalysisService(
-        ai_client=ai_client,
-        context_fetcher=context_fetcher,
-        decision_engine=decision_engine,
-        default_needs=config_cls.DEFAULT_CONTEXT_NEEDS,
-    )
-    docker_swarm_client = DockerSwarmClient(
-        docker_bin=config_cls.DOCKER_BIN,
-        docker_host=config_cls.DOCKER_HOST,
-        docker_tls_verify=config_cls.DOCKER_TLS_VERIFY,
-        docker_cert_path=config_cls.DOCKER_CERT_PATH,
-        log_default_tail=config_cls.DOCKER_LOG_DEFAULT_TAIL,
-        log_max_tail=config_cls.DOCKER_LOG_MAX_TAIL,
-    )
-
-    # ---- platform kernel ----
+    # ---- platform kernel：先装 manager，再让它从 env 种子写一份 DB connection ----
     skill_registry = SkillRegistry()
     load_skills_from_package("skills", skill_registry)
 
     connection_manager = ConnectionManager(store)
     model_manager = ModelManager(store)
 
-    runbook_registry = RunbookRegistry(None)  # 先占位，下面把 runtime 灌进去
-    http_skill_loader = HttpSkillLoader.__new__(HttpSkillLoader)  # 同样先占位
+    runbook_registry = RunbookRegistry(None)  # 先占位
+    http_skill_loader = HttpSkillLoader.__new__(HttpSkillLoader)
 
+    # 先建 runtime 骨架，下面再把 alert pipeline 的 legacy clients 灌进来
     runtime = AppRuntime(
         store=store,
-        zabbix_client=zabbix_client,
-        graph_client=graph_client,
-        incident_service=incident_service,
-        context_fetcher=context_fetcher,
-        ai_client=ai_client,
-        decision_engine=decision_engine,
-        alert_service=alert_service,
-        alert_analysis_service=alert_analysis_service,
-        docker_swarm_client=docker_swarm_client,
+        zabbix_client=None,                     # 先占位，下面 refresh_legacy_clients 填
+        graph_client=GraphClient(),
+        incident_service=IncidentService(store),
+        context_fetcher=None,                   # 占位
+        ai_client=None,                         # 占位
+        decision_engine=DecisionEngine(),
+        alert_service=None,                     # 占位
+        alert_analysis_service=None,            # 占位
+        docker_swarm_client=None,               # 占位
         connection_manager=connection_manager,
         model_manager=model_manager,
         skill_registry=skill_registry,
@@ -130,6 +99,9 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     connection_manager.ensure_bootstrap(config_cls)
     model_manager.ensure_bootstrap(config_cls)
 
+    # ---- alert pipeline 老链路：从 DB 默认 connection / model 派生（不再读 env） ----
+    _build_legacy_clients(runtime, config_cls)
+
     # 装配 runbook_registry：先 seed 默认（如果空表），再 reload 进内存
     runbook_registry.runtime = runtime
     seed_default_runbooks(store)
@@ -140,9 +112,114 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     seed_default_http_skills(store)
     http_skill_loader.reload()
 
+    _attach_refresh_method(runtime, config_cls)
     _log_data_source_state(runtime, config_cls)
     _kick_off_async_health_check(runtime)
     return runtime
+
+
+def _build_legacy_clients(runtime, config_cls) -> None:
+    """从 DB 的默认 connection / model 派生 alert pipeline 老链路用的 client。
+
+    这样：
+      - alert pipeline (POST /api/v1/alerts/*) 看到的凭证 = admin 在后台改的凭证（DB）
+      - env 真的只是 ensure_bootstrap 的种子值
+      - admin 改完连接后调 ``runtime.refresh_legacy_clients()`` 立即生效
+    """
+    store = runtime.store
+    cm = runtime.connection_manager
+    mm = runtime.model_manager
+
+    # ---- ZabbixClient：从默认 zabbix connection 派生 ----
+    z_default = cm.get_default("zabbix")
+    if z_default:
+        # connection_manager.get_client 已经按 driver 建好了 ZabbixClient，直接复用
+        runtime.zabbix_client = cm.get_client(z_default["id"])
+    else:
+        # DB 没 zabbix connection（极少见）→ 用 env 种子兜底
+        runtime.zabbix_client = ZabbixClient(
+            base_url=config_cls.ZABBIX_BASE_URL,
+            username=config_cls.ZABBIX_USERNAME,
+            password=config_cls.ZABBIX_PASSWORD,
+            timeout_seconds=config_cls.ZABBIX_TIMEOUT_SECONDS,
+            use_stub=config_cls.USE_STUB_ZABBIX,
+        )
+
+    # ---- DockerSwarmClient ----
+    s_default = cm.get_default("swarm")
+    if s_default:
+        runtime.docker_swarm_client = cm.get_client(s_default["id"])
+    else:
+        runtime.docker_swarm_client = DockerSwarmClient(
+            docker_bin=config_cls.DOCKER_BIN,
+            docker_host=config_cls.DOCKER_HOST,
+            docker_tls_verify=config_cls.DOCKER_TLS_VERIFY,
+            docker_cert_path=config_cls.DOCKER_CERT_PATH,
+            log_default_tail=config_cls.DOCKER_LOG_DEFAULT_TAIL,
+            log_max_tail=config_cls.DOCKER_LOG_MAX_TAIL,
+        )
+
+    # ---- AIClient（alert pipeline 用的，跟 OpsModelClient 不是同一个但参数一致）----
+    m_default = mm.get_default()
+    if m_default:
+        runtime.ai_client = AIClient(
+            provider=m_default.get("provider", "volcengine_ark"),
+            base_url=m_default["base_url"],
+            api_key=m_default["api_key"],
+            model=m_default.get("model", ""),
+            timeout_seconds=int(m_default.get("timeout_seconds") or 120),
+            use_stub=False,
+        )
+    else:
+        runtime.ai_client = AIClient(
+            provider=config_cls.AI_PROVIDER,
+            base_url=config_cls.AI_BASE_URL,
+            api_key=config_cls.AI_API_KEY,
+            model=config_cls.AI_MODEL,
+            timeout_seconds=config_cls.AI_TIMEOUT_SECONDS,
+            use_stub=config_cls.USE_STUB_AI,
+        )
+
+    # ---- 依赖这些 client 的服务 ----
+    runtime.context_fetcher = ContextFetcher(
+        runtime.zabbix_client, runtime.graph_client, runtime.incident_service,
+    )
+    runtime.alert_service = AlertService(
+        store=store,
+        ai_client=runtime.ai_client,
+        context_fetcher=runtime.context_fetcher,
+        incident_service=runtime.incident_service,
+        decision_engine=runtime.decision_engine,
+        default_needs=config_cls.DEFAULT_CONTEXT_NEEDS,
+    )
+    runtime.alert_analysis_service = AlertAnalysisService(
+        ai_client=runtime.ai_client,
+        context_fetcher=runtime.context_fetcher,
+        decision_engine=runtime.decision_engine,
+        default_needs=config_cls.DEFAULT_CONTEXT_NEEDS,
+    )
+
+
+def _attach_refresh_method(runtime, config_cls) -> None:
+    """挂一个 refresh_legacy_clients 方法到 runtime，admin 改连接后调用即可。"""
+    def _refresh():
+        import logging as _logging
+        log = _logging.getLogger(__name__)
+        try:
+            _build_legacy_clients(runtime, config_cls)
+            # 顺便刷一下 app.extensions，让 Flask 路由也看见新实例
+            try:
+                from flask import current_app
+                current_app.extensions["alert_service"] = runtime.alert_service
+            except Exception:
+                pass  # 不在请求上下文里，跳过
+            log.info("alert pipeline 老链路 client 已刷新（取自 DB 当前默认 connection / model）")
+            return True
+        except Exception as exc:
+            log.exception("refresh_legacy_clients 失败：%s", exc)
+            return False
+
+    runtime.refresh_legacy_clients = _refresh
 
 
 def _kick_off_async_health_check(runtime) -> None:

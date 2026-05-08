@@ -242,6 +242,13 @@ def update_connection(connection_id):
         existing = _store().get_connection(connection_id) or {}
         fields["config"] = _unmask_config(fields["config"], existing.get("config") or {}, CONNECTION_SECRETS)
     record = _runtime().connection_manager.update(connection_id, **fields)
+
+    # 如果改的是默认 connection（zabbix/swarm），让 alert pipeline 老链路也立即用新值
+    if record and (record.get("is_default") or fields.get("is_default")):
+        refresh = getattr(_runtime(), "refresh_legacy_clients", None)
+        if callable(refresh):
+            refresh()
+
     return jsonify(_strip_secrets(record, CONNECTION_SECRETS))
 
 
@@ -319,6 +326,13 @@ def update_model(model_id):
         if not fields["api_key"]:
             fields.pop("api_key")
     record = _runtime().model_manager.update(model_id, **fields)
+
+    # 改的是默认模型 → 刷 alert pipeline 老链路用的 AIClient
+    if record and (record.get("is_default") or fields.get("is_default")):
+        refresh = getattr(_runtime(), "refresh_legacy_clients", None)
+        if callable(refresh):
+            refresh()
+
     return jsonify(_strip_secrets(record, ("api_key",)))
 
 

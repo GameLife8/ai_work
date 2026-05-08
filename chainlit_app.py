@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import uuid
@@ -155,43 +156,62 @@ async def on_message(message: cl.Message) -> None:
         runtime.store.save_chat_message(session_id, "user", text,
                                         metadata={"user": (user or {}).get("username")})
 
-    try:
-        outcome = agent.ask(
-            text,
-            user=user,
-            session_id=session_id,
-            selected_connections=selected,
+    # ---- 模型分析中：用 cl.Step 显示 spinner，agent.ask 在线程池里跑不阻塞事件循环 ----
+    async with cl.Step(name="🤖 模型分析中…", type="llm") as step:
+        step.input = text
+        try:
+            outcome = await asyncio.to_thread(
+                agent.ask,
+                text,
+                user=user,
+                session_id=session_id,
+                selected_connections=selected,
+            )
+        except Exception as exc:
+            step.output = f"处理失败：{exc}"
+            if runtime and session_id:
+                runtime.store.save_chat_message(session_id, "assistant", f"处理失败：{exc}",
+                                                metadata={"error": True})
+            await cl.Message(content=f"处理失败：{exc}").send()
+            return
+        step.output = (
+            f"调用 {len(outcome.trace)} 个 skill；"
+            f"待确认 {len(outcome.pending_actions)} 个写操作。"
         )
-    except Exception as exc:
-        if runtime and session_id:
-            runtime.store.save_chat_message(session_id, "assistant", f"处理失败：{exc}",
-                                            metadata={"error": True})
-        await cl.Message(content=f"处理失败：{exc}").send()
-        return
 
+    # ---- 把每次 skill 调用以原生 cl.Step 形式渲染（默认折叠 + 自带耗时） ----
+    for item in outcome.trace:
+        sigs = item.get("signals") or []
+        sig_chip = (
+            "  📡 " + ", ".join(s.get("type", "") for s in sigs) if sigs else ""
+        )
+        step_name = (
+            f"🔧 {item.get('tool_name')}"
+            f"  ·  {item.get('status')}"
+            f"  ·  {item.get('latency_ms', 0)}ms"
+            f"{sig_chip}"
+        )
+        async with cl.Step(name=step_name, type="tool") as s:
+            s.input = json.dumps(item.get("tool_args") or {}, ensure_ascii=False, indent=2)
+            s.output = json.dumps(
+                {
+                    "status": item.get("status"),
+                    "signals": sigs,
+                    "result": item.get("tool_result"),
+                },
+                ensure_ascii=False, indent=2, default=str,
+            )
+
+    # ---- 最终中文报告 ----
     if runtime and session_id:
         runtime.store.save_chat_message(
             session_id, "assistant", outcome.message,
             trace=outcome.trace,
             metadata={"trace_count": len(outcome.trace)},
         )
-
     await cl.Message(content=outcome.message).send()
 
-    if outcome.trace:
-        await cl.Message(
-            content=(
-                f"本次共调用 {len(outcome.trace)} 个 skill。\n\n"
-                "<details>\n"
-                "<summary>点击展开 skill 调用轨迹</summary>\n\n"
-                "```json\n"
-                f"{json.dumps(outcome.trace, ensure_ascii=False, indent=2)}\n"
-                "```\n"
-                "</details>"
-            )
-        ).send()
-
-    # 写操作待确认：每个 pending action 都弹一张确认卡
+    # ---- 写操作待确认：每个 pending action 都弹一张确认卡 ----
     for pending in outcome.pending_actions:
         await _ask_confirmation(pending, agent=agent, user=user, session_id=session_id, runtime=runtime)
 
@@ -224,10 +244,15 @@ async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, sess
         runtime=runtime, user=user, session_id=session_id,
         selected_connections=cl.user_session.get("selected_connections") or {},
     )
-    if res.get("name") == "confirm_action":
-        envelope = runtime.skill_invoker.confirm(token, ctx)
-    else:
-        envelope = runtime.skill_invoker.reject(token, ctx, reason="user_rejected_in_chainlit")
+    action_name = "执行" if res.get("name") == "confirm_action" else "拒绝"
+    async with cl.Step(name=f"⚙️ 平台正在{action_name}写操作…", type="tool") as step:
+        if res.get("name") == "confirm_action":
+            envelope = await asyncio.to_thread(runtime.skill_invoker.confirm, token, ctx)
+        else:
+            envelope = await asyncio.to_thread(
+                runtime.skill_invoker.reject, token, ctx, "user_rejected_in_chainlit",
+            )
+        step.output = json.dumps(envelope, ensure_ascii=False, indent=2, default=str)
 
     runtime.store.save_chat_message(
         session_id, "assistant",
@@ -235,5 +260,8 @@ async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, sess
         metadata={"action_decision": res.get("name"), "token": token},
     )
 
-    follow_up = agent.follow_up_after_action(envelope, user=user, session_id=session_id)
+    async with cl.Step(name="📝 模型整理执行结果…", type="llm"):
+        follow_up = await asyncio.to_thread(
+            agent.follow_up_after_action, envelope, user=user, session_id=session_id,
+        )
     await cl.Message(content=follow_up).send()

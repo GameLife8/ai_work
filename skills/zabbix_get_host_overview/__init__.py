@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+import logging
+
+from ops_platform.signals import (
+    SEV_CRITICAL, SEV_WARNING,
+    SIG_AGENT_DOWN, SIG_HIGH_CPU, SIG_HIGH_DISK, SIG_HIGH_MEM,
+    SIG_HOST_UNREACHABLE,
+    attach, signal,
+)
+
+
+logger = logging.getLogger(__name__)
+
+
 MANIFEST = {
     "code": "zabbix_get_host_overview",
-    "name": "主机概览",
+    "name": "主机概览（CPU + 内存 + 磁盘 + 可用性）",
     "description": (
-        "获取主机概览：CPU 用率、内存用率、agent 可用性、近 1h 趋势。"
+        "获取主机的**全量基础信息**：可用性（ping / agent）+ CPU 用率 + 内存用率 + "
+        "**所有挂载点磁盘容量**。一次调用就能回答「主机基础信息 / 主机当前状态 / 主机概览」。"
         "**两类典型场景**："
-        "(1) 用户直接问「主机当前状态」——直接调；"
-        "(2) 容器/Pod 排障时把 swarm task.Node / k8s pod.node 当作 host_query 反查——验证容器异常是不是宿主机扛不住引起的。"
-        "如果 CPU 持续 >80% 或内存 >90%，往往就是导致容器 OOM/重启的根因；"
-        "如果 agent 不可用，主机本身可能宕机或网络隔离，需要走另一条排查路径。"
+        "(1) 用户直接问「基础信息 / 主机概况 / 主机情况」——直接调本 skill 即可；"
+        "(2) 容器/Pod 排障时把 swarm task.Node / k8s pod.node 当作 host_query 反查——"
+        "    验证容器异常是不是宿主机 CPU/MEM/DISK 扛不住引起的。"
+        "信号判定：CPU >80% / MEM >90% / 任一挂载点 >90% → 高度疑似宿主机层根因。"
+        "agent 不可用 / ping 不通 → 主机宕机或网络隔离，要换另一条排查路径。"
     ),
     "category": "zabbix",
     "required_connection_type": "zabbix",
@@ -20,11 +35,78 @@ MANIFEST = {
         "properties": {
             "host_query": {"type": "string"},
             "connection_id": {"type": "string"},
+            "include_storage": {
+                "type": "boolean",
+                "default": True,
+                "description": "是否一并返回磁盘信息；默认 true",
+            },
         },
         "required": ["host_query"],
     },
 }
 
 
-def run(ctx, *, host_query: str, connection_id: str | None = None) -> dict:
-    return ctx.connection_for("zabbix", connection_id).get_host_overview(host_query)
+def _extract_signals(result: dict) -> list[dict]:
+    """从聚合结果里识别异常信号——驱动跨域 pivot 用。"""
+    sigs: list[dict] = []
+    host = (result.get("host") or {}).get("host_name") or ""
+
+    avail = result.get("availability_summary") or {}
+    if avail.get("ping_status") == "down" or avail.get("agent_status") == "down":
+        last_seen = avail.get("last_seen_minutes_ago")
+        sigs.append(signal(
+            SIG_HOST_UNREACHABLE if avail.get("ping_status") == "down" else SIG_AGENT_DOWN,
+            severity=SEV_CRITICAL,
+            evidence=(
+                f"主机 {host} ping={avail.get('ping_status')} agent={avail.get('agent_status')}"
+                + (f"，最后心跳 {last_seen} 分钟前" if last_seen is not None else "")
+            ),
+        ))
+
+    mem = result.get("memory_summary") or {}
+    used_pct = mem.get("memory_used_percent")
+    if isinstance(used_pct, (int, float)) and used_pct >= 90:
+        sigs.append(signal(
+            SIG_HIGH_MEM, severity=SEV_CRITICAL,
+            evidence=f"主机 {host} 内存使用率 {used_pct}%（>= 90%）",
+        ))
+
+    metric = result.get("metric_summary") or {}
+    cpu_avg = metric.get("cpu_avg")
+    if isinstance(cpu_avg, (int, float)) and cpu_avg >= 80:
+        sigs.append(signal(
+            SIG_HIGH_CPU, severity=SEV_WARNING,
+            evidence=f"主机 {host} CPU 平均用率 {cpu_avg}%（>= 80%）",
+        ))
+
+    for fs in result.get("filesystems") or []:
+        used = fs.get("used_percent")
+        if isinstance(used, (int, float)) and used >= 90:
+            sigs.append(signal(
+                SIG_HIGH_DISK, severity=SEV_CRITICAL,
+                evidence=(
+                    f"主机 {host} 挂载点 {fs.get('mount_point')} "
+                    f"使用率 {used}%（剩 {fs.get('free_gb')} GB / "
+                    f"共 {fs.get('total_gb')} GB）"
+                ),
+                context={"node": host, "mount_point": fs.get("mount_point")},
+            ))
+    return sigs
+
+
+def run(ctx, *, host_query: str, connection_id: str | None = None,
+        include_storage: bool = True) -> dict:
+    client = ctx.connection_for("zabbix", connection_id)
+    overview = client.get_host_overview(host_query)
+
+    # 一并拿磁盘信息：放在同一份结果里，admin 看一次就够了
+    if include_storage:
+        try:
+            storage = client.get_host_storage_overview(host_query)
+            overview["filesystems"] = storage.get("filesystems") or []
+        except Exception as exc:
+            logger.warning("zabbix_get_host_overview 拿磁盘失败：%s", exc)
+            overview["filesystems"] = []
+            overview["storage_error"] = str(exc)
+
+    return attach(overview, _extract_signals(overview))

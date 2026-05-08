@@ -191,7 +191,9 @@ async def on_message(message: cl.Message) -> None:
             f"  ·  {item.get('latency_ms', 0)}ms"
             f"{sig_chip}"
         )
-        async with cl.Step(name=step_name, type="tool") as s:
+        async with cl.Step(name=step_name, type="tool", language="json") as s:
+            # language='json' 让 input / output 渲染成代码块（带语法高亮 + 边框）
+            # 而不是裸文本
             s.input = json.dumps(item.get("tool_args") or {}, ensure_ascii=False, indent=2)
             s.output = json.dumps(
                 {
@@ -245,7 +247,7 @@ async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, sess
         selected_connections=cl.user_session.get("selected_connections") or {},
     )
     action_name = "执行" if res.get("name") == "confirm_action" else "拒绝"
-    async with cl.Step(name=f"⚙️ 平台正在{action_name}写操作…", type="tool") as step:
+    async with cl.Step(name=f"⚙️ 平台正在{action_name}写操作…", type="tool", language="json") as step:
         if res.get("name") == "confirm_action":
             envelope = await asyncio.to_thread(runtime.skill_invoker.confirm, token, ctx)
         else:

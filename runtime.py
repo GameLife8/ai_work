@@ -141,47 +141,129 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     http_skill_loader.reload()
 
     _log_data_source_state(runtime, config_cls)
+    _kick_off_async_health_check(runtime)
     return runtime
 
 
+def _kick_off_async_health_check(runtime) -> None:
+    """启动后异步把所有 connection 跑一次 healthcheck，把 status 字段从 unknown 更新成 ok/fail。
+
+    异步线程跑，**不阻塞启动**——单条 zabbix login 失败可能要 10s，串行跑 5 条会让平台
+    启动等几十秒。后台慢慢跑，admin 列表页刷新就能看到。
+    """
+    import logging as _logging
+    import threading as _threading
+
+    log = _logging.getLogger(__name__)
+
+    def _run():
+        try:
+            conns = runtime.connection_manager.list()
+        except Exception:
+            return
+        for c in conns:
+            cid = c["id"]
+            type_code = c.get("type_code")
+            if type_code == "alert_analysis":
+                # 内部 driver，没真实健康检查
+                runtime.connection_manager.update(cid, status="ok")
+                continue
+            try:
+                result = runtime.connection_manager.validate(cid)
+                new_status = "ok" if result.get("ok") else "fail"
+                runtime.connection_manager.update(cid, status=new_status)
+                log.info("[health] %s (%s) → %s", c["name"], type_code, new_status)
+            except Exception as exc:
+                runtime.connection_manager.update(cid, status="fail")
+                log.warning("[health] %s (%s) → fail: %s", c["name"], type_code, exc)
+
+    t = _threading.Thread(target=_run, name="conn-health", daemon=True)
+    t.start()
+
+
 def _log_data_source_state(runtime, config_cls) -> None:
-    """启动时把"数据源真不真"明确打印出来，避免悄悄走 stub / memory 的尴尬。"""
+    """启动时把"数据源真不真"明确打印出来。
+
+    **关键**：检查的是 **DB 中 connection / model_config 的实际记录**，不是 Config env。
+    env 仅是 ensure_bootstrap 的种子值；admin 在后台编辑过任何东西后，DB 才是 source of truth。
+    之前错把 env 当真相 → 用户后台改了真凭证启动还是报"未配置"——是 bug，本次修。
+    """
     import logging as _logging
     log = _logging.getLogger(__name__)
 
+    # ---------- 数据库 ----------
     store_kind = type(runtime.store).__name__
+    db_url_masked = _mask_db_url(getattr(config_cls, "DATABASE_URL", "<unset>"))
     if "InMemory" in store_kind:
         log.error(
             "⚠️  数据库未连通，store 已降级到 InMemoryStore——所有用户/接入/skill_call/runbook "
-            "执行历史**重启即丢**。检查 DATABASE_URL 是否可达：%s",
-            getattr(config_cls, "DATABASE_URL", "<unset>"),
+            "执行历史**重启即丢**。检查 DATABASE_URL 是否可达：%s", db_url_masked,
         )
     else:
-        log.info("✅ 持久化层：%s（DATABASE_URL=%s）",
-                  store_kind, getattr(config_cls, "DATABASE_URL", "<unset>"))
+        log.info("✅ 持久化层：%s（%s）", store_kind, db_url_masked)
 
-    if getattr(config_cls, "USE_STUB_ZABBIX", False):
-        log.error(
-            "⚠️  USE_STUB_ZABBIX=true，Zabbix 返回的全是 mock 数据。"
-            "生产/演示前请关掉这个开关并填 ZABBIX_USERNAME/ZABBIX_PASSWORD。"
-        )
-    elif not (getattr(config_cls, "ZABBIX_USERNAME", "") and getattr(config_cls, "ZABBIX_PASSWORD", "")):
-        log.warning(
-            "⚠️  Zabbix 用户名/密码为空，下次调用 Zabbix API 时会 login 失败。"
-            "在 .env 或 admin 后台 connection 里补全 ZABBIX_USERNAME/ZABBIX_PASSWORD。"
-        )
+    # ---------- Zabbix（看 DB connection 真实状态，不看 env）----------
+    try:
+        z_conns = runtime.connection_manager.list(type_code="zabbix")
+    except Exception:
+        z_conns = []
+    if not z_conns:
+        log.warning("⚠️  没有 zabbix connection（如不用 zabbix 可忽略）")
     else:
-        log.info("✅ Zabbix 接入：%s（账号 %s）",
-                  getattr(config_cls, "ZABBIX_BASE_URL", ""),
-                  getattr(config_cls, "ZABBIX_USERNAME", ""))
+        stubs, no_creds, real = [], [], []
+        for c in z_conns:
+            if not c.get("enabled", True):
+                continue
+            cfg = c.get("config") or {}
+            if cfg.get("use_stub"):
+                stubs.append(c)
+            elif not (cfg.get("username") and cfg.get("password")):
+                no_creds.append(c)
+            else:
+                real.append(c)
+        if stubs:
+            log.error(
+                "⚠️  %d 条 zabbix connection 还在 stub 模式（返回的全是 mock 数据）：%s。"
+                "到管理后台编辑这些 connection 关掉 stub。",
+                len(stubs), ", ".join(c["name"] for c in stubs),
+            )
+        if no_creds:
+            log.warning(
+                "⚠️  %d 条 zabbix connection 未填账号密码（调用时 login 必失败）：%s。",
+                len(no_creds), ", ".join(c["name"] for c in no_creds),
+            )
+        for c in real:
+            log.info("✅ Zabbix 接入「%s」：%s（账号 %s）",
+                      c.get("alias") or c["name"],
+                      c["config"].get("base_url", ""),
+                      c["config"].get("username", ""))
 
-    if getattr(config_cls, "USE_STUB_AI", False):
-        log.warning("⚠️  USE_STUB_AI=true，模型走 stub 不真实调用。")
-    elif not getattr(config_cls, "AI_API_KEY", ""):
-        log.error(
-            "⚠️  AI_API_KEY 未配置，模型调用必失败。生产前一定填火山方舟 / 通义 / 智谱 等真实 key。"
-        )
+    # ---------- 模型（看 DB model_config 真实状态，不看 env）----------
+    try:
+        models = runtime.store.list_model_configs()
+    except Exception:
+        models = []
+    if not models:
+        log.error("⚠️  数据库里没有任何模型配置——agent 调用必失败。到 admin 后台 → 模型管理 → 新增。")
     else:
-        log.info("✅ 默认模型：%s（base_url=%s）",
-                  getattr(config_cls, "AI_MODEL", ""),
-                  getattr(config_cls, "AI_BASE_URL", ""))
+        usable = [m for m in models if m.get("enabled", True) and m.get("api_key")]
+        no_key = [m for m in models if m.get("enabled", True) and not m.get("api_key")]
+        if no_key:
+            log.error(
+                "⚠️  %d 个 enabled 模型 api_key 为空：%s。模型调用必失败。",
+                len(no_key), ", ".join(m["name"] for m in no_key),
+            )
+        if usable:
+            default = next((m for m in usable if m.get("is_default")), usable[0])
+            log.info("✅ 默认模型：%s（model=%s, base_url=%s）",
+                      default["name"], default.get("model", ""), default.get("base_url", ""))
+            if len(usable) > 1:
+                log.info("   另有 %d 个备用模型可切换。", len(usable) - 1)
+
+
+def _mask_db_url(url: str) -> str:
+    """mysql+pymysql://user:pass@host:port/db → mysql+pymysql://user:***@host:port/db"""
+    if not url:
+        return "<unset>"
+    import re
+    return re.sub(r"(://[^:/?#]+):[^@]+@", r"\1:***@", url)

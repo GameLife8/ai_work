@@ -255,7 +255,16 @@ def delete_connection(connection_id):
 @admin_bp.post("/connections/<connection_id>/validate")
 @_login_required("admin")
 def validate_connection(connection_id):
-    return jsonify(_runtime().connection_manager.validate(connection_id))
+    """跑一次 driver.validate；同时把结果（ok / fail）写回 connection.status，
+    让接入列表的"状态"列从 unknown 变成实时的健康状态。"""
+    result = _runtime().connection_manager.validate(connection_id)
+    new_status = "ok" if result.get("ok") else "fail"
+    try:
+        _runtime().connection_manager.update(connection_id, status=new_status)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("连通后回写 status 失败：%s", exc)
+    result["persisted_status"] = new_status
+    return jsonify(result)
 
 
 @admin_bp.post("/connections/validate")

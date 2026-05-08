@@ -172,6 +172,8 @@ async function onSubmit() {
 async function onValidate(row) {
   const { data } = await api.post(`/connections/${row.id}/validate`)
   data.ok ? ElMessage.success('连通正常') : ElMessage.error(data.message || '连通失败')
+  // 刷新列表，让"状态"列从 unknown 变成 ok / fail
+  await load()
 }
 
 async function onValidateForm() {

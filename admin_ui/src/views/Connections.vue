@@ -80,6 +80,7 @@
             :language="guessLang(f.key)"
             :height="280"
             :placeholder="f.placeholder"
+            :wrap="true"
           />
           <el-input v-else v-model="dlg.form.config[f.key]" :placeholder="f.placeholder" />
           <div class="hint" v-if="f.help">{{ f.help }}</div>

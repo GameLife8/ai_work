@@ -181,6 +181,11 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .cm-host {
+  /* 强制宽度约束：防止 CodeMirror 内部内容把父容器撑爆 */
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;            /* flex/grid 子项必须的 hack 否则不被压缩 */
+  box-sizing: border-box;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   overflow: hidden;
@@ -191,6 +196,15 @@ onBeforeUnmount(() => {
   border-color: var(--border-focus);
   box-shadow: var(--shadow-focus);
 }
-:deep(.cm-editor) { outline: none !important; }
+:deep(.cm-editor) {
+  outline: none !important;
+  width: 100%;
+  max-width: 100%;
+}
 :deep(.cm-editor.cm-focused) { outline: none !important; }
+:deep(.cm-scroller) {
+  /* 长行内部横向滚动，不要把外层容器撑开 */
+  overflow-x: auto;
+  max-width: 100%;
+}
 </style>

@@ -92,14 +92,15 @@
           </div>
           <div v-else-if="validateResult.ok" class="ok-msg">✅ 校验通过</div>
 
-          <div class="ref-card">
+          <!-- v-pre：让 Vue 跳过这块的插值语法解析，下面就能放心写 {{ x }} 字面量演示 Jinja2 -->
+          <div class="ref-card" v-pre>
             <div class="ref-title">YAML 字段速查</div>
             <ul>
               <li><code>method</code> + <code>path</code> 必填</li>
               <li><code>connection_id</code> 绑定 http_api connection</li>
               <li><code>read_only=false</code> 时必走 needs_confirmation</li>
               <li><code>params_schema</code> 给模型用的工具 schema</li>
-              <li><code>body_template</code> Jinja2 渲染（可用 <code>{{'{{'}} x {{'}}'}}</code>、<code>tojson</code>、<code>now()</code>）</li>
+              <li><code>body_template</code> Jinja2 渲染（可用 <code>{{ x }}</code>、<code>tojson</code>、<code>now()</code>）</li>
               <li><code>response_extract</code> 用 <code>$.path[*].field</code> 精简响应</li>
               <li><code>signal_rules</code> 把响应转成跨域信号</li>
             </ul>

@@ -23,7 +23,10 @@ MANIFEST = {
         "(1) 用户直接问「基础信息 / 主机概况 / 主机情况」——直接调本 skill 即可；"
         "(2) 容器/Pod 排障时把 swarm task.Node / k8s pod.node 当作 host_query 反查——"
         "    验证容器异常是不是宿主机 CPU/MEM/DISK 扛不住引起的。"
-        "信号判定：CPU >80% / MEM >90% / 任一挂载点 >90% → 高度疑似宿主机层根因。"
+        "返回里 cpu_avg/max/min/p95、memory_avg/max/p95 全部基于窗口内**全量原始点**精确算出，"
+        "跟 Zabbix dashboard 完全一致；尖峰、长尾都不会被采样错过。"
+        "信号判定：CPU avg ≥ 80%（持续满载，critical）或 p95 ≥ 80%（长尾压力，warning）；"
+        "MEM 当前 ≥ 90% 或窗口内 max ≥ 90%；任一挂载点 used ≥ 90% → 宿主机层根因。"
         "agent 不可用 / ping 不通 → 主机宕机或网络隔离，要换另一条排查路径。"
     ),
     "category": "zabbix",
@@ -76,18 +79,40 @@ def _extract_signals(result: dict) -> list[dict]:
 
     mem = result.get("memory_summary") or {}
     used_pct = mem.get("memory_used_percent")
+    mem_max = mem.get("memory_max_percent")
     if isinstance(used_pct, (int, float)) and used_pct >= 90:
         sigs.append(signal(
             SIG_HIGH_MEM, severity=SEV_CRITICAL,
-            evidence=f"主机 {host} 内存使用率 {used_pct}%（>= 90%）",
+            evidence=f"主机 {host} 当前内存使用率 {used_pct}%（>= 90%）",
+        ))
+    elif isinstance(mem_max, (int, float)) and mem_max >= 90:
+        # 当前回落但窗口内出现过 90%+：内存压力近期发生过，仍值得关注
+        sigs.append(signal(
+            SIG_HIGH_MEM, severity=SEV_WARNING,
+            evidence=(
+                f"主机 {host} 窗口内最高内存 {mem_max}%（当前 {used_pct}% 已回落，"
+                f"近期发生过内存压力）"
+            ),
         ))
 
     metric = result.get("metric_summary") or {}
     cpu_avg = metric.get("cpu_avg")
+    cpu_p95 = metric.get("cpu_p95")
+    cpu_max = metric.get("cpu_max")
     if isinstance(cpu_avg, (int, float)) and cpu_avg >= 80:
+        # 平均 ≥ 80：持续满载，根因级
+        sigs.append(signal(
+            SIG_HIGH_CPU, severity=SEV_CRITICAL,
+            evidence=f"主机 {host} CPU 平均用率 {cpu_avg}%（>= 80%，持续满载）",
+        ))
+    elif isinstance(cpu_p95, (int, float)) and cpu_p95 >= 80:
+        # 平均不高但 5% 时间在告急：长尾尖峰、突发压力
         sigs.append(signal(
             SIG_HIGH_CPU, severity=SEV_WARNING,
-            evidence=f"主机 {host} CPU 平均用率 {cpu_avg}%（>= 80%）",
+            evidence=(
+                f"主机 {host} CPU p95 {cpu_p95}%（avg {cpu_avg}% / max {cpu_max}%，"
+                f"窗口内 5% 时间持续高负载）"
+            ),
         ))
 
     for fs in result.get("filesystems") or []:

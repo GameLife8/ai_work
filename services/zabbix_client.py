@@ -8,12 +8,34 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+from services.metric_provider import (
+    HostRef,
+    MetricDescriptor,
+    MetricPoint,
+)
+
 
 logger = logging.getLogger(__name__)
+
+
+# 逻辑指标名 → Zabbix item key 前缀候选（按顺序找，第一个命中即用）。
+# 新增其它监控产品时，对应 client 自己维护一份类似映射，不影响这里。
+_ZBX_METRIC_KEY_MAP: dict[str, list[str]] = {
+    "cpu.utilization":    ["system.cpu.util", "system.cpu.util[,system,avg1]"],
+    "memory.utilization": ["vm.memory.util", "vm.memory.utilization"],
+    "system.load.avg1":   ["system.cpu.load", "system.cpu.load[all,avg1]"],
+    "memory.available":   ["vm.memory.size[available]", "vm.memory.size[free]"],
+    "memory.total":       ["vm.memory.size[total]"],
+}
 
 SAMPLE_INTERVAL_SECONDS = 300       # 默认每 5 分钟一个采样点
 SAMPLE_POINTS = 12                  # 默认 12 个点 = 1 小时窗口
 DEFAULT_EVENT_TIMEZONE = ZoneInfo("Asia/Shanghai")
+
+# history.get 单次拉的最大原始点数。
+# 1min 间隔 × 7d ≈ 10080 点；为了拿全 7d 数据这里设到 12000。
+# 更长窗口（30d+）应改用 trends.get（1h 聚合），见 _get_window_history TODO。
+HISTORY_RAW_LIMIT = 12000
 
 
 # 所有 stub 返回都通过本函数打标记，避免假数据被静默当真实数据用
@@ -51,6 +73,10 @@ def compute_window(lookback_hours: float | int) -> tuple[int, int]:
 
 
 class ZabbixClient:
+    # services.metric_provider.MetricProvider 协议要求；让 services.metric_analytics
+    # 不依赖具体实现也能识别 provider 类型（在错误信息和日志里用）。
+    name: str = "zabbix"
+
     def __init__(
         self,
         base_url: str,
@@ -100,6 +126,15 @@ class ZabbixClient:
             }
 
     def get_metric_summary(self, alert: dict) -> dict:
+        """CPU + load 概览。
+
+        关键设计：avg / max / min / p95 全部基于**窗口内全部原始点**计算
+        （不是降采样到 24 点），保证跟 Zabbix dashboard 显示完全一致——
+        不会因为采样误差错过分钟级 CPU spike。
+
+        12h 窗口下原始点数 ≈ 720（Zabbix 每分钟一条 history），算 max/p95
+        够精确；当前窗口最大 7d ≈ 10080 点，已在 history.get limit 范围内。
+        """
         if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             return self._stub_metric_summary(alert)
 
@@ -108,23 +143,34 @@ class ZabbixClient:
             if not host_id:
                 return self._stub_metric_summary(alert)
 
-            summary = {}
+            summary: dict = {}
             items = self._get_host_items(host_id)
 
-            item = self._find_metric_item(items, ["system.cpu.util", "system.cpu.util[,system,avg1]"])
-            if item:
-                values = self._get_numeric_history(item["itemid"], item["value_type"], alert)
-                if values:
-                    summary["cpu_avg"] = round(mean(values), 2)
-                    summary["cpu_max"] = round(max(values), 2)
+            cpu_item = self._find_metric_item(items, ["system.cpu.util", "system.cpu.util[,system,avg1]"])
+            if cpu_item:
+                window = self._get_window_history(cpu_item["itemid"], cpu_item["value_type"], alert)
+                agg = self._aggregate(window["raw"])
+                if agg:
+                    summary.update({
+                        "cpu_avg": agg["avg"],
+                        "cpu_max": agg["max"],
+                        "cpu_min": agg["min"],
+                        "cpu_p95": agg["p95"],
+                        "cpu_last": agg["last"],
+                        "cpu_raw_count": agg["raw_count"],
+                    })
 
             load_item = self._find_metric_item(items, ["system.cpu.load", "system.cpu.load[all,avg1]"])
             if load_item:
-                values = self._get_numeric_history(load_item["itemid"], load_item["value_type"], alert)
-                if values:
-                    summary["load_avg"] = round(mean(values), 2)
+                window = self._get_window_history(load_item["itemid"], load_item["value_type"], alert)
+                agg = self._aggregate(window["raw"])
+                if agg:
+                    summary["load_avg"] = agg["avg"]
+                    summary["load_max"] = agg["max"]
 
-            if {"cpu_avg", "cpu_max", "load_avg"} <= summary.keys():
+            # 至少拿到 CPU 或 load 之一就算成功（之前要求三个都齐，过于苛刻——
+            # 有些主机 Zabbix 模板没装 system.cpu.load 就会全量回 stub，掩盖真数据）
+            if "cpu_avg" in summary or "load_avg" in summary:
                 summary.update(self._sample_window_metadata())
                 return summary
         except Exception as exc:  # pragma: no cover
@@ -229,6 +275,13 @@ class ZabbixClient:
         return self._stub_disk_summary(alert)
 
     def get_memory_summary(self, alert: dict) -> dict:
+        """内存概览。
+
+        - ``memory_used_percent``：**最新一条**原始点（保留原语义，跟 dashboard 实时值对齐）
+        - ``memory_avg/max/min/p95_percent``：基于窗口全量原始点
+        - ``available_gb / total_gb``：最新点（容量信息是当下值，无聚合意义）
+        - ``trend``：rising_fast 当 (last - first) ≥ 8pp，否则 stable
+        """
         if self.use_stub:  # ⚠️ STUB DATA — 仅 USE_STUB_ZABBIX=true 或 connection.use_stub=true 时进入
             return self._stub_memory_summary(alert)
 
@@ -242,18 +295,27 @@ class ZabbixClient:
             free_item = self._find_metric_item(items, ["vm.memory.size[free]", "vm.memory.size[available]"])
             total_item = self._find_metric_item(items, ["vm.memory.size[total]"])
 
-            util_values = self._get_numeric_history(util_item["itemid"], util_item["value_type"], alert) if util_item else []
-            free_values = self._get_numeric_history(free_item["itemid"], free_item["value_type"], alert) if free_item else []
-            total_values = self._get_numeric_history(total_item["itemid"], total_item["value_type"], alert) if total_item else []
-            if util_values:
-                latest_free = free_values[-1] if free_values else 0
-                latest_total = total_values[-1] if total_values else 0
+            util_window = self._get_window_history(util_item["itemid"], util_item["value_type"], alert) if util_item else {"raw": []}
+            free_window = self._get_window_history(free_item["itemid"], free_item["value_type"], alert) if free_item else {"raw": []}
+            total_window = self._get_window_history(total_item["itemid"], total_item["value_type"], alert) if total_item else {"raw": []}
+
+            agg = self._aggregate(util_window["raw"])
+            if agg:
+                latest_free = free_window["raw"][-1]["value"] if free_window["raw"] else 0
+                latest_total = total_window["raw"][-1]["value"] if total_window["raw"] else 0
+                util_values = [r["value"] for r in util_window["raw"]]
+                rising_fast = len(util_values) > 1 and (util_values[-1] - util_values[0]) >= 8
                 return {
-                    "memory_used_percent": round(util_values[-1], 2),
-                    "available_gb": round(latest_free / 1024 / 1024 / 1024, 2) if latest_free else 0,
-                    "total_gb": round(latest_total / 1024 / 1024 / 1024, 2) if latest_total else 0,
-                    "swap_used_percent": 0.0,
-                    "trend": "rising_fast" if len(util_values) > 1 and util_values[-1] - util_values[0] >= 8 else "stable",
+                    "memory_used_percent":  agg["last"],   # 最新点（保持向后兼容字段名）
+                    "memory_avg_percent":   agg["avg"],
+                    "memory_max_percent":   agg["max"],
+                    "memory_min_percent":   agg["min"],
+                    "memory_p95_percent":   agg["p95"],
+                    "memory_raw_count":     agg["raw_count"],
+                    "available_gb":         round(latest_free / 1024 / 1024 / 1024, 2) if latest_free else 0,
+                    "total_gb":             round(latest_total / 1024 / 1024 / 1024, 2) if latest_total else 0,
+                    "swap_used_percent":    0.0,
+                    "trend":                "rising_fast" if rising_fast else "stable",
                     **self._sample_window_metadata(),
                 }
         except Exception as exc:  # pragma: no cover
@@ -507,6 +569,171 @@ class ZabbixClient:
         self._auth_token = token
         return token
 
+    # ----------------------------------------------------------------- #
+    # services.metric_provider.MetricProvider 协议实现
+    #
+    # 这三个方法把 Zabbix 适配成 provider-agnostic 接口。analytics 层
+    # （find_peak / fetch_window / summarize）只依赖这三个方法，换 Prometheus
+    # 之类只要实现同样三个签名即可。
+    # ----------------------------------------------------------------- #
+
+    def resolve_host(self, query: str) -> HostRef | None:
+        """MetricProvider: 把 host name / IP / hostid 解析成中性 HostRef。"""
+        if self.use_stub:  # ⚠️ STUB DATA
+            host = self.find_host(query)
+            if not host:
+                return None
+            return HostRef(
+                id=str(host.get("hostid", "")),
+                name=str(host.get("name") or host.get("host") or query),
+                ip=self._extract_host_ip(host),
+                extra={"_stub": True},
+            )
+
+        # 优先 hostid（数字串），命中直接走 host.get by id 拿规范字段
+        if query.isdigit():
+            rows = self._rpc(
+                "host.get",
+                params={
+                    "output": ["hostid", "host", "name"],
+                    "selectInterfaces": ["ip"],
+                    "hostids": [query],
+                },
+                auth=self.login(),
+            )
+            if rows:
+                return self._host_to_ref(rows[0])
+
+        host = self.find_host(query)
+        if not host:
+            return None
+        return self._host_to_ref(host)
+
+    def find_metric(self, host: HostRef, metric_name: str) -> MetricDescriptor | None:
+        """MetricProvider: 把逻辑指标名映射到 Zabbix item。
+
+        映射表见模块顶部 ``_ZBX_METRIC_KEY_MAP``。未知指标返回 None——
+        analytics 层会包装成"主机上无此指标"的错误。
+        """
+        keys = _ZBX_METRIC_KEY_MAP.get(metric_name)
+        if not keys:
+            return None
+
+        if self.use_stub:  # ⚠️ STUB DATA
+            return MetricDescriptor(
+                name=metric_name,
+                unit="%" if "util" in metric_name else "",
+                provider_handle={"_stub": True, "metric": metric_name},
+            )
+
+        items = self._get_host_items(host.id)
+        item = self._find_metric_item(items, keys)
+        if not item:
+            return None
+        return MetricDescriptor(
+            name=metric_name,
+            unit=str(item.get("units") or ""),
+            provider_handle={
+                "itemid": str(item["itemid"]),
+                "value_type": int(item.get("value_type", 0)),
+                "key": item.get("key_", ""),
+            },
+        )
+
+    def query_series(
+        self,
+        host: HostRef,
+        metric: MetricDescriptor,
+        start_ts: int,
+        end_ts: int,
+    ) -> list[MetricPoint]:
+        """MetricProvider: 拉 [start, end] 区间的全部原始点（升序）。
+
+        命中 ``HISTORY_RAW_LIMIT`` 时打 warning 但不抛——保证 analytics 拿到部分
+        数据也能给统计；超长窗口（>7d）后续应改 trends.get（TODO）。
+        """
+        if start_ts >= end_ts:
+            return []
+
+        handle = metric.provider_handle or {}
+
+        if self.use_stub or handle.get("_stub"):  # ⚠️ STUB DATA
+            return self._stub_query_series(host, metric, int(start_ts), int(end_ts))
+
+        item_id = handle.get("itemid")
+        value_type = handle.get("value_type")
+        if not item_id or value_type is None:
+            return []
+
+        rows = self._rpc(
+            "history.get",
+            params={
+                "output": "extend",
+                "history": int(value_type),
+                "itemids": [item_id],
+                "sortfield": "clock",
+                "sortorder": "ASC",
+                "time_from": int(start_ts),
+                "time_till": int(end_ts),
+                "limit": HISTORY_RAW_LIMIT,
+            },
+            auth=self.login(),
+        )
+
+        series: list[MetricPoint] = []
+        for row in rows or []:
+            try:
+                series.append(MetricPoint(timestamp=int(row["clock"]), value=float(row["value"])))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        if len(series) >= HISTORY_RAW_LIMIT:
+            logger.warning(
+                "history.get 命中 limit=%s（item %s, %s ~ %s），数据可能被截断；"
+                "对超长窗口（>7d）应改用 trends.get（1h 聚合）。",
+                HISTORY_RAW_LIMIT, item_id, start_ts, end_ts,
+            )
+        return series
+
+    @staticmethod
+    def _host_to_ref(host: dict) -> HostRef:
+        return HostRef(
+            id=str(host.get("hostid", "")),
+            name=str(host.get("name") or host.get("host") or ""),
+            ip=ZabbixClient._extract_host_ip(host),
+            extra={"host": host.get("host", "")},
+        )
+
+    @staticmethod
+    def _stub_query_series(
+        host: HostRef, metric: MetricDescriptor, start_ts: int, end_ts: int,
+    ) -> list[MetricPoint]:
+        """生成 stub 时间序列：60s 一个点、值在合理范围内带个明显的尖峰。
+
+        这只在 use_stub=True 时被调用；目的是让本地联调 / 集成测试能跑得通，
+        而**不是**伪装成真实数据。返回的点 timestamp 真实（基于 start_ts），
+        但调用方应该结合 healthcheck 里的 _stub_data 标记判断。
+        """
+        if start_ts >= end_ts:
+            return []
+        # 每分钟一个点，最多 720 个（12h 上限），避免大窗口炸内存
+        step = 60
+        max_points = 720
+        n = min(max_points, max(1, (end_ts - start_ts) // step))
+        baseline = 70.0 if metric.name == "cpu.utilization" else 60.0
+        if "load" in metric.name:
+            baseline = 2.0
+        # 在窗口中段插一个 +25 的尖峰，让 find_peak 测试有可挑的点
+        spike_idx = n // 2
+        points: list[MetricPoint] = []
+        for i in range(n):
+            ts = start_ts + i * step
+            value = baseline + (5.0 if i % 7 == 0 else 0.0)
+            if i == spike_idx:
+                value = baseline + 25.0
+            points.append(MetricPoint(timestamp=ts, value=round(value, 2)))
+        return points
+
     def _resolve_host_id(self, alert: dict) -> str | None:
         host_id = str(alert.get("host_id", "")).strip()
         if host_id:
@@ -612,13 +839,18 @@ class ZabbixClient:
         return None
 
     def _get_numeric_history(self, item_id: str, value_type: int | str, alert: dict | None = None) -> list[float]:
-        samples = self._get_sampled_history(item_id, value_type, alert)
-        if samples:
-            return [sample["value"] for sample in samples]
+        """返回窗口内**全部原始点**的值列表（不再降采样）。
 
-        if alert is None:
-            return []
+        历史背景：早期实现里这里返回的是降采样到 ``_sample_points`` 的值，
+        然后上游再 ``mean / max``——会丢精度（30min 采样错过分钟级 spike）。
+        现在统一从 ``_get_window_history`` 拿原始点，agg 走真值。
+        """
+        if alert is not None:
+            window = self._get_window_history(item_id, value_type, alert)
+            if window["raw"]:
+                return [r["value"] for r in window["raw"]]
 
+        # alert=None：不带时间窗的 fallback——给老调用方留口子，拉最近 20 条
         history_type = int(value_type)
         result = self._rpc(
             "history.get",
@@ -639,6 +871,102 @@ class ZabbixClient:
             except (KeyError, TypeError, ValueError):
                 continue
         return list(reversed(values))
+
+    def _get_window_history(self, item_id: str, value_type: int | str, alert: dict | None) -> dict:
+        """一次 history.get 同时返回**原始点 + 降采样点**。
+
+        Returns:
+            {
+                "raw":     [{"clock", "value"}, ...]   # 窗口内全部原始点（用来算 avg/max/p95/min）
+                "samples": [{"clock", "time", "value", "source_clock", "source_time"}, ...]
+                                                       # step-interpolation 降采样到 _sample_points 个
+                                                       # （用来给序列展示，避免 token 爆炸）
+            }
+
+        ⚠️ 长窗口 (>7d) 命中 ``HISTORY_RAW_LIMIT``，会有"老数据被截断"的 warning；
+            后续应该用 ``trends.get``（1h 聚合）替代——TODO。
+        """
+        if not item_id:
+            return {"raw": [], "samples": []}
+
+        history_type = int(value_type)
+        sample_times = self._build_sample_times(alert)
+        window_start = sample_times[0] - self._sample_interval_seconds
+
+        rows = self._rpc(
+            "history.get",
+            params={
+                "output": "extend",
+                "history": history_type,
+                "itemids": [item_id],
+                "sortfield": "clock",
+                "sortorder": "ASC",
+                "time_from": window_start,
+                "time_till": sample_times[-1],
+                "limit": HISTORY_RAW_LIMIT,
+            },
+            auth=self.login(),
+        )
+
+        raw: list[dict] = []
+        for row in rows:
+            try:
+                raw.append({"clock": int(row["clock"]), "value": float(row["value"])})
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        if len(raw) >= HISTORY_RAW_LIMIT:
+            logger.warning(
+                "history.get 命中 limit=%s（item %s），窗口起点可能被截断；"
+                "对超长窗口（>7d）应改用 trends.get（1h 聚合）。",
+                HISTORY_RAW_LIMIT, item_id,
+            )
+
+        if not raw:
+            return {"raw": [], "samples": []}
+
+        # 降采样：每个采样点取 ≤ 该时间最近的一条（step interpolation）
+        samples: list[dict] = []
+        row_index = 0
+        last_seen: dict | None = None
+        for sample_clock in sample_times:
+            while row_index < len(raw) and raw[row_index]["clock"] <= sample_clock:
+                last_seen = raw[row_index]
+                row_index += 1
+            if last_seen is None:
+                continue
+            samples.append(
+                {
+                    "clock": sample_clock,
+                    "time": datetime.fromtimestamp(sample_clock, UTC).isoformat(),
+                    "value": round(last_seen["value"], 6),
+                    "source_clock": last_seen["clock"],
+                    "source_time": datetime.fromtimestamp(last_seen["clock"], UTC).isoformat(),
+                }
+            )
+        return {"raw": raw, "samples": samples}
+
+    @staticmethod
+    def _aggregate(raw: list[dict], precision: int = 2) -> dict:
+        """从原始点列表算 avg / max / min / p95 / last。
+
+        - p95 用最简单的 nearest-rank 法：sorted[ceil(0.95 * n) - 1]
+        - 单点也能给出值（avg=max=min=p95=last=唯一点）
+        - 空列表返回空 dict（让调用方决定是 fallback 还是跳过）
+        """
+        if not raw:
+            return {}
+        values = [r["value"] for r in raw]
+        s = sorted(values)
+        p95_idx = min(len(s) - 1, max(0, int(round(0.95 * len(s))) - 1))
+        return {
+            "avg": round(mean(values), precision),
+            "max": round(max(values), precision),
+            "min": round(min(values), precision),
+            "p95": round(s[p95_idx], precision),
+            "last": round(values[-1], precision),
+            "raw_count": len(values),
+        }
 
     def _sample_window_metadata(self) -> dict:
         return {
@@ -671,56 +999,11 @@ class ZabbixClient:
         return _ctx()
 
     def _get_sampled_history(self, item_id: str, value_type: int | str, alert: dict | None) -> list[dict]:
-        if not item_id:
-            return []
+        """向后兼容：只返回降采样后的 samples 数组，原始点扔掉。
 
-        history_type = int(value_type)
-        sample_times = self._build_sample_times(alert)
-        window_start = sample_times[0] - self._sample_interval_seconds
-        result = self._rpc(
-            "history.get",
-            params={
-                "output": "extend",
-                "history": history_type,
-                "itemids": [item_id],
-                "sortfield": "clock",
-                "sortorder": "ASC",
-                "time_from": window_start,
-                "time_till": sample_times[-1],
-                "limit": 2000,
-            },
-            auth=self.login(),
-        )
-
-        rows = []
-        for row in result:
-            try:
-                rows.append({"clock": int(row["clock"]), "value": float(row["value"])})
-            except (KeyError, TypeError, ValueError):
-                continue
-
-        if not rows:
-            return []
-
-        samples = []
-        row_index = 0
-        last_seen = None
-        for sample_clock in sample_times:
-            while row_index < len(rows) and rows[row_index]["clock"] <= sample_clock:
-                last_seen = rows[row_index]
-                row_index += 1
-            if last_seen is None:
-                continue
-            samples.append(
-                {
-                    "clock": sample_clock,
-                    "time": datetime.fromtimestamp(sample_clock, UTC).isoformat(),
-                    "value": round(last_seen["value"], 6),
-                    "source_clock": last_seen["clock"],
-                    "source_time": datetime.fromtimestamp(last_seen["clock"], UTC).isoformat(),
-                }
-            )
-        return samples
+        新代码请直接用 ``_get_window_history``，能同时拿到 raw + samples。
+        """
+        return self._get_window_history(item_id, value_type, alert)["samples"]
 
     def _build_sample_times(self, alert: dict | None) -> list[int]:
         end_ts = self._resolve_reference_timestamp(alert)
@@ -785,8 +1068,16 @@ class ZabbixClient:
     def _stub_metric_summary(alert: dict) -> dict:
         severity = alert.get("severity", "").lower()
         if severity in {"high", "critical"}:
-            return _mark_stub({"cpu_avg": 94.1, "cpu_max": 97.6, "load_avg": 18.2})
-        return _mark_stub({"cpu_avg": 68.2, "cpu_max": 76.4, "load_avg": 3.4})
+            return _mark_stub({
+                "cpu_avg": 94.1, "cpu_max": 97.6, "cpu_min": 88.0,
+                "cpu_p95": 96.5, "cpu_last": 93.2, "cpu_raw_count": 720,
+                "load_avg": 18.2, "load_max": 22.7,
+            })
+        return _mark_stub({
+            "cpu_avg": 68.2, "cpu_max": 76.4, "cpu_min": 60.0,
+            "cpu_p95": 74.1, "cpu_last": 67.8, "cpu_raw_count": 720,
+            "load_avg": 3.4, "load_max": 4.7,
+        })
 
     @staticmethod
     def _stub_disk_summary(alert: dict) -> dict:
@@ -809,11 +1100,17 @@ class ZabbixClient:
         host_name = alert.get("host_name", "").lower()
         if "db" in host_name or "tidb" in host_name:
             return _mark_stub({
-                "memory_used_percent": 96.1, "available_gb": 1.4, "total_gb": 64.0,
+                "memory_used_percent": 96.1, "memory_avg_percent": 94.5,
+                "memory_max_percent": 97.2, "memory_min_percent": 91.0,
+                "memory_p95_percent": 96.8, "memory_raw_count": 720,
+                "available_gb": 1.4, "total_gb": 64.0,
                 "swap_used_percent": 68.0, "trend": "rising_fast",
             })
         return _mark_stub({
-            "memory_used_percent": 88.0, "available_gb": 9.8, "total_gb": 32.0,
+            "memory_used_percent": 88.0, "memory_avg_percent": 86.4,
+            "memory_max_percent": 89.5, "memory_min_percent": 83.2,
+            "memory_p95_percent": 89.1, "memory_raw_count": 720,
+            "available_gb": 9.8, "total_gb": 32.0,
             "swap_used_percent": 10.0, "trend": "stable",
         })
 

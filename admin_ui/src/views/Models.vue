@@ -60,7 +60,16 @@ function blankForm() {
   return { provider: 'volcengine_ark', name: '', base_url: '', api_key: '', model: '', timeout_seconds: 120, is_default: false }
 }
 
-async function load() { loading.value = true; rows.value = (await api.get('/models')).data; loading.value = false }
+async function load() {
+  loading.value = true
+  try {
+    rows.value = (await api.get('/models')).data
+  } finally {
+    // 之前用 ``loading = true ... loading = false`` 单行串起来，
+    // 一旦 await 抛错 loading 永远停在 true，loading 蒙层卡住整张表。
+    loading.value = false
+  }
+}
 onMounted(load)
 
 function openCreate() { dlg.value = { show: true, id: null, form: blankForm() } }

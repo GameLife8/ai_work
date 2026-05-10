@@ -9,6 +9,12 @@ from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
 
+# SQLAlchemy 是 requirements.txt 里的硬依赖；以前每个 SQLPlatformStore
+# 方法都做 ``from sqlalchemy import text`` 局部 import，纯粹是冗余——
+# 既然进程能 import 到 store.py 就一定能 import sqlalchemy，没什么好"懒"的。
+# 全部上提到模块顶层避免重复绑定开销和 39 行噪音。
+from sqlalchemy import text
+
 from ops_platform.crypto import decrypt, encrypt, is_active as crypto_active
 
 
@@ -416,8 +422,6 @@ class SQLPlatformStore:
         self._lock = threading.RLock()
 
     def initialize(self) -> None:
-        from sqlalchemy import text
-
         is_sqlite = self.engine.dialect.name == "sqlite"
         statements = self._sqlite_ddl() if is_sqlite else self._mysql_ddl()
         with self.engine.begin() as conn:
@@ -437,8 +441,6 @@ class SQLPlatformStore:
         通过 ``encrypt()`` 的"已加密则不重复"特性保持幂等；只把无前缀的
         rows 走一次 update 即可。
         """
-        from sqlalchemy import text
-
         from ops_platform.crypto import is_encrypted, PREFIX
 
         stats = {"connections": 0, "model_configs": 0}
@@ -788,20 +790,17 @@ class SQLPlatformStore:
     # ---------- users ----------
 
     def list_users(self) -> list[dict]:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             rows = conn.execute(text("SELECT * FROM platform_user")).mappings().all()
         return [self._row_to_user(r) for r in rows]
 
     def get_user(self, user_id: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(text("SELECT * FROM platform_user WHERE id=:id"),
                                {"id": user_id}).mappings().first()
         return self._row_to_user(row) if row else None
 
     def get_user_by_username(self, username: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(text("SELECT * FROM platform_user WHERE username=:u"),
                                {"u": username}).mappings().first()
@@ -809,7 +808,6 @@ class SQLPlatformStore:
 
     def create_user(self, *, username: str, password_hash: str, role: str,
                     display_name: str = "") -> dict:
-        from sqlalchemy import text
         now = _now()
         record = {
             "id": _new_id(),
@@ -831,7 +829,6 @@ class SQLPlatformStore:
         return self.get_user(record["id"])
 
     def update_user(self, user_id: str, **fields) -> dict:
-        from sqlalchemy import text
         if not fields:
             return self.get_user(user_id)
         allowed = {"password_hash", "role", "display_name", "enabled"}
@@ -848,14 +845,12 @@ class SQLPlatformStore:
         return self.get_user(user_id)
 
     def delete_user(self, user_id: str) -> None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             conn.execute(text("DELETE FROM platform_user WHERE id=:id"), {"id": user_id})
 
     # ---------- connections ----------
 
     def list_connections(self, type_code: str | None = None) -> list[dict]:
-        from sqlalchemy import text
         sql = "SELECT * FROM platform_connection"
         params: dict[str, Any] = {}
         if type_code:
@@ -867,7 +862,6 @@ class SQLPlatformStore:
         return [self._row_to_connection(r) for r in rows]
 
     def get_connection(self, connection_id: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(text("SELECT * FROM platform_connection WHERE id=:id"),
                                {"id": connection_id}).mappings().first()
@@ -875,7 +869,6 @@ class SQLPlatformStore:
 
     def create_connection(self, *, type_code: str, name: str, alias: str,
                           config: dict, is_default: bool, created_by: str | None) -> dict:
-        from sqlalchemy import text
         now = _now()
         with self._lock, self.engine.begin() as conn:
             if is_default:
@@ -903,7 +896,6 @@ class SQLPlatformStore:
         return self.get_connection(record["id"])
 
     def update_connection(self, connection_id: str, **fields) -> dict:
-        from sqlalchemy import text
         if not fields:
             return self.get_connection(connection_id)
         allowed = {"name", "alias", "config", "is_default", "enabled", "status"}
@@ -935,20 +927,17 @@ class SQLPlatformStore:
         return self.get_connection(connection_id)
 
     def delete_connection(self, connection_id: str) -> None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             conn.execute(text("DELETE FROM platform_connection WHERE id=:id"), {"id": connection_id})
 
     # ---------- model_configs ----------
 
     def list_model_configs(self) -> list[dict]:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             rows = conn.execute(text("SELECT * FROM platform_model_config ORDER BY created_at")).mappings().all()
         return [self._row_to_model(r) for r in rows]
 
     def get_model_config(self, model_id: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(text("SELECT * FROM platform_model_config WHERE id=:id"),
                                {"id": model_id}).mappings().first()
@@ -957,7 +946,6 @@ class SQLPlatformStore:
     def create_model_config(self, *, provider: str, name: str, base_url: str,
                             api_key: str, model: str, is_default: bool,
                             created_by: str | None) -> dict:
-        from sqlalchemy import text
         now = _now()
         with self._lock, self.engine.begin() as conn:
             if is_default:
@@ -985,7 +973,6 @@ class SQLPlatformStore:
         return self.get_model_config(record["id"])
 
     def update_model_config(self, model_id: str, **fields) -> dict:
-        from sqlalchemy import text
         if not fields:
             return self.get_model_config(model_id)
         allowed = {"provider", "name", "base_url", "api_key", "model",
@@ -1010,14 +997,12 @@ class SQLPlatformStore:
         return self.get_model_config(model_id)
 
     def delete_model_config(self, model_id: str) -> None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             conn.execute(text("DELETE FROM platform_model_config WHERE id=:id"), {"id": model_id})
 
     # ---------- skill_call audit ----------
 
     def save_skill_call(self, **fields) -> int:
-        from sqlalchemy import text
         record = {
             "skill_code": fields.get("skill_code"),
             "connection_id": fields.get("connection_id"),
@@ -1040,7 +1025,6 @@ class SQLPlatformStore:
             return int(result.lastrowid)
 
     def list_skill_calls(self, *, limit: int = 100) -> list[dict]:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             rows = conn.execute(
                 text("SELECT * FROM platform_skill_call ORDER BY id DESC LIMIT :n"),
@@ -1062,7 +1046,6 @@ class SQLPlatformStore:
                               connection_id: str | None, requires_admin_approval: bool,
                               requested_by: str | None, session_id: str | None,
                               expires_at: str, preview: dict) -> dict:
-        from sqlalchemy import text
         record = {
             "token": token,
             "skill_code": skill_code,
@@ -1094,7 +1077,6 @@ class SQLPlatformStore:
         return self.get_pending_action(token)
 
     def get_pending_action(self, token: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(
                 text("SELECT * FROM platform_pending_action WHERE token=:t"),
@@ -1103,7 +1085,6 @@ class SQLPlatformStore:
         return self._row_to_pending(row) if row else None
 
     def list_pending_actions(self, *, status: str | None = None, limit: int = 100) -> list[dict]:
-        from sqlalchemy import text
         sql = "SELECT * FROM platform_pending_action"
         params: dict[str, Any] = {"n": limit}
         if status:
@@ -1127,13 +1108,11 @@ class SQLPlatformStore:
         return d
 
     def list_prompt_segments(self) -> list[dict]:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             rows = conn.execute(text("SELECT * FROM platform_prompt_segment")).mappings().all()
         return [self._row_to_segment(r) for r in rows]
 
     def get_prompt_segment(self, key: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(
                 text("SELECT * FROM platform_prompt_segment WHERE segment_key=:k"),
@@ -1143,7 +1122,6 @@ class SQLPlatformStore:
 
     def upsert_prompt_segment(self, *, key: str, title: str, content: str,
                               enabled: bool = True, updated_by: str | None = None) -> dict:
-        from sqlalchemy import text
         now = _now()
         with self.engine.begin() as conn:
             existing = conn.execute(
@@ -1178,7 +1156,6 @@ class SQLPlatformStore:
         return self.get_prompt_segment(key)
 
     def delete_prompt_segment(self, key: str) -> None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             conn.execute(text("DELETE FROM platform_prompt_segment WHERE segment_key=:k"), {"k": key})
 
@@ -1197,13 +1174,11 @@ class SQLPlatformStore:
         return d
 
     def list_runbooks(self) -> list[dict]:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             rows = conn.execute(text("SELECT * FROM platform_runbook ORDER BY rb_key")).mappings().all()
         return [self._row_to_runbook(r) for r in rows]
 
     def get_runbook(self, key: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(text("SELECT * FROM platform_runbook WHERE rb_key=:k"),
                                {"k": key}).mappings().first()
@@ -1212,7 +1187,6 @@ class SQLPlatformStore:
     def upsert_runbook(self, *, key: str, title: str, description: str,
                        triggers: list, inputs: list, definition: dict,
                        enabled: bool = True, updated_by: str | None = None) -> dict:
-        from sqlalchemy import text
         now = _now()
         with self.engine.begin() as conn:
             existing = conn.execute(
@@ -1254,7 +1228,6 @@ class SQLPlatformStore:
         return self.get_runbook(key)
 
     def delete_runbook(self, key: str) -> None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             conn.execute(text("DELETE FROM platform_runbook WHERE rb_key=:k"), {"k": key})
 
@@ -1291,7 +1264,6 @@ class SQLPlatformStore:
         started_at: str = "",
         ended_at: str = "",
     ) -> str:
-        from sqlalchemy import text
         record = {
             "execution_id": execution_id,
             "rb_key": runbook_key,
@@ -1325,7 +1297,6 @@ class SQLPlatformStore:
         return execution_id
 
     def list_runbook_executions(self, *, limit: int = 100, runbook_key: str | None = None) -> list[dict]:
-        from sqlalchemy import text
         sql = "SELECT * FROM platform_runbook_execution"
         params: dict[str, Any] = {"n": limit}
         if runbook_key:
@@ -1337,7 +1308,6 @@ class SQLPlatformStore:
         return [self._row_to_execution(r) for r in rows]
 
     def get_runbook_execution(self, execution_id: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(
                 text("SELECT * FROM platform_runbook_execution WHERE execution_id=:id"),
@@ -1359,13 +1329,11 @@ class SQLPlatformStore:
         return d
 
     def list_http_skills(self) -> list[dict]:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             rows = conn.execute(text("SELECT * FROM platform_http_skill ORDER BY skill_code")).mappings().all()
         return [self._row_to_http_skill(r) for r in rows]
 
     def get_http_skill(self, code: str) -> dict | None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             row = conn.execute(
                 text("SELECT * FROM platform_http_skill WHERE skill_code=:c"),
@@ -1377,7 +1345,6 @@ class SQLPlatformStore:
                           category: str, connection_id: str | None,
                           definition: dict, enabled: bool = True,
                           updated_by: str | None = None) -> dict:
-        from sqlalchemy import text
         now = _now()
         with self.engine.begin() as conn:
             existing = conn.execute(
@@ -1419,7 +1386,6 @@ class SQLPlatformStore:
         return self.get_http_skill(code)
 
     def delete_http_skill(self, code: str) -> None:
-        from sqlalchemy import text
         with self.engine.begin() as conn:
             conn.execute(text("DELETE FROM platform_http_skill WHERE skill_code=:c"), {"c": code})
 
@@ -1427,7 +1393,6 @@ class SQLPlatformStore:
                                      decided_by: str | None = None,
                                      reject_reason: str | None = None,
                                      skill_call_id: int | None = None) -> dict | None:
-        from sqlalchemy import text
         sets = ["status=:status", "decided_at=:decided_at"]
         params: dict[str, Any] = {"token": token, "status": status, "decided_at": _now()}
         if decided_by is not None:

@@ -184,11 +184,14 @@ class HttpApiClient:
                     timeout=timeout or self.timeout_seconds,
                 )
                 elapsed_ms = int((time.time() - t0) * 1000)
-            except Exception as exc:
+            except requests.RequestException as exc:
+                # 只接住网络层错误。其它（比如 _apply_auth 里的 KeyError /
+                # AttributeError）属于配置/编程错误，应该直接冒出来——之前
+                # broad except 把它们全裹成"OAuth2 重试失败"，让排障变难。
                 return HttpResult(
                     method=method, url=url, status=0, headers={},
                     json_body=None, text_body="", elapsed_ms=elapsed_ms,
-                    error=f"OAuth2 重试失败：{exc}",
+                    error=f"OAuth2 重试网络异常：{exc}",
                 )
 
         # 解析 body

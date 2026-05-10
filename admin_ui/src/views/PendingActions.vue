@@ -168,10 +168,18 @@ async function onConfirm(row) {
       { type: 'warning', confirmButtonText: '执行', cancelButtonText: '取消', dangerouslyUseHTMLString: false },
     )
   } catch { return }
-  const { data } = await api.post(`/pending-actions/${row.token}/confirm`)
-  if (data.status === 'ok') ElMessage.success('已执行')
-  else ElMessage.error(data.message || data.error_code || '执行失败')
-  await load()
+  // confirm POST 之前没 try/catch——网络挂了页面什么都不变，
+  // 用户以为没生效又点一次，造成重复执行。这里 catch + 强制 reload。
+  try {
+    const { data } = await api.post(`/pending-actions/${row.token}/confirm`)
+    if (data.status === 'ok') ElMessage.success('已执行')
+    else ElMessage.error(data.message || data.error_code || '执行失败')
+  } catch (e) {
+    e.handled = true   // 让 axios interceptor 跳过 5xx toast，避免 double 弹
+    ElMessage.error(`确认失败：${e.response?.data?.error || e.message || '网络异常'}`)
+  } finally {
+    await load()
+  }
 }
 
 async function onReject(row) {

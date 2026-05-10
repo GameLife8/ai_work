@@ -97,19 +97,25 @@ import api from '../api'
 const auth = useAuthStore()
 const stats = ref({ connections: 0, models: 0, skills: 0, calls: 0 })
 
+// onMounted 里之前没 try/catch；任一接口 500 就让整页 stats 永远 0、
+// 用户看不到任何"加载失败"提示。现在让每段独立失败，单项 0 而不是全 0，
+// 整体异常由 api.js interceptor 自动弹 toast。
 onMounted(async () => {
-  const skills = (await api.get('/skills')).data
-  stats.value.skills = skills.length
-  if (auth.isAdmin) {
-    const [c, m, calls] = await Promise.all([
-      api.get('/connections'),
-      api.get('/models'),
-      api.get('/skill-calls?limit=200'),
-    ])
-    stats.value.connections = c.data.length
-    stats.value.models = m.data.length
-    stats.value.calls = calls.data.length
-  }
+  try {
+    const skills = (await api.get('/skills')).data
+    stats.value.skills = skills.length
+  } catch { /* interceptor 已弹错 */ }
+
+  if (!auth.isAdmin) return
+
+  const [c, m, calls] = await Promise.allSettled([
+    api.get('/connections'),
+    api.get('/models'),
+    api.get('/skill-calls?limit=200'),
+  ])
+  if (c.status === 'fulfilled') stats.value.connections = c.value.data.length
+  if (m.status === 'fulfilled') stats.value.models = m.value.data.length
+  if (calls.status === 'fulfilled') stats.value.calls = calls.value.data.length
 })
 </script>
 

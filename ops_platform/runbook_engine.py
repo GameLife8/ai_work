@@ -533,7 +533,13 @@ def evaluate_condition(cond: RunbookCondition | None, ctx: "ExecutionContext") -
             try:
                 return str(expected) in str(actual) if not isinstance(actual, list) \
                     else expected in actual
-            except Exception:
+            except (TypeError, ValueError) as exc:
+                # 走到这里通常是 actual / expected 不是预期类型——log 一下，
+                # 让 runbook 作者能定位为啥这条 condition 永远 False。
+                logger.warning(
+                    "condition field_contains 评估失败：path=%s actual=%r expected=%r → %s",
+                    cond.path, actual, expected, exc,
+                )
                 return False
         if t == "field_gt":
             try: return float(actual) > float(expected)
@@ -547,7 +553,12 @@ def evaluate_condition(cond: RunbookCondition | None, ctx: "ExecutionContext") -
     if t == "all_of":
         return all(evaluate_condition(c, ctx) for c in cond.conditions)
     if t == "not":
-        return cond.conditions and not evaluate_condition(cond.conditions[0], ctx)
+        # 注意：``cond.conditions and not ...`` 会在 conditions 为空时返回空列表，
+        # 上游期望 bool；显式转 bool 避免下游 ``if condition:`` 读到 [] 误判。
+        if not cond.conditions:
+            logger.warning("condition 'not' 缺少 inner conditions，按 false 处理")
+            return False
+        return not evaluate_condition(cond.conditions[0], ctx)
 
     logger.warning("未知条件类型：%s，按 false 处理", t)
     return False

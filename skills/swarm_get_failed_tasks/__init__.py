@@ -60,26 +60,34 @@ def _extract_signals(failed: list[dict]) -> list[dict]:
                 context={"node": node},
             ))
         elif "pull access denied" in merged or "manifest unknown" in merged or "image pull" in merged:
+            # ServiceName 缺失时不挂 next_skill——比起递 ``{"service_name": ""}`` 让下游失败，
+            # 不如让模型看证据自己再 list_services 找名字。
+            svc = task.get("ServiceName") or (task.get("Name") or "").split(".")[0]
+            pivot = {"next_skill": "swarm_get_service_detail",
+                     "next_args": {"service_name": svc}} if svc else {}
             sigs.append(signal(
                 SIG_IMAGE_PULL_FAIL, severity=SEV_CRITICAL,
                 evidence=f"任务 {task.get('Name')} 拉镜像失败：{err[:160]}",
-                next_skill="swarm_get_service_detail",
-                next_args={"service_name": task.get("ServiceName") or task.get("Name", "").split(".")[0]},
+                **pivot,
             ))
         elif "permission denied" in merged or "operation not permitted" in merged:
+            svc = task.get("ServiceName") or (task.get("Name") or "").split(".")[0]
+            pivot = {"next_skill": "swarm_get_service_logs_filter",
+                     "next_args": {"service_name": svc, "keyword": "denied"}} if svc else {}
             sigs.append(signal(
                 SIG_PERMISSION_DENIED, severity=SEV_WARNING,
                 evidence=f"任务 {task.get('Name')} 报权限错误：{err[:160]}",
-                next_skill="swarm_get_service_logs_filter",
-                next_args={"service_name": task.get("ServiceName") or "", "keyword": "denied"},
+                **pivot,
             ))
         elif "exit code 1" in merged or "(1)" in merged:
             # 通用退出码 1，多半是配置/启动脚本错误
+            svc = task.get("ServiceName") or (task.get("Name") or "").split(".")[0]
+            pivot = {"next_skill": "swarm_get_service_logs_filter",
+                     "next_args": {"service_name": svc, "keyword": "error"}} if svc else {}
             sigs.append(signal(
                 SIG_CONFIG_ERROR, severity=SEV_WARNING,
                 evidence=f"任务 {task.get('Name')} 退出码 1，可能是应用启动错误：{err[:120]}",
-                next_skill="swarm_get_service_logs_filter",
-                next_args={"service_name": task.get("ServiceName") or "", "keyword": "error"},
+                **pivot,
             ))
     return sigs
 

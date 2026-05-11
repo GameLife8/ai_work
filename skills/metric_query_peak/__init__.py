@@ -109,7 +109,14 @@ MANIFEST = {
 
 def _extract_signals(result: dict) -> list[dict]:
     """峰值过高时挂 signal，让 agent 跨域 pivot（比如 CPU 峰值过高时建议拉
-    主机概览看持续负载，或拉容器列表看哪个容器在吃资源）。"""
+    主机概览看持续负载）。
+
+    设计要点：
+    - host_name 为空时**不挂 next_skill**——免得给模型一个 ``{"host_query": ""}`` 的
+      无效 next_args，调下游 skill 直接失败。只发证据让模型自己消化。
+    - warning 阈值（80~90% CPU）也要给 next_skill：之前缺这条，导致 80~90% 区间
+      模型拿到 signal 但没 pivot 提示，跨域诊断卡住。
+    """
     peak = result.get("peak") or {}
     metric = result.get("metric")
     value = peak.get("value")
@@ -119,35 +126,58 @@ def _extract_signals(result: dict) -> list[dict]:
     if not (sig_type and isinstance(value, (int, float))):
         return []
 
+    # host_name 缺失时跳过 next_skill / next_args——不给模型递空指针
+    pivot: dict = {}
+    if host_name:
+        pivot = {
+            "next_skill": "zabbix_get_host_overview",
+            "next_args": {"host_query": host_name},
+        }
+
+    base_ctx = {"peak_time": peak.get("time"), "metric": metric}
+    lookback_h = (result.get("lookback_seconds") or 0) // 3600
+
     if metric == "cpu.utilization":
         if value >= 90:
             return [signal(
                 sig_type, severity=SEV_CRITICAL,
                 evidence=(
-                    f"主机 {host_name} {result.get('lookback_seconds', 0)//3600}h 内 CPU 峰值 "
+                    f"主机 {host_name or '?'} {lookback_h}h 内 CPU 峰值 "
                     f"{value}%（@ {peak.get('time')}），≥ 90% 严重负载"
                 ),
-                next_skill="zabbix_get_host_overview",
-                next_args={"host_query": host_name},
-                context={"peak_time": peak.get("time"), "metric": metric},
+                context=base_ctx,
+                **pivot,
             )]
         if value >= 80:
             return [signal(
                 sig_type, severity=SEV_WARNING,
-                evidence=f"主机 {host_name} CPU 峰值 {value}%（@ {peak.get('time')}）",
-                context={"peak_time": peak.get("time"), "metric": metric},
+                evidence=(
+                    f"主机 {host_name or '?'} CPU 峰值 {value}%（@ {peak.get('time')}），"
+                    f"接近告警阈值"
+                ),
+                context=base_ctx,
+                **pivot,    # 之前 warning 分支没挂 next_skill，模型拿到只能干瞪眼；现在补上
             )]
     elif metric == "memory.utilization":
         if value >= 90:
             return [signal(
                 sig_type, severity=SEV_CRITICAL,
                 evidence=(
-                    f"主机 {host_name} 内存峰值 {value}%（@ {peak.get('time')}），"
+                    f"主机 {host_name or '?'} 内存峰值 {value}%（@ {peak.get('time')}），"
                     f"≥ 90% 接近 OOM 风险"
                 ),
-                next_skill="zabbix_get_host_overview",
-                next_args={"host_query": host_name},
-                context={"peak_time": peak.get("time"), "metric": metric},
+                context=base_ctx,
+                **pivot,
+            )]
+        if value >= 80:
+            return [signal(
+                sig_type, severity=SEV_WARNING,
+                evidence=(
+                    f"主机 {host_name or '?'} 内存峰值 {value}%（@ {peak.get('time')}），"
+                    f"接近高水位"
+                ),
+                context=base_ctx,
+                **pivot,
             )]
     return []
 

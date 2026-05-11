@@ -183,16 +183,28 @@ class UnifiedOpsAgent:
 
             had_pending = False
             new_signals: list[dict[str, Any]] = []
+            # 同一轮里如果模型重复要求执行同 skill + 同 args（实测国产模型偶尔会），
+            # 直接复用第一次的 envelope——避免双倍审计/双倍 LLM token + 双倍写操作风险。
+            # key 不进 trace（trace 仍按顺序记录每个 tool_call 以便排错）。
+            turn_call_cache: dict[tuple, dict[str, Any]] = {}
             for tool_call in tool_calls:
                 fn = tool_call.get("function", {})
                 name = fn.get("name")
                 args = json.loads(fn.get("arguments") or "{}")
-                envelope = self.invoker.invoke(name, args, ctx)
+                dedup_key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str))
+                cached = turn_call_cache.get(dedup_key)
+                if cached is not None:
+                    envelope = cached
+                else:
+                    envelope = self.invoker.invoke(name, args, ctx)
+                    turn_call_cache[dedup_key] = envelope
                 trace.append(self._to_trace_item(name, args, envelope))
                 if envelope.get("status") == "needs_confirmation":
                     pending_actions.append(envelope)
                     had_pending = True
                 # 提取本次结果里的结构化 signals，去重后留作下一轮 system 提示
+                # 命中缓存的 envelope 已经在第一次执行时贡献过 signal，这里 signal_dedup
+                # 会过滤掉，不会重复挂 hint。
                 for sig in collect_signals(envelope):
                     key = signal_dedup(sig)
                     if key in seen_signal_keys:

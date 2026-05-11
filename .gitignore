@@ -21,3 +21,4 @@ admin_ui/.vite/
 .files/
 chainlit-*.db
 .chainlit/translations/
+admin_ui/.chainlit/

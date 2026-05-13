@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -10,6 +11,102 @@ from ops_platform.prompts import assemble_default, assemble_from_records
 from ops_platform.signals import collect as collect_signals
 from ops_platform.signals import dedup_key as signal_dedup
 from ops_platform.signals import render_hint as render_signal_hint
+
+
+logger = logging.getLogger(__name__)
+
+
+# ----- 上下文滑窗：避免 8 步循环里 messages 越积越大把窗口撑爆 ----------- #
+
+# JSON 序列化后总长度超过这个阈值就开始压缩。~4 char/token，50K char ≈ 12.5K token。
+# 国产模型大多 32K~128K 上下文；预留余量给 system + tools schema + 当前轮输出。
+MAX_MESSAGE_CHARS = 50_000
+
+# 一次压缩里至少保留多少个"最新"消息（除去 head [system, user]）。低于这个就别压了。
+KEEP_TAIL_MESSAGES = 6
+
+
+def _messages_size_chars(messages: list[dict[str, Any]]) -> int:
+    """估算 messages 序列化后的字符数。粗略代理 token 数。"""
+    try:
+        return len(json.dumps(messages, ensure_ascii=False, default=str))
+    except (TypeError, ValueError):
+        # 极端情况下 JSON 化失败——按上限处理强制压缩
+        return MAX_MESSAGE_CHARS + 1
+
+
+def _compress_history(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """把最早的一个"轮组" (assistant w/ tool_calls + 对应 tool 回复) 折叠成一句摘要。
+
+    OpenAI tool calling 协议约束：``assistant.tool_calls`` 必须跟对应数量的
+    ``tool`` 消息成对出现，不能单独丢 tool 消息（``tool_call_id`` 会悬空）。
+    所以压缩单位 = 一整个轮组。
+
+    Args:
+        messages: 当前消息列表（原位**不修改**，返回新列表）。
+
+    Returns:
+        压缩后的新列表；如果找不到可压缩的轮组（比如只剩 [system, user] +
+        一个未完成轮），原样返回。
+    """
+    if len(messages) < 4:
+        return messages
+    # 跳过最前面的 [system, ...] + [user, ...] 头部
+    head_end = 0
+    while head_end < len(messages) and messages[head_end].get("role") in {"system", "user"}:
+        head_end += 1
+
+    # 从 head 之后找第一个"轮组" = assistant(有 tool_calls) + 紧跟的所有 tool 消息
+    turn_start = head_end
+    while turn_start < len(messages):
+        m = messages[turn_start]
+        if m.get("role") == "assistant" and m.get("tool_calls"):
+            break
+        turn_start += 1
+    if turn_start >= len(messages):
+        return messages    # 没有可压的轮组
+
+    turn_end = turn_start + 1
+    while turn_end < len(messages) and messages[turn_end].get("role") == "tool":
+        turn_end += 1
+    # turn_end 现在指向下一轮 assistant（或越界）
+    # 如果压完后尾部少于 KEEP_TAIL_MESSAGES，就别压了——避免压得过狠丢上下文
+    if len(messages) - turn_end < KEEP_TAIL_MESSAGES:
+        return messages
+
+    # 生成摘要内容：列出本轮调了哪些 skill + 简要结果
+    called: list[str] = []
+    for tc in (messages[turn_start].get("tool_calls") or []):
+        fn = tc.get("function") or {}
+        called.append(f"{fn.get('name')}({(fn.get('arguments') or '')[:80]})")
+    # tool 消息体可能很长，只取每条前 200 字符
+    tool_snippets: list[str] = []
+    for i in range(turn_start + 1, turn_end):
+        body = messages[i].get("content") or ""
+        if not isinstance(body, str):
+            body = json.dumps(body, ensure_ascii=False, default=str)
+        tool_snippets.append(body[:200].replace("\n", " "))
+
+    summary = {
+        "role": "system",
+        "content": (
+            "[历史摘要] 之前已经调用过：" + "; ".join(called) +
+            "。简要结果（每条 ≤200 char）：" + " | ".join(tool_snippets) +
+            "。完整原始结果已从上下文里裁剪以节省 token，详见 trace。"
+        ),
+    }
+    return messages[:turn_start] + [summary] + messages[turn_end:]
+
+
+def _maybe_compress(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """messages 太大时迭代压缩，直到达标或没法再压。"""
+    current = messages
+    while _messages_size_chars(current) > MAX_MESSAGE_CHARS:
+        compressed = _compress_history(current)
+        if compressed is current or len(compressed) == len(current):
+            break    # 没法再压
+        current = compressed
+    return current
 
 
 _LEGACY_SYSTEM_PROMPT = """
@@ -141,26 +238,86 @@ class UnifiedOpsAgent:
         pending_actions: list[dict[str, Any]] = []
         seen_signal_keys: set[tuple] = set()
         all_signals: list[dict[str, Any]] = []
+        # 已经被"signal 强制 pivot"路径用过的 (skill, args_json) —— 避免同信号无限循环
+        force_routed_keys: set[tuple[str, str]] = set()
 
-        for _ in range(self.max_steps):
+        for step in range(self.max_steps):
+            # ⏬ 调用 LLM 前先压缩 messages，防止 8 步循环里上下文越积越多撑爆窗口
+            messages = _maybe_compress(messages)
+
             message = self.model.create_completion(
                 messages=messages, tools=tools, tool_choice="auto",
             )
             tool_calls = message.get("tool_calls") or []
             if not tool_calls:
-                heuristic = self._heuristic_route(user_message)
-                if heuristic and not trace:
-                    name, args = heuristic
+                fallback = self._pick_fallback(
+                    user_message=user_message,
+                    trace=trace,
+                    all_signals=all_signals,
+                    force_routed_keys=force_routed_keys,
+                )
+                if fallback is not None:
+                    name, args, reason = fallback
                     envelope = self.invoker.invoke(name, args, ctx)
                     trace.append(self._to_trace_item(name, args, envelope))
+                    force_routed_keys.add(
+                        (name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str))
+                    )
                     if envelope.get("status") == "needs_confirmation":
                         pending_actions.append(envelope)
+                        # 进入"待确认"路径：让模型给一段提议+风险说明就结束
+                        summary = self.model.create_completion(
+                            messages=messages + [{
+                                "role": "system",
+                                "content": (
+                                    f"平台已根据 {reason} 自动调用 {name}({args})，"
+                                    "结果是写操作 needs_confirmation。请用中文向用户说明："
+                                    "你打算执行什么、为什么、影响范围、回滚方式。**禁止再调用任何工具**。"
+                                ),
+                            }],
+                        )
+                        return AgentOutcome(
+                            message=summary.get("content") or "操作待用户确认。",
+                            trace=trace,
+                            pending_actions=pending_actions,
+                        )
+                    # 只读 fallback：把"合成的工具调用"塞进 messages，让下一轮 LLM 看到结果，
+                    # 自己决定是给最终报告还是再调其它 skill。
+                    synthetic_id = f"fallback_{step}"
+                    messages.append({
+                        "role": "assistant", "content": "",
+                        "tool_calls": [{
+                            "id": synthetic_id, "type": "function",
+                            "function": {"name": name,
+                                         "arguments": json.dumps(args, ensure_ascii=False)},
+                        }],
+                    })
+                    messages.append({
+                        "role": "tool", "tool_call_id": synthetic_id,
+                        "content": self.invoker.serialize_for_model(envelope),
+                    })
+                    messages.append({
+                        "role": "system",
+                        "content": (
+                            f"⚙️ 平台已根据 {reason} 自动调用 ``{name}`` 补一次取证。"
+                            "请综合上下文给出最终五段式报告；如还有缺失再调一次 skill 即可。"
+                        ),
+                    })
+                    # 把 fallback 命中的 signal 也吸收一次，避免下一轮再触发
+                    for sig in collect_signals(envelope):
+                        key = signal_dedup(sig)
+                        if key not in seen_signal_keys:
+                            seen_signal_keys.add(key)
+                            all_signals.append(sig)
+                    continue   # 让 for 循环进入下一步，给模型用新上下文重试
+
+                # 真没 fallback：拿模型自己给的回答 / 或拿 trace 让模型再总结一次
+                if trace:
                     summary = self.model.create_completion(
                         messages=[
                             {"role": "system", "content":
-                             "请根据用户问题和 skill 结果输出中文报告。"
-                             "若 skill 结果包含 _pending=True，仅说明"
-                             "你打算做什么、风险、并提示用户在下方点击确认/取消，不要再次调用工具。"},
+                             "请根据用户问题和 skill 结果输出中文五段式报告，"
+                             "不要再调用任何工具。"},
                             {"role": "user", "content": json.dumps(
                                 {"user_message": user_message, "trace": trace},
                                 ensure_ascii=False, indent=2,
@@ -168,7 +325,7 @@ class UnifiedOpsAgent:
                         ],
                     )
                     return AgentOutcome(
-                        message=summary.get("content") or "已执行兜底 skill。",
+                        message=summary.get("content") or "已完成排查，但模型没有输出总结。",
                         trace=trace,
                         pending_actions=pending_actions,
                     )
@@ -306,4 +463,51 @@ class UnifiedOpsAgent:
         payload_match = re.search(r"(\{[\s\S]*\})", user_message)
         if payload_match:
             return "alerts_analyze_payload", {"raw_payload_json": payload_match.group(1)}
+        return None
+
+    @classmethod
+    def _pick_fallback(
+        cls,
+        *,
+        user_message: str,
+        trace: list[dict[str, Any]],
+        all_signals: list[dict[str, Any]],
+        force_routed_keys: set[tuple[str, str]],
+    ) -> tuple[str, dict[str, Any], str] | None:
+        """模型空手而归时挑一个兜底 skill。返回 ``(name, args, reason)`` 或 None。
+
+        优先级：
+          1. **会话刚开始** (trace 空) — 走关键词启发式 (``_heuristic_route``)，
+             适合用户原话本身就指向某个 skill 的场景。
+          2. **会话中段** (trace 非空) — 优先读未被 force-route 过的 ``critical``
+             signal；若没有 critical 再降级看 warning。**只有带 ``next_skill`` 的
+             signal 才能驱动 pivot**（避免递空 args 让下游 skill 崩）。
+
+        防循环：每次 pivot 后调用方应该把 ``(skill, args_json)`` 写入
+        ``force_routed_keys``，确保同一个 (skill, args) 不会被强制路由两次。
+        """
+        if not trace:
+            heuristic = cls._heuristic_route(user_message)
+            if heuristic:
+                name, args = heuristic
+                return name, args, "user_message 关键词启发式"
+            return None
+
+        # 中段：从最新 signal 往前找未 force-route 过的 critical 推荐
+        for severity_target in ("critical", "warning"):
+            for sig in reversed(all_signals):
+                if (sig.get("severity") or "warning") != severity_target:
+                    continue
+                next_skill = sig.get("next_skill")
+                next_args = sig.get("next_args") or {}
+                if not next_skill:
+                    continue
+                key = (next_skill, json.dumps(next_args, sort_keys=True, ensure_ascii=False, default=str))
+                if key in force_routed_keys:
+                    continue
+                reason = (
+                    f"上一轮信号 ``{sig.get('type')}`` (severity={severity_target}) "
+                    f"建议 next_skill={next_skill}"
+                )
+                return next_skill, next_args, reason
         return None

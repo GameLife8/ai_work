@@ -45,7 +45,10 @@
 #     curl -H "Authorization: Bearer <你的token>" \
 #          http://<节点IP>:9100/v1/health | jq .
 # =====================================================================
-version: "3.8"
+# compose 版本：3.6 是 Docker 18.06+ 都支持的稳妥版本；如你的 swarm 是
+# Docker 19.03+，可以把 ``version: "3.8"`` + ``update_config.order: start-first``
+# 加回来获得更丝滑的滚动更新。
+version: "3.6"
 
 services:
   ai-ops-agent:
@@ -57,8 +60,9 @@ services:
         condition: any
         delay: 5s
       update_config:
-        order: start-first               # 先起新的再停老的，减少 agent 不可用窗口
-        parallelism: 1
+        parallelism: 1                   # 滚动更新时一次一台节点
+        delay: 5s
+        failure_action: rollback
       resources:
         limits:    { cpus: "0.5", memory: 256M }
         reservations: { cpus: "0.02", memory: 32M }

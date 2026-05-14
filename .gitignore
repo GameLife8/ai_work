@@ -22,3 +22,9 @@ admin_ui/.vite/
 chainlit-*.db
 .chainlit/translations/
 admin_ui/.chainlit/
+
+# 临时凭证 / 部署期产生的敏感文件——绝对不要提交
+.agent_token.tmp
+.daemon.json.tmp
+.http-proxy.conf.tmp
+*.token.txt

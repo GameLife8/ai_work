@@ -77,6 +77,10 @@ spec:
     spec:
       serviceAccountName: ai-ops-agent
 
+      # Agent 不需要跟 K8s API server 对话——关掉 SA token 自动挂载，避免 kubelet
+      # 在 /run/secrets/kubernetes.io/serviceaccount/ 下创目录（跟我们的 secret 挂载冲突）。
+      automountServiceAccountToken: false
+
       # 看到宿主机所有进程 / 网络栈 / IPC（nsenter 必须）
       hostPID: true
       hostNetwork: true

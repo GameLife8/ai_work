@@ -71,7 +71,7 @@ import yaml
 from aiohttp import web
 
 
-AGENT_VERSION = "1.0.0"
+AGENT_VERSION = "1.1.0"
 
 # ---------- 配置 ----------
 
@@ -81,6 +81,25 @@ TOKEN_ENV = os.getenv("AGENT_AUTH_TOKEN", "")          # 仅 dev/测试用；生
 ALLOWED_CIDR = os.getenv("AGENT_ALLOWED_CIDR", "")     # 逗号分隔；空 = 不做 IP 限制
 ALLOW_FILE = os.getenv("AGENT_ALLOWED_FILE", "/etc/ai-ops-agent/allowed.yml")
 NODE_NAME = os.getenv("AGENT_NODE_NAME") or socket.gethostname()
+
+# Agent 执行模式
+#   direct       —— Agent 直接在自己进程里跑 nsenter -t 1。要求容器自己有
+#                    privileged + pid:host + network:host（K8s DaemonSet 默认走这条）。
+#   docker_proxy —— Agent 不要任何特权，但挂 /var/run/docker.sock；收到 /v1/exec 时
+#                    通过本地 docker daemon ``docker run --rm --privileged --pid host``
+#                    起一次性 sibling 容器跑 nsenter。
+#                    专为 Docker 18.03 / 老版 swarm 用——它们的 service 调度器拒绝
+#                    privileged 类字段，但 ``docker run`` 始终支持。
+AGENT_MODE = os.getenv("AGENT_MODE", "direct").strip().lower()
+if AGENT_MODE not in {"direct", "docker_proxy"}:
+    raise RuntimeError(f"AGENT_MODE 必须是 direct 或 docker_proxy，当前: {AGENT_MODE!r}")
+
+# docker_proxy 模式下用哪个镜像作为 sibling 跑 nsenter。默认沿用 agent 自己的镜像
+# （它里面已经有 nsenter / iproute2 / iptables / tcpdump），省一次镜像维护。
+AGENT_TOOLS_IMAGE = os.getenv("AGENT_TOOLS_IMAGE", "")
+
+# docker_proxy 模式下调本地 docker daemon 的 CLI；alpine 包名 docker-cli
+DOCKER_BIN = os.getenv("DOCKER_BIN", "docker")
 
 # 全局上限——单次调用兜底
 MAX_TIMEOUT_SEC = 300
@@ -102,7 +121,7 @@ logger = logging.getLogger("ai-ops-agent")
 # ---------- 启动配置加载 ----------
 
 def load_config() -> None:
-    """读 token + 白名单。任一缺失都直接退出——agent 没法在不安全状态下运行。"""
+    """读 token + 白名单 + 模式校验。任一缺失都直接退出——agent 不能裸跑。"""
 
     # token：优先文件（secret 挂载），其次环境变量
     token = ""
@@ -128,10 +147,27 @@ def load_config() -> None:
         raise RuntimeError(f"{ALLOW_FILE} 的 read_only 列表为空——拒绝启动")
     _state["allowed_commands"] = cmds
 
+    # docker_proxy 模式必须能调到 docker CLI + 必须设 tools 镜像
+    if AGENT_MODE == "docker_proxy":
+        if not AGENT_TOOLS_IMAGE:
+            raise RuntimeError(
+                "AGENT_MODE=docker_proxy 需要设 AGENT_TOOLS_IMAGE 环境变量"
+                "（指定一个内含 nsenter + iproute2 + iptables 的镜像，"
+                "通常直接复用 agent 自己的镜像即可）"
+            )
+        # 兜一下：docker.sock 必须挂上
+        if not Path("/var/run/docker.sock").exists():
+            raise RuntimeError(
+                "AGENT_MODE=docker_proxy 但 /var/run/docker.sock 不存在——"
+                "确认部署 YAML 里挂了 host docker socket"
+            )
+
     logger.info(
-        "agent 启动配置就绪：node=%s port=%s allowed=%s",
-        NODE_NAME, PORT, sorted(cmds),
+        "agent 启动配置就绪：node=%s port=%s mode=%s allowed=%s",
+        NODE_NAME, PORT, AGENT_MODE, sorted(cmds),
     )
+    if AGENT_MODE == "docker_proxy":
+        logger.info("docker_proxy 模式 tools image = %s", AGENT_TOOLS_IMAGE)
 
 
 # ---------- 鉴权中间件 ----------
@@ -189,7 +225,12 @@ _NS_FLAGS = {
 
 
 def _build_argv(payload: dict) -> tuple[list[str], float, int]:
-    """从请求体造最终 argv（含 nsenter wrap）+ timeout + max_output_bytes。
+    """从请求体造最终 argv + timeout + max_output_bytes。
+
+    direct 模式：``[nsenter -t 1 ... -- <cmd>]`` —— 在 agent 进程里直接 exec。
+    docker_proxy 模式：``[docker run --rm --privileged --pid host --network host
+                          --mount /:/ host:ro --entrypoint nsenter <tools-image>
+                          -t 1 ... -- <cmd>]`` —— 起 sibling 容器跑 nsenter。
 
     抛 ``ValueError`` 表示请求格式错（→ 400）；
     抛 ``PermissionError`` 表示命令不在白名单（→ 403）。
@@ -215,25 +256,54 @@ def _build_argv(payload: dict) -> tuple[list[str], float, int]:
         raise PermissionError(
             f"不要直接调用 {base}；agent 会自动用 nsenter 包裹业务命令"
         )
+    # docker_proxy 模式下也禁止用户直接调 docker（避免穿透到本地 daemon）
+    if AGENT_MODE == "docker_proxy" and base == "docker":
+        raise PermissionError(
+            "docker_proxy 模式下不能直接调 docker；agent 自己会用 docker run 起 sibling"
+        )
 
-    # nsenter 配置：默认进 m/u/i/n/p；显式传 "" 表示在 agent 容器自己的 ns 里跑
+    # nsenter 配置：默认进 m/u/i/n/p；显式传 "" 表示**不**进 host ns
     ns_str = payload.get("nsenter")
     if ns_str is None:
         ns_str = "muinp"
     if not isinstance(ns_str, str):
         raise ValueError("nsenter 必须是字符串，如 'muinp' 或 ''")
 
+    # 拼 nsenter 段
     if ns_str:
-        argv = ["nsenter", "-t", "1"]
+        ns_args: list[str] = ["-t", "1"]
         for ch in ns_str:
             flag = _NS_FLAGS.get(ch)
             if not flag:
                 raise ValueError(f"nsenter 字符 {ch!r} 未识别")
-            argv.append(flag)
-        argv.append("--")
-        argv.extend(cmd)
+            ns_args.append(flag)
+        ns_args.append("--")
+
+    if AGENT_MODE == "direct":
+        # 老路径：agent 自己 nsenter
+        if ns_str:
+            argv = ["nsenter", *ns_args, *cmd]
+        else:
+            argv = list(cmd)
     else:
-        argv = list(cmd)
+        # docker_proxy 路径：把整个执行包到 sibling 容器里
+        docker_argv = [
+            DOCKER_BIN, "run", "--rm",
+            "--privileged",
+            "--pid", "host",
+            "--network", "host",
+            # 宿主机文件系统挂到 sibling 内 /host，方便 cat /host/etc/...
+            "--mount", "type=bind,src=/,dst=/host,readonly,bind-propagation=rshared",
+        ]
+        if ns_str:
+            # entrypoint = nsenter，把 nsenter flags + 业务 cmd 当 ARGS 喂进去
+            docker_argv += ["--entrypoint", "nsenter", AGENT_TOOLS_IMAGE]
+            docker_argv += ns_args + cmd
+        else:
+            # 不进 host ns 时：sibling 里直接跑业务命令
+            docker_argv += ["--entrypoint", cmd[0], AGENT_TOOLS_IMAGE]
+            docker_argv += cmd[1:]
+        argv = docker_argv
 
     # 限流参数
     timeout = float(payload.get("timeout_sec") or DEFAULT_TIMEOUT_SEC)
@@ -261,6 +331,8 @@ async def health(_request: web.Request) -> web.Response:
         "ok": True,
         "node": NODE_NAME,
         "agent_version": AGENT_VERSION,
+        "agent_mode": AGENT_MODE,
+        "tools_image": AGENT_TOOLS_IMAGE if AGENT_MODE == "docker_proxy" else None,
         "uptime_seconds": int(time.time() - _state["start_time"]),
         "exec_count": _state["exec_count"],
         "allowed_commands": sorted(_state["allowed_commands"]),

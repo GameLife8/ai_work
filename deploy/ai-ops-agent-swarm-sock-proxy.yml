@@ -1,0 +1,114 @@
+# =====================================================================
+# ai-ops-agent (Docker Swarm global service) —— docker.sock 代理模式
+# =====================================================================
+#
+# 适用场景
+# --------
+# Docker swarm 18.03 及以下版本：其 service 调度器**拒绝**调度有 ``privileged: true``
+# / ``pid: host`` / ``network_mode: host`` 字段的服务。compose 部署时会看到：
+#
+#     Ignoring unsupported options: network_mode, pid, privileged
+#
+# 结果是 agent 容器跑起来但**进不了宿主 namespace**，nsenter 报 Operation not
+# permitted。Docker 20.10+ 才在 ``docker service create`` 加 ``--privileged``，
+# 23.0+ 才加 ``--pid host``。
+#
+# 解决思路：把 agent 容器变成"无特权 HTTP 代理"，挂 ``/var/run/docker.sock``。
+# 收到 ``/v1/exec`` 时通过本地 docker daemon 起一个 ``docker run --rm --privileged
+# --pid host --network host <tools-image> nsenter ...`` sibling 容器跑真活。
+# 这条路径绕开 swarm 调度器，``docker run`` 本身在 18.03 就完整支持那些特权字段。
+#
+# 用 Docker 20.10+ 的 swarm 集群？请用 ``ai-ops-agent-swarm.yml`` 走 direct 模式
+# （agent 自己有特权，省一次 docker run 的开销）。
+#
+# =====================================================================
+# 部署
+# =====================================================================
+#
+# 0. （只需一次）每个节点的 daemon 加 harbor 到 insecure-registries：
+#       /etc/docker/daemon.json:
+#         { "insecure-registries": ["mobile.chinasws.com:9990"] }
+#       systemctl restart docker
+#
+# 1. 在 manager 上 docker login harbor（让 --with-registry-auth 能下发凭证）：
+#       docker -H tcp://manager:2375 login mobile.chinasws.com:9990 -u 12860
+#
+# 2. 生成 token + 创建 swarm secret：
+#       TOKEN=$(openssl rand -hex 32)        # 或 python3 -c "import secrets;print(secrets.token_hex(32))"
+#       echo $TOKEN | docker -H tcp://manager:2375 secret create ai-ops-agent-token -
+#       echo "Token: $TOKEN  ← 粘到平台 admin UI"
+#
+# 3. 部署：
+#       export AGENT_IMAGE=mobile.chinasws.com:9990/ops/ai-ops-agent:1.1
+#       docker -H tcp://manager:2375 stack deploy --with-registry-auth \
+#              -c deploy/ai-ops-agent-swarm-sock-proxy.yml ai-ops
+#
+# 4. 验证（在 manager 节点）：
+#       docker -H tcp://manager:2375 ps --filter name=ai-ops_ai-ops-agent --format '{{.Names}}'
+#       # 找到容器名后：
+#       docker -H tcp://manager:2375 exec <container> wget -qO- http://127.0.0.1:9100/livez
+#       # 应该回 "ok"
+#
+# 5. 卸载：
+#       docker -H tcp://manager:2375 stack rm ai-ops
+#       docker -H tcp://manager:2375 secret rm ai-ops-agent-token
+# =====================================================================
+
+# 3.6 是 Docker 18.06+ 都能解析的最稳妥 compose 版本
+version: "3.6"
+
+services:
+  ai-ops-agent:
+    image: ${AGENT_IMAGE:-mobile.chinasws.com:9990/ops/ai-ops-agent:1.1}
+
+    deploy:
+      mode: global                       # 每个节点都跑一份
+      restart_policy:
+        condition: any
+        delay: 5s
+      update_config:
+        parallelism: 1
+        delay: 5s
+        failure_action: rollback
+      resources:
+        limits:    { cpus: "0.5", memory: 128M }     # 比 direct 模式更小，只跑 HTTP server
+        reservations: { cpus: "0.02", memory: 24M }
+
+    # 注意：这里**不**写 privileged / pid:host / network_mode:host —— swarm 18.03
+    # 调度器无论如何都会忽略它们。特权由 sibling 容器的 ``docker run`` 在运行时获得。
+
+    environment:
+      AGENT_PORT: "9100"
+      AGENT_NODE_NAME: "{{.Node.Hostname}}"
+      # 关键：开启 docker.sock 代理模式
+      AGENT_MODE: "docker_proxy"
+      # sibling 容器用**digest** 引用而不是 tag——这样 docker run 直接命中 swarm
+      # 拉下来的本地缓存（swarm 拉镜像只 pin digest 不打 tag），不会再去 harbor 拉，
+      # 也就不需要每节点配 harbor 凭证。每次发布新 agent 版本要更新这里的 digest。
+      AGENT_TOOLS_IMAGE: "${AGENT_TOOLS_IMAGE:-mobile.chinasws.com:9990/ops/ai-ops-agent@sha256:888cfd6486ca3e40d11699d9ed993f3dc08ee87c3b9aff74a4a3060f1462495e}"
+      # 可选源 IP 限制
+      AGENT_ALLOWED_CIDR: "${BACKEND_CIDR:-}"
+
+    secrets:
+      - source: ai-ops-agent-token
+        target: token
+
+    volumes:
+      # 挂宿主 docker.sock —— agent 通过它起 sibling 容器
+      - /var/run/docker.sock:/var/run/docker.sock
+
+      # 注意：宿主机文件挂载从 agent 容器移到 sibling 容器内做（sibling 启动时
+      # 由 agent 帮它加 --mount type=bind,src=/,dst=/host,readonly），所以这里
+      # agent 自己**不需要**挂 /:/host。这样 agent 容器更轻、攻击面更小。
+
+    ports:
+      # swarm 调度时 :9100 走 ingress overlay；但更建议平台 backend 走 manager IP
+      # 反代 + per-node 通过 manager 的 docker context 转发（如果有该机制）。
+      # 老 swarm 不支持 hostNetwork —— ingress 是唯一手段。
+      - target: 9100
+        published: 9100
+        mode: host                       # 直接绑节点 NIC（不走 overlay routing mesh）
+
+secrets:
+  ai-ops-agent-token:
+    external: true

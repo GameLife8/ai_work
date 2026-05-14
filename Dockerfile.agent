@@ -29,6 +29,9 @@ RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories
         util-linux \
         # 文件 / 系统 / 容器排障
         lsof procps coreutils findutils file \
+        # Docker CLI ——只在 AGENT_MODE=docker_proxy 模式下用，调本地 /var/run/docker.sock
+        # 起 sibling 容器跑 nsenter。direct 模式装着也不碍事（~20MB）。
+        docker-cli \
         # K8s 节点用 crictl（containerd-only 集群必备）
         # alpine 没有 crictl 包，运维侧建议自己 push 进镜像；下面只装 ctr 配套依赖
         # Python + aiohttp + yaml

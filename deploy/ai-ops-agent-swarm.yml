@@ -1,6 +1,15 @@
 # =====================================================================
-# ai-ops-agent (Docker Swarm global service)
+# ai-ops-agent (Docker Swarm global service) —— direct (特权) 模式
 # =====================================================================
+#
+# ⚠️ 适用 Docker 20.10+ 的 swarm（service 调度器支持 ``--privileged``）。
+# Docker 18.03 / 19.x 上 swarm 会**忽略** privileged/pid/network_mode 三个字段，
+# agent 进不了宿主 ns。老 swarm 请用 ``ai-ops-agent-swarm-sock-proxy.yml``。
+#
+# 如何判断你的 swarm 是哪种？
+#   docker -H tcp://manager:2375 info --format '{{.ServerVersion}}'
+#   < 20.10  → sock-proxy
+#   >= 20.10 → direct (本文件)
 #
 # 架构升级说明（重要）
 # --------------------

@@ -52,6 +52,14 @@ class Config:
     USE_STUB_AI = os.getenv("USE_STUB_AI", "false").lower() == "true"
     AGENT_MAX_REASONING_STEPS = int(os.getenv("AGENT_MAX_REASONING_STEPS", "8"))
 
+    # ---- 告警自动诊断 ----
+    # alert webhook 进来 → 旧 pipeline 出决策后，再 best-effort 跑一次 runbook
+    # （按 alert.summary + host + service 匹配 trigger）。失败不影响告警入库与决策。
+    # 默认开；ENV ``ALERT_AUTO_RUNBOOK=false`` 可关掉（如平台还在调试期、runbook 不稳）。
+    ALERT_AUTO_RUNBOOK = os.getenv("ALERT_AUTO_RUNBOOK", "true").lower() == "true"
+    # auto-diagnose 单次执行上限：超时直接放弃（不阻塞告警 API 响应）。
+    ALERT_AUTO_RUNBOOK_TIMEOUT_SECONDS = int(os.getenv("ALERT_AUTO_RUNBOOK_TIMEOUT", "120"))
+
     # ---- 平台后台 ----
     ADMIN_JWT_SECRET = os.getenv("ADMIN_JWT_SECRET", "change-me-in-prod")
     ADMIN_BOOTSTRAP_USERNAME = os.getenv("ADMIN_BOOTSTRAP_USERNAME", "admin")

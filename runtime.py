@@ -14,6 +14,7 @@ from ops_platform import (
 from ops_platform.http_skill_loader import HttpSkillLoader
 from ops_platform.http_skill_seeds import seed_default_http_skills
 from ops_platform.loader import load_skills_from_package
+from ops_platform.mcp_skill_loader import MCPSkillLoader
 from ops_platform.runbook_engine import RunbookRegistry
 from ops_platform.runbook_seeds import seed_default_runbooks
 from ops_platform.store import attach_platform_store
@@ -50,6 +51,7 @@ class AppRuntime:
     skill_invoker: SkillInvoker
     runbook_registry: RunbookRegistry
     http_skill_loader: HttpSkillLoader
+    mcp_skill_loader: MCPSkillLoader
 
 
 def create_runtime(config_cls=Config) -> AppRuntime:
@@ -75,6 +77,7 @@ def create_runtime(config_cls=Config) -> AppRuntime:
 
     runbook_registry = RunbookRegistry(None)  # 先占位
     http_skill_loader = HttpSkillLoader.__new__(HttpSkillLoader)
+    mcp_skill_loader = MCPSkillLoader.__new__(MCPSkillLoader)
 
     # 先建 runtime 骨架，下面再把 alert pipeline 的 legacy clients 灌进来
     runtime = AppRuntime(
@@ -94,6 +97,7 @@ def create_runtime(config_cls=Config) -> AppRuntime:
         skill_invoker=SkillInvoker(skill_registry, store),
         runbook_registry=runbook_registry,
         http_skill_loader=http_skill_loader,
+        mcp_skill_loader=mcp_skill_loader,
     )
     connection_manager.attach_runtime(runtime)
     connection_manager.ensure_bootstrap(config_cls)
@@ -111,6 +115,15 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     HttpSkillLoader.__init__(http_skill_loader, runtime)
     seed_default_http_skills(store)
     http_skill_loader.reload()
+
+    # 装配 mcp_skill_loader：扫所有 enabled 的 mcp_client connection 拉远端 tools 注册成 skill。
+    # 失败不阻塞启动——远端 MCP 服务可能暂时挂、网络抖动等。后续 admin 改完触发手动 reload。
+    MCPSkillLoader.__init__(mcp_skill_loader, runtime)
+    try:
+        mcp_skill_loader.reload()
+    except Exception as exc:    # noqa: BLE001
+        import logging
+        logging.getLogger(__name__).warning("MCP skill 初次加载失败（不阻塞启动）：%s", exc)
 
     _attach_refresh_method(runtime, config_cls)
     _log_data_source_state(runtime, config_cls)
@@ -191,6 +204,10 @@ def _build_legacy_clients(runtime, config_cls) -> None:
         incident_service=runtime.incident_service,
         decision_engine=runtime.decision_engine,
         default_needs=config_cls.DEFAULT_CONTEXT_NEEDS,
+        # 让 alert pipeline 能 best-effort 触发 runbook 自动诊断（_maybe_run_runbook）
+        runtime_ref=runtime,
+        auto_runbook_enabled=getattr(config_cls, "ALERT_AUTO_RUNBOOK", False),
+        auto_runbook_timeout_seconds=getattr(config_cls, "ALERT_AUTO_RUNBOOK_TIMEOUT_SECONDS", 120),
     )
     runtime.alert_analysis_service = AlertAnalysisService(
         ai_client=runtime.ai_client,

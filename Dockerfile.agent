@@ -1,0 +1,51 @@
+# =====================================================================
+# ai-ops-agent —— 每个节点上跑的 HTTP 诊断代理容器。
+#
+# 部署见：
+#   - Swarm: deploy/ai-ops-agent-swarm.yml
+#   - K8s:   deploy/ai-ops-agent-k8s.yaml
+#   - 协议:  docs/host-agent.md
+#
+# 镜像约 60-80MB，alpine 基础 + iproute2 / iptables / tcpdump / py3-aiohttp 一应俱全。
+# =====================================================================
+FROM alpine:3.20
+
+ENV TZ=Asia/Shanghai \
+    AGENT_PORT=9100 \
+    AGENT_AUTH_TOKEN_FILE=/run/secrets/token \
+    AGENT_ALLOWED_FILE=/etc/ai-ops-agent/allowed.yml \
+    PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+# alpine 镜像默认源在国外；启用阿里云镜像加速。私有化部署时 admin 可重写为内网。
+RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories \
+ && apk add --no-cache \
+        tzdata \
+        # 网络层取证
+        iproute2 iptables ip6tables nftables ipvsadm ethtool bridge-utils \
+        # 包抓取 + DNS
+        tcpdump bind-tools \
+        # 进容器 / 内核事件
+        util-linux \
+        # 文件 / 系统 / 容器排障
+        lsof procps coreutils findutils file \
+        # K8s 节点用 crictl（containerd-only 集群必备）
+        # alpine 没有 crictl 包，运维侧建议自己 push 进镜像；下面只装 ctr 配套依赖
+        # Python + aiohttp + yaml
+        python3 py3-aiohttp py3-yaml \
+ && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
+ && echo "Asia/Shanghai" > /etc/timezone
+
+# Agent 主体 + 白名单
+COPY agent/agent.py /usr/local/bin/agent.py
+COPY agent/allowed.yml /etc/ai-ops-agent/allowed.yml
+
+# 健康检查走未鉴权的 /livez（不带 token，方便 docker/k8s 自己探活）
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -qO- http://127.0.0.1:9100/livez || exit 1
+
+EXPOSE 9100
+
+# 用 root + 特权运行——这是设计上要求的（nsenter -t 1 进宿主 namespace）。
+# 部署 YAML 里通过 privileged + pid:host 才能真正 nsenter。
+ENTRYPOINT ["python3", "/usr/local/bin/agent.py"]

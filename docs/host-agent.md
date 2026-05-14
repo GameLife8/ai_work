@@ -1,8 +1,11 @@
-# Host Agent —— 用 DaemonSet/global 替代 SSH 排障
+# Host Agent —— 用节点 HTTP 代理替代 SSH 排障
 
-> 本文档对应代码：[`services/host_agent_client.py`](../services/host_agent_client.py)、
-> [`ops_platform/drivers/host_agent.py`](../ops_platform/drivers/host_agent.py)、
-> [`skills/host_*`](../skills/) 系列、[`deploy/`](../deploy/) 部署清单。
+> 本文档对应代码：
+> [`agent/`](../agent/)（agent 主体），
+> [`services/host_agent_client.py`](../services/host_agent_client.py)（平台侧客户端），
+> [`ops_platform/drivers/host_agent.py`](../ops_platform/drivers/host_agent.py)，
+> [`skills/host_*`](../skills/) 系列，
+> [`deploy/`](../deploy/) 部署清单。
 
 ---
 
@@ -10,245 +13,291 @@
 
 私有化部署的运维团队经常面对：
 
-- **SSH 不允许开**：合规、堡垒机、网段隔离都让 SSH 进宿主机变得越来越麻烦。
+- **SSH 不允许开**：合规、堡垒机、网段隔离都让 SSH 进宿主机越来越麻烦。
 - **AI 排障要"进主机看"**：服务起不来到底是不是 iptables 拦了？conntrack 满了？OOM 了？只在容器里看不到。
 - **审计要求**：人手敲的命令谁都说不清做了什么；用 SSH 敲完关掉 session 就没了。
 
-**`host_agent` 把"进宿主机"这件事变成一次容器操作**：每个节点一个特权诊断容器（K8s 是 DaemonSet、Swarm 是 `mode: global`），平台通过集群 API（`kubectl exec` / `docker exec`）进入这个容器，再用 `nsenter` 进入宿主机的 namespace 跑命令。
+**`host_agent` 把"进宿主机"这件事变成一次 HTTP 调用**：
 
-走完这一圈：
+每个节点跑一个特权 HTTP 代理容器（K8s DaemonSet / Swarm `mode: global`），监听节点的 `:9100`。平台 backend 直接 HTTP POST 到 `<node-ip>:9100/v1/exec`，agent 用 `nsenter -t 1` 进宿主机 namespace 执行命令，返回 JSON。
 
-| 维度 | SSH | host_agent |
+| 维度 | SSH | host_agent (v2 HTTP) |
 |---|---|---|
-| 鉴权 | 每台机器独立 authorized_keys | 集群 API 统一 RBAC |
-| 命令审计 | 自己上 auditd | 平台 `platform_skill_call` 表自动记 |
-| 网络入口 | 22 端口要开到运维 | 集群 API 一个口子 |
-| 节点扩缩容 | 加 SSH 配置 | DaemonSet 自动覆盖 |
-| 范围控制 | "全 root 或全没" | 命令白名单 + 审批 |
+| 鉴权 | 每台机器独立 authorized_keys | 集群级 Bearer token，每节点 docker secret / k8s Secret 分发 |
+| 命令审计 | 自己上 auditd | 平台 `platform_skill_call` 表自动记 + agent 侧请求日志 |
+| 网络入口 | 22 端口要开到运维 | 单一 `:9100`，可加 source CIDR 限制 |
+| 节点扩缩容 | 加 SSH 配置 | DaemonSet/global 自动覆盖 |
+| 范围控制 | "全 root 或全没" | agent 内置命令白名单 + 平台侧二次审批 |
+| 流式输出 | tail -f 直接出 | `/v1/exec/stream` SSE，tcpdump / 滚日志原生支持 |
+
+> **跟旧版（v1）的区别**：v1 让 agent 容器跑 `sleep infinity`，平台靠 `docker exec` / `kubectl exec` 进去再 `nsenter`。问题：`docker exec` 是 daemon-local 操作，跨节点必须 worker 也暴露 daemon TCP（违背"少暴露端口"初衷）。v2 让 agent 自己当 HTTP server，平台直连，**worker 不再需要任何 daemon socket 暴露**。
 
 ---
 
 ## 2. 它能查什么
 
-部署 agent 后，平台多出 7 个 skill（详见 [skill 注册表](../skills/) 或登录后台 `/skills` 页面）：
+部署 agent 后，平台多出 8 个 host_* skill：
 
 | skill code | 类型 | 干啥 |
 |---|---|---|
 | `host_list_nodes` | 读 | 列出已部署 agent 的节点；**先调它拿到 node 名** |
-| `host_socket_overview` | 读 | `nsenter ... ss -tunlp` 宿主机所有监听端口 |
+| `host_socket_overview` | 读 | `ss -tunlp` 宿主机所有监听端口 |
 | `host_iptables_dump` | 读 | iptables-save / nft list ruleset / ipvsadm |
-| `host_route_overview` | 读 | ip a + ip route + ip rule + ip netns |
-| `host_kernel_events` | 读 | dmesg + 关键词过滤（OOM / conntrack / I/O error 等） |
+| `host_route_overview` | 读 | `ip a` + `ip route` + `ip rule` + `ip netns` |
+| `host_kernel_events` | 读 | `dmesg` + 关键词过滤（OOM / conntrack / I/O error 等） |
 | `host_inspect_container_netns` | 读 | 给定容器名，进它自己的网络 namespace 查 socket / 路由 |
-| `host_capture_packets` | **写** | tcpdump 抓包 N 秒；进入二次确认流 |
-| `host_run_command` | **写**（admin 审批） | 任意命令逃生口；只有 admin 能确认 |
-
-跨域协同（在 [`ops_platform/runbooks.py`](../ops_platform/runbooks.py) 已经登记成 runbook）：
-
-- **`network_troubleshooting`**：`host_list_nodes` → `host_socket_overview` → `host_iptables_dump` → `host_route_overview` → `host_inspect_container_netns` → `host_kernel_events` → `host_capture_packets`
-- **`node_health_audit`**：`host_list_nodes` → `zabbix_get_host_overview` → `zabbix_get_host_storage_overview` → `host_kernel_events` →（兜底）`host_run_command`
-
-模型在面对"网络不通 / 主机抖动"问题时会先调 `platform_get_runbooks(name="network_troubleshooting")` 拿到这个剧本，再按 step 取证。
+| `host_capture_packets` | **写** | `tcpdump` 抓包 N 秒；进入二次确认流 |
+| `host_run_command` | **写**（admin 审批） | 任意（白名单内）命令逃生口；只有 admin 能确认 |
 
 ---
 
-## 3. 怎么部署
+## 3. 协议规范
 
-### 3.1 K8s（推荐）
+### 3.1 端点
 
-```bash
-kubectl apply -f deploy/ai-ops-agent-k8s.yaml
-kubectl -n ai-ops get pods -o wide -l app=ai-ops-agent
+| Method | Path | 鉴权 | 用途 |
+|---|---|---|---|
+| `GET` | `/livez` | ❌ | docker/k8s healthcheck 探活，**不带任何信息** |
+| `GET` | `/v1/health` | ✅ | 详细健康（node 名、agent 版本、uptime、exec 计数、白名单）|
+| `POST` | `/v1/exec` | ✅ | 一次性命令（JSON in/out）|
+| `POST` | `/v1/exec/stream` | ✅ | 长命令（JSON in / SSE out）|
+
+### 3.2 请求体
+
+```json
+{
+  "cmd":              ["ss", "-ltnp"],
+  "nsenter":          "muinp",
+  "timeout_sec":      30,
+  "max_output_bytes": 1048576
+}
 ```
 
-确认每个节点都起来了：
+| 字段 | 必填 | 默认 | 说明 |
+|---|---|---|---|
+| `cmd` | ✅ | — | 数组形式，**不是** shell 字符串。第一个元素是命令名（basename），其余是参数。 |
+| `nsenter` | ❌ | `"muinp"` | 进哪些 namespace。`m=mount u=uts i=ipc n=net p=pid U=user C=cgroup`。**空串** = 不进 host ns（在 agent 容器里跑）。 |
+| `timeout_sec` | ❌ | 30 | 单次命令超时；上限 300。超时 = SIGTERM → 2s 后 SIGKILL。 |
+| `max_output_bytes` | ❌ | 1 MB | stdout/stderr 各自的截断阈值；上限 10 MB。 |
 
-```bash
-kubectl -n ai-ops get pods -l app=ai-ops-agent -o wide
-# NAME                READY   STATUS    NODE
-# ai-ops-agent-x7nhk  1/1     Running   it-cluster01-master
-# ai-ops-agent-q3vzm  1/1     Running   it-cluster01-w01
-# ai-ops-agent-...    1/1     Running   ...
+### 3.3 `/v1/exec` 响应
+
+```json
+{
+  "exit_code":   0,
+  "stdout":      "State  Recv-Q  Send-Q ...",
+  "stderr":      "",
+  "duration_ms": 87,
+  "truncated":   false,
+  "timeout":     false
+}
 ```
 
-### 3.2 Swarm
+- 命令执行**完成**（即便 exit_code != 0）都是 HTTP 200。
+- HTTP 401 = token 错 / 缺；403 = 命令不在白名单 / 源 IP 不在 CIDR；400 = 请求体不合法；500 = binary 不存在。
+
+### 3.4 `/v1/exec/stream` 响应（SSE）
+
+```
+event: stdout
+data: 22:14:50.123 IP 10.0.0.1.443 > 10.0.5.6.41252: Flags [S.]
+
+event: stdout
+data: 22:14:50.124 IP 10.0.0.1.443 > 10.0.5.6.41252: Flags [.]
+
+event: stderr
+data: tcpdump: listening on any, link-type LINUX_SLL (Linux cooked v1)
+
+event: exit
+data: {"exit_code":0,"duration_ms":30001,"timeout":false}
+```
+
+- 每行 stdout/stderr 一个 event。
+- 客户端关连接 → agent 立刻 SIGKILL 子进程。
+- 最后一个 event 必然是 `exit`（含 exit_code + duration + timeout 标志）。
+
+### 3.5 鉴权
+
+`Authorization: Bearer <token>`。Token 来源：
+
+- **Swarm**：`docker secret create ai-ops-agent-token`，agent 启动时挂到 `/run/secrets/token` 读。
+- **K8s**：`kubectl create secret generic ai-ops-agent-token --from-literal=token=...`，挂到 `/run/secrets/token`。
+- **同一 token** 也填到平台 admin UI 的 host_agent connection 上。平台调 agent 时从 connection 里取。
+
+### 3.6 命令白名单
+
+`/etc/ai-ops-agent/allowed.yml` 在镜像里就内置；可读：[`agent/allowed.yml`](../agent/allowed.yml)。
+
+默认放行的全是**取证型只读命令**：`ss / ip / iptables-save / nft / dmesg / lsof / ps / cat / tcpdump / dig / nslookup` 等。
+
+**不放行**的（即便业务需要也不能直接走 agent）：
+
+- 任何写操作（`iptables -A` / `ip route add` / `echo > /proc/sysrq-trigger`）—— 这些走平台的 `host_run_command` skill，强制 admin 审批 + 走 needs_confirmation 流。
+- `curl / wget / nc` —— 防集群内 SSRF 和数据外泄。
+- `nsenter / unshare` —— agent 自己会包一层 nsenter，禁止调用方手动塞防绕过。
+
+白名单改动**必须重启 agent 容器**才能生效（启动时一次性加载）。
+
+---
+
+## 4. 部署
+
+### 4.1 Build 镜像
 
 ```bash
+# 在仓库根目录
+docker build -t ai-ops/agent:1.0 -f Dockerfile.agent .
+
+# 推到内网 harbor
+docker tag ai-ops/agent:1.0 harbor.intra/ops/ai-ops-agent:1.0
+docker push harbor.intra/ops/ai-ops-agent:1.0
+```
+
+镜像约 60-80 MB，alpine 基础 + iproute2 / iptables / tcpdump / nftables / py3-aiohttp。
+
+### 4.2 Swarm 部署
+
+```bash
+# 1) 生成 token
+TOKEN=$(openssl rand -hex 32)
+echo $TOKEN | docker secret create ai-ops-agent-token -
+echo "Token: $TOKEN  (粘到平台 admin UI 的 host_agent connection)"
+
+# 2) 设环境变量
+export AGENT_IMAGE=harbor.intra/ops/ai-ops-agent:1.0
+export BACKEND_CIDR=10.20.0.0/16        # 可选：平台 backend 网段
+
+# 3) 部署
 docker stack deploy -c deploy/ai-ops-agent-swarm.yml ai-ops
-docker service ps ai-ops_ai-ops-agent
+
+# 4) 验证（在任一节点）
+curl http://<node-ip>:9100/livez                                # → "ok"
+curl -H "Authorization: Bearer $TOKEN" \
+     http://<node-ip>:9100/v1/health | jq .
 ```
 
-⚠️ **Swarm 的特殊限制**：`docker exec` 只能对本地 daemon 上的容器生效。要让平台真正跨节点 exec：
+### 4.3 K8s 部署
 
-- **方案 A（推荐）**：每个节点的 daemon 暴露 `tcp://NODE:2375`（**必须配 mTLS**），平台对每个节点单独注册一份 `host_agent` connection（kind=swarm, docker_host=tcp://NODE:2375）。每份 connection 可以打 alias 区分（如 `swarm-prod-node1`）。
-- **方案 B**：只在 manager 节点用 host_agent；这种情况下你只能 exec 到 manager 自己的 agent，看到 manager 这一台。
+```bash
+# 1) 创建 namespace + token
+kubectl create namespace ai-ops
+TOKEN=$(openssl rand -hex 32)
+kubectl -n ai-ops create secret generic ai-ops-agent-token \
+    --from-literal=token=$TOKEN
+echo "Token: $TOKEN"
 
-K8s 没这个问题——`kubectl exec` 走 API server 路由到任意 node，单个 connection 即可。
+# 2) 改 deploy/ai-ops-agent-k8s.yaml 里的 image: 字段指向你的 harbor
+
+# 3) 部署
+kubectl apply -f deploy/ai-ops-agent-k8s.yaml
+
+# 4) 验证
+NODE_IP=$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+curl http://$NODE_IP:9100/livez
+curl -H "Authorization: Bearer $TOKEN" http://$NODE_IP:9100/v1/health | jq .
+```
+
+### 4.4 在平台后台创建 connection
+
+1. 登录 admin UI（http://平台:8080） → 接入管理 → 新增
+2. 类型选 `host_agent`，填：
+   - **alias**：例如 `prod-cluster-1`
+   - **kind**：`swarm` 或 `k8s`
+   - **agent_port**：`9100`
+   - **agent_token**：上面生成的 `$TOKEN`
+   - （swarm）**docker_host**：`tcp://<manager-ip>:2375`，用于查节点 IP
+   - （k8s）**kubeconfig**：粘集群 kubeconfig，用于查节点 IP
+3. 点"验证连通"，应返回 ok。
 
 ---
 
-## 4. 怎么接入平台
+## 5. 安全模型 / Threat Model
 
-### 4.1 admin 后台添加 connection
-
-登录管理后台 → **接入管理** → **+ 新增接入**：
-
-| 字段 | K8s 模式 | Swarm 模式 |
-|---|---|---|
-| 类型 | `节点诊断 Agent` | `节点诊断 Agent` |
-| kind | `k8s` | `swarm` |
-| Kubeconfig | 粘贴目标集群完整 kubeconfig | — |
-| Agent namespace | `ai-ops`（与 yaml 一致） | — |
-| Agent label selector | `app=ai-ops-agent` | — |
-| DOCKER_HOST | — | `tcp://manager:2375` 或单节点 |
-| Agent service 名 | — | `ai-ops_ai-ops-agent`（默认）|
-
-保存后点"验证连通"——后端会调 `host_list_nodes` 探活，能列出节点就说明全链路通了。
-
-### 4.2 在聊天里使用
-
-打开 Chainlit，问题示例：
-
-> *"dmz-cluster01 的 worker-3 节点上 80 端口没人监听，帮我查一下"*
-
-模型典型行为：
+### 5.1 信任边界
 
 ```
-1. platform_list_connections(type_code="host_agent")     # 找到 host_agent connection
-2. host_list_nodes                                       # 确认 worker-3 在列表里
-3. host_socket_overview(node="worker-3", filter=":80")   # 确认监听情况
-4. host_iptables_dump(node="worker-3", mode="iptables")  # 看防火墙
-5. host_route_overview(node="worker-3")                  # 看路由
-→ 五段式中文报告
+            untrusted                    trusted
+                                  │
+   Internet / 内网用户  ───X──── │ ────  集群网络（agent listens here）
+                                  │            │
+                                  │       平台 backend
+                                  │       （持有 token，知道节点 IP）
+                                  │            │
+                                  │       agent :9100
+                                  │       （token + CIDR 双保险）
+                                  │            │
+                                  │       host root namespace
+                                  │       （nsenter -t 1）
 ```
 
-如果要抓包（写操作）：
+只有**平台 backend** 知道 token；token 在平台 admin UI 创建 connection 时一次性输入，存在 `platform_connection.config_json`（启用 `PLATFORM_ENCRYPTION_KEY` 后是密文）。
 
-> *"在 worker-3 上抓 10 秒去 1.2.3.4:443 的包"*
+### 5.2 多层防御
 
-模型会调 `host_capture_packets`，平台返回 `needs_confirmation` token，**你在聊天卡片或后台"写操作待确认"页面点"确认执行"**，平台才真的跑 tcpdump。
+| 层 | 控制 |
+|---|---|
+| 网络 | (a) agent 只绑节点 NIC（hostNetwork），不走 overlay；(b) `AGENT_ALLOWED_CIDR` 限源 IP；(c) 集群外建议 iptables 阻断 `:9100` 入站 |
+| 协议 | Bearer token；HTTPS 由集群入口/反代负责（agent 自身只裸 HTTP，避免每节点维护证书） |
+| 命令 | (a) 数组形式无 shell 注入；(b) 白名单只放取证型只读；(c) 写操作必须走平台 needs_confirmation |
+| 进程 | timeout 强 SIGTERM→SIGKILL；输出截断防 OOM |
+| 审计 | 双向日志：agent 侧记 `peer_ip + cmd + exit_code + duration`；平台 `platform_skill_call` 记完整调用链 |
 
-### 4.3 通过 MCP server 给外部 agent 用
+### 5.3 已知风险 / 不解决的
 
-`platform_list_skills` 已经把这 7 个 skill 暴露给任何接 MCP 的客户端（Claude Code / Cursor / 其它）。
-鉴权 token 在 `.env` 的 `MCP_API_KEYS` 里设。详见 [`docs/platform.md`](platform.md) MCP 章节。
+- **节点被攻陷 → agent 自身可被滥用**：agent 是特权容器，节点 root 拿到了 = agent 已经被绕开了，不在 threat model 内。
+- **平台 backend 被攻陷 → 持有 token 可调任意 agent**：依赖平台主体的 RBAC + 审计；后续可加 token rotation API。
+- **HTTPS 没在 agent 内置**：私有化集群环境通常用 mTLS 或入口反代收口，不再让每节点维护证书。如需端到端 TLS，可加 sidecar Envoy。
 
 ---
 
-## 5. 安全模型
+## 6. 开发 / 调试
 
-### 5.1 谁能用这些 skill
+### 6.1 本地跑 agent
 
-| skill | 普通用户 | admin |
-|---|---|---|
-| `host_list_nodes` 等 5 个读 skill | ✅ | ✅ |
-| `host_capture_packets`（写但不强审批） | ✅ 但需自己确认 | ✅ 需确认 |
-| `host_run_command`（任意命令） | ❌ 不可见 | ✅ 必须 admin 二次确认 |
-
-`host_run_command` 的 manifest 里：
-
-```python
-"read_only": False,
-"requires_admin_approval": True,
-"visibility": "admin",
+```bash
+cd agent/
+AGENT_AUTH_TOKEN=devtoken \
+AGENT_ALLOWED_FILE=$(pwd)/allowed.yml \
+python3 agent.py
+# 然后另一个终端
+curl -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" \
+     -d '{"cmd":["ss","-ltnp"],"nsenter":""}' \
+     http://127.0.0.1:9100/v1/exec | jq .
 ```
 
-**三重锁**：visibility 让普通用户的 chat 会话连这个 tool 都看不到（后端不喂给模型）；requires_admin_approval 强制只有 admin 能 confirm；正常的 needs_confirmation 流给一次"我要做 X，请确认"的人工拦截。
+注意 `nsenter:""` —— 本地 dev 不在 host ns，得显式跳过 nsenter wrap。
 
-### 5.2 审计
+### 6.2 SSE 调试
 
-每次 `host_*` skill 调用都进 `platform_skill_call` 表：
-- `skill_code`、`connection_id`、`session_id`、`user`
-- `args_json` 里完整的 node + 命令
-- `result_json` 里 stdout/stderr 截断片段（避免吐 GB 级 tcpdump 输出）
-- 写操作还会带 `_extra.confirmation_token` 反查到底是谁批准的
+```bash
+curl -N -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" \
+     -d '{"cmd":["sh","-c","for i in 1 2 3; do echo line $i; sleep 1; done"],"nsenter":""}' \
+     http://127.0.0.1:9100/v1/exec/stream
+```
 
-后台 **调用审计** 页面（admin 可见）按时间倒序展示。
+注意：`sh` 不在白名单里，所以这条 dev 例子会 403。要本地测，临时往 `agent/allowed.yml` 加 `- sh`。
 
-### 5.3 攻击面
+### 6.3 K8s containerd 集群的 crictl 缺失
 
-老实承认：拿到一份 host_agent connection 等于拿到了集群所有节点的 root。这跟"拿到 SSH 私钥"是同一级风险，不是更弱。**该做的安全**：
+alpine 默认源没有 crictl 包。如要 `host_inspect_container_netns` 在 containerd 集群可用，两条路：
 
-1. **JWT secret 强随机**（`ADMIN_JWT_SECRET`）；admin 账号开 MFA（这一版还没做，下一步建议）
-2. **Connection 凭证字段加密**（这是平台的 known TODO；当前明文落 `platform_connection.config_json`）
-3. **审计日志外推到 SIEM**（写一个 hook 把 `platform_skill_call` 投递到 syslog/ELK）
-4. **AppArmor / SELinux**：宿主机 enforcing 时 nsenter 可能被拒，agent 容器需要 `--security-opt label=disable`，部署前先在测试节点验证
-5. **网络隔离**：agent namespace 只对平台 backend 可见，不要暴露 API 给业务 namespace
+1. 在 `Dockerfile.agent` 末尾加一行从 GitHub releases 下 crictl 静态 binary（需要 build 期能联外网）。
+2. K8s DaemonSet 加 initContainer 启动时拉 crictl 装到 emptyDir 共享卷。
 
 ---
 
-## 6. 故障排查
+## 7. Roadmap
 
-### 6.1 `host_list_nodes` 返回空
-
-- K8s：`kubectl -n ai-ops get pods -l app=ai-ops-agent` 看 pod 是不是 Running；node taint 没容忍会漏节点
-- Swarm：`docker service ps ai-ops_ai-ops-agent` 看任务状态；mode:global 没生效会只起一个
-
-### 6.2 `host_socket_overview` 报 `nsenter: cannot open /proc/1/ns/...`
-
-agent 没拿到 hostPID。检查：
-- K8s yaml 里的 `hostPID: true` / `hostNetwork: true` / `securityContext.privileged: true`
-- Swarm yml 里的 `pid: "host"` / `network_mode: "host"` / `privileged: true`
-
-### 6.3 `host_inspect_container_netns` 找不到容器
-
-skill 现在按 **docker → crictl → ctr** 顺序探测，三种 runtime 都支持：
-
-| 集群形态 | 用什么 | yaml 需要 |
-|---|---|---|
-| 老 K8s（≤ 1.23）+ Docker shim | `docker inspect` | 挂 `/var/run/docker.sock` ✅（默认） |
-| K8s 1.24+ containerd | `crictl ps + crictl inspect` | 挂 `/run/containerd/containerd.sock` ✅（默认） + agent 镜像里要有 `crictl` |
-| K8s 1.24+ CRI-O | `crictl` | 同上，env `CONTAINER_RUNTIME_ENDPOINT` 改 CRI-O socket |
-| Swarm | `docker inspect` | 挂 `/var/run/docker.sock` ✅ |
-
-**netshoot 默认不带 crictl**。三种解法：
-
-**A. 用扩展镜像（推荐）**：自己 build 一份 `your-registry/netshoot-crictl:1.0`：
-
-```dockerfile
-FROM nicolaka/netshoot:latest
-ARG CRICTL_VERSION=v1.30.0
-RUN curl -fsSL "https://github.com/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-amd64.tar.gz" \
-        | tar -xz -C /usr/local/bin
-```
-
-把 yaml 里的 `image: nicolaka/netshoot:latest` 替换成它即可。
-
-**B. 用 initContainer 在线装**：[`deploy/ai-ops-agent-k8s.yaml`](../deploy/ai-ops-agent-k8s.yaml) 里有注释模板，取消注释、改下载源即可。
-
-**C. 通过 ctr 兜底**：containerd 自带 `ctr`。skill 实现里已经做 `_try_ctr` 兜底，但 `ctr` 一般不在 netshoot 镜像里，所以 A/B 仍是首选。
-
-### 6.4 `host_run_command` 一直 needs_confirmation 不执行
-
-正常。它强制 admin 审批：
-1. 普通用户调 → 落 pending
-2. admin 进后台 **写操作待确认** 页面 → 看 args.command → 确认/拒绝
-3. 平台执行，模型给最终总结
-
-### 6.5 SELinux/AppArmor 拒绝 nsenter
-
-`dmesg | grep -i denied` 看具体策略。常用法：
-- SELinux：`setenforce 0` 临时验证，正式生产写 policy
-- AppArmor：在 K8s yaml 里加 `container.apparmor.security.beta.kubernetes.io/agent: unconfined`
-
----
-
-## 7. 限制 + Roadmap
-
-当前实现已经够 95% 场景用，但留几个口子：
-
-| 限制 | 影响 | 计划 |
-|---|---|---|
-| Swarm 跨节点 exec 需要 `tcp://NODE:2375` | 必须每节点单独注册 connection | 自定义 HTTP node-agent（详见 platform.md 路线图） |
-| 抓包只返回文本头 | 大流量分析不友好 | 落到平台对象存储/MinIO，返回下载链接 |
-| 审计未外发 | 需要 SIEM 时要自己写 hook | invoker 加 webhook hook 接口 |
-
-✅ **已收尾**：
-- containerd 适配：skill 已按 docker → crictl → ctr 三段探测，K8s 1.24+ 集群可用（agent 镜像需包含 crictl，见 6.3）
-- 凭证加密：`platform_connection.config_json` 和 `platform_model_config.api_key` 落库前 Fernet 加密；首启自动迁移已有明文行，详见 [`platform.md` § 数据持久化](platform.md)
+| 项目 | 计划 |
+|---|---|
+| 端到端 TLS | sidecar Envoy 或 nginx，agent 镜像不动 |
+| Token rotation | `POST /v1/admin/rotate_token` + 平台后台调 docker secret update |
+| 抓包大文件 | 落对象存储/MinIO，agent 返回下载 URL（避免 SSE 把大 pcap 撑爆 backend）|
+| 命令白名单热加载 | agent 加 inotify watch + 内存原子替换 |
+| Prometheus metrics | `/v1/metrics` 暴露 exec_count / exec_latency_seconds / unauthorized_total |
 
 ---
 
 ## 8. 一句话
 
-> SSH 是工具，不是必需品。`host_agent` 让"进宿主机查"变成一次有审计、有权限、有审批、可被 AI 协同调度的标准动作。
+> SSH 是工具，不是必需品。HTTP agent 让"进宿主机查"变成一次有审计、有权限、有审批、可被 AI 协同调度的标准 HTTP 调用。

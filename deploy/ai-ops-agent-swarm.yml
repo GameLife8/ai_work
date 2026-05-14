@@ -1,51 +1,101 @@
-# ============================================================================
+# =====================================================================
 # ai-ops-agent (Docker Swarm global service)
+# =====================================================================
 #
-# 部署：
-#   docker stack deploy -c ai-ops-agent-swarm.yml ai-ops
+# 架构升级说明（重要）
+# --------------------
+# 旧版（已废弃）：用 ``nicolaka/netshoot`` 跑 ``sleep infinity``，平台靠
+#   ``docker exec`` 进容器跑 ``nsenter``——这要求 worker 节点也暴露 daemon TCP，
+#   实际上把 daemon socket 安全模型放到了风口。
 #
-# 卸载：
-#   docker stack rm ai-ops
+# 新版：agent 自己跑一个 **HTTP server (:9100)**，平台 backend 直接 HTTP
+#   调它。manager 节点只暴露 2375（用于查 ``docker node inspect`` 拿节点
+#   IP），worker 节点**不需要**任何 docker daemon TCP。
 #
-# 重要限制
-# --------
-# Swarm 的 ``docker exec`` 只能对 **本地 daemon 上的容器** 生效。要让平台真正
-# 跨节点 exec 进每台 agent，常见做法二选一：
-#   1) 每个节点 daemon 暴露 tcp://NODE:2375（**强烈推荐配 mTLS**），
-#      平台对每个节点单独注册一份 host_agent connection（kind=swarm,
-#      docker_host=tcp://NODE:2375）。
-#   2) 用 SSH context 桥接：``docker context create --docker host=ssh://...``，
-#      不过这样又依赖 SSH，本平台目标是去 SSH 化，所以推荐方案 1。
-# ============================================================================
+# 协议 + 安全模型详见 docs/host-agent.md。
+#
+# =====================================================================
+# 部署
+# =====================================================================
+#
+# 1. 编辑 ``.env``（同一目录）填这台 Swarm manager 的几个变量：
+#
+#     AGENT_IMAGE=harbor.intra/ops/ai-ops-agent:1.0   # 你内网 harbor 上的镜像
+#     BACKEND_CIDR=10.20.0.0/16                        # 平台 backend 容器所在网段
+#                                                       # （加一道源 IP 限制，可选）
+#
+# 2. 给整个集群生成一个 token，写成 docker secret：
+#
+#     openssl rand -hex 32 | docker secret create ai-ops-agent-token -
+#     # 同一个 token 副本也要在平台 admin UI 创建 host_agent connection 时填进去
+#
+# 3. 部署：
+#
+#     docker stack deploy -c ai-ops-agent-swarm.yml ai-ops
+#
+# 4. 卸载：
+#
+#     docker stack rm ai-ops
+#     docker secret rm ai-ops-agent-token
+#
+# 5. 验证：
+#
+#     # 在 manager 节点
+#     curl http://<任一节点IP>:9100/livez                          # → "ok"
+#     curl -H "Authorization: Bearer <你的token>" \
+#          http://<节点IP>:9100/v1/health | jq .
+# =====================================================================
 version: "3.8"
 
 services:
   ai-ops-agent:
-    image: nicolaka/netshoot:latest
+    image: ${AGENT_IMAGE:-ai-ops/agent:1.0}
+
     deploy:
-      mode: global
+      mode: global                       # 每个节点都跑一份
       restart_policy:
         condition: any
+        delay: 5s
+      update_config:
+        order: start-first               # 先起新的再停老的，减少 agent 不可用窗口
+        parallelism: 1
       resources:
-        limits: { cpus: "0.5", memory: 256M }
+        limits:    { cpus: "0.5", memory: 256M }
         reservations: { cpus: "0.02", memory: 32M }
-      placement:
-        constraints: []
+
+    # 进宿主机 namespace 的必要权限
     pid: "host"
-    network_mode: "host"
+    network_mode: "host"                 # 绑节点 :9100，不走 overlay
     privileged: true
     cap_add:
       - SYS_ADMIN
       - SYS_PTRACE
       - NET_ADMIN
       - NET_RAW
-    command: ["sleep", "infinity"]
+
+    environment:
+      AGENT_PORT: "9100"
+      # 让 agent 写日志时知道自己在哪台节点
+      AGENT_NODE_NAME: "{{.Node.Hostname}}"
+      # 可选：限制只接来自平台 backend 网段的请求；空 = 不限源 IP
+      AGENT_ALLOWED_CIDR: "${BACKEND_CIDR:-}"
+
+    secrets:
+      - source: ai-ops-agent-token
+        target: token                    # → /run/secrets/token，agent 启动时读
+
     volumes:
-      # 宿主机文件系统只读
+      # 宿主机文件系统只读挂到 /host（``cat /host/etc/sysctl.conf`` 等会用）
       - type: bind
         source: /
         target: /host
         read_only: true
         bind: { propagation: rshared }
-      # docker 容器排障
-      - /var/run/docker.sock:/var/run/docker.sock
+      # 给 K8s（如混合部署）的 crictl 用；纯 Swarm 集群可删
+      # - /run/containerd/containerd.sock:/run/containerd/containerd.sock
+
+    # 健康检查由镜像内置 HEALTHCHECK（GET /livez）负责，这里不重复
+
+secrets:
+  ai-ops-agent-token:
+    external: true                       # 必须先 docker secret create

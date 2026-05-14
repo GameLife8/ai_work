@@ -1,0 +1,67 @@
+# ai-ops-agent 命令白名单
+# ========================
+#
+# 这里列出的命令才能被 ``/v1/exec`` / ``/v1/exec/stream`` 调用。任何不在 ``read_only``
+# 列表里的命令一律 403。
+#
+# 改动后 **必须重启 agent 容器** 才能生效（agent 启动时一次性加载，不做 inotify 监听）。
+#
+# 设计原则
+# --------
+# - **只允许"取证型"命令**——读 socket / 路由 / iptables / dmesg / proc 等。
+# - **不允许写操作**（``iptables -A`` / ``ip route add`` / ``echo > /proc/sysrq-trigger``）。
+#   写操作如果业务真需要，应该走平台的 ``host_run_command`` skill（带 admin 审批）。
+# - **不允许 curl / wget / nc** —— 防止集群内 SSRF / 数据外泄。需要的话明确知会 admin。
+# - **不允许 nsenter / unshare** —— agent 会自动包 ``nsenter -t 1``，再让调用方传
+#   这俩等于让 sandbox 形同虚设。
+
+read_only:
+  # 网络 socket / 路由 / 接口
+  - ss
+  - ip
+  - ipvsadm
+  - iptables-save
+  - ip6tables-save
+  - nft
+  - ethtool
+  - bridge
+  - arp
+
+  # 包抓取（流式才有意义；要靠 timeout_sec 限制）
+  - tcpdump
+
+  # 内核 / 系统事件
+  - dmesg
+  - sysctl
+  - lsof
+  - lscpu
+  - lsblk
+  - lsmod
+  - ps
+  - top                   # 用 ``-b -n 1`` 非交互模式调用
+  - free
+  - uptime
+  - vmstat
+  - iostat
+  - mpstat
+
+  # 文件读取（path 由 skill 收口；agent 不做 path 二次校验，依赖 host 只读挂载）
+  - cat
+  - head
+  - tail
+  - stat
+  - file
+  - find                  # 仅供枚举；写操作不在白名单里也调不动
+  - df
+  - du
+  - mount
+
+  # 容器排障（K8s 节点）
+  - crictl
+  - ctr
+
+  # DNS / 域名解析（不含 curl/wget，防 SSRF）
+  - dig
+  - nslookup
+  - host
+  - getent

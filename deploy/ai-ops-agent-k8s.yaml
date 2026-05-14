@@ -1,39 +1,59 @@
 # ============================================================================
 # ai-ops-agent (K8s DaemonSet)
+# ============================================================================
 #
-# 在每个节点起一个特权诊断容器，内置 nsenter / ss / iptables / tcpdump / ip /
-# dmesg / netshoot 等工具。平台通过 ``kubectl exec`` 进入此容器，再用 nsenter
-# 进入宿主机 namespace 排障，**完全替代 SSH**。
+# 架构升级说明（重要）
+# --------------------
+# 旧版（已废弃）：netshoot + sleep infinity，平台靠 ``kubectl exec`` 进容器。
+# 新版：agent 跑一个 HTTP server，平台直接 HTTP POST 调它。无需 ``kubectl exec``，
+#       省去 kubeconfig 跨平台依赖。
 #
-# 部署：
-#   kubectl apply -f ai-ops-agent-k8s.yaml
+# 协议见 docs/host-agent.md。
 #
-# 卸载：
-#   kubectl delete -f ai-ops-agent-k8s.yaml
+# 部署步骤
+# --------
+# 1. 平台管理员生成 token：
+#       TOKEN=$(openssl rand -hex 32)
+#       kubectl -n ai-ops create secret generic ai-ops-agent-token \
+#           --from-literal=token=$TOKEN
+#       # 把 $TOKEN 同步到平台 admin UI 的 host_agent connection 上
 #
-# 注意：
-#   1. 镜像 nicolaka/netshoot 自带网络排障工具集；如果集群拉不到，可换成
-#      内网镜像（确保里面有 nsenter, iputils, iproute2, tcpdump, iptables,
-#      net-tools, ipvsadm, dnsutils 即可）。
-#   2. tolerations: operator=Exists 让 agent 也覆盖 master/control-plane 节点。
-#   3. 默认部到 ``ai-ops`` namespace，平台 host_agent connection 里默认就找这个。
-#   4. 容器运行时探测：host_inspect_container_netns 默认按 docker → crictl → ctr
-#      顺序探测；containerd-only 集群（K8s 1.24+）需要镜像里有 ``crictl``。
-#      netshoot 默认 **不带 crictl**，建议用扩展镜像或在 agent 启动时 install。
-#      简单方案：用 ``ai-ops/netshoot-crictl:latest``（自打）；或者在下面 initContainer
-#      里把 crictl 静态二进制下到 /host/usr/local/bin。
+# 2. 改 ``image:`` 字段指向内网 harbor 上的镜像，然后 apply：
+#       kubectl apply -f ai-ops-agent-k8s.yaml
+#
+# 3. 卸载：
+#       kubectl delete -f ai-ops-agent-k8s.yaml
+#
+# 4. 验证：
+#       NODE_IP=$(kubectl get node -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}')
+#       curl http://$NODE_IP:9100/livez            # → "ok"
+#       curl -H "Authorization: Bearer $TOKEN" \
+#            http://$NODE_IP:9100/v1/health | jq .
+#
+# 网络可达性
+# ----------
+# Agent 跑在 ``hostNetwork: true`` 模式下，监听节点的 9100 端口。平台 backend
+# 容器需要能直连节点 IP:9100。Pod 默认网络通常能直连 node IP（除非有 NetworkPolicy
+# 阻断）；如有限制，可在 admin UI 的 host_agent connection 里改 ``agent_port``
+# 或自定义路由。
 # ============================================================================
 ---
 apiVersion: v1
 kind: Namespace
 metadata:
   name: ai-ops
+
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: ai-ops-agent
   namespace: ai-ops
+
+---
+# Token Secret —— 部署前由管理员手工创建，不在本 YAML 里硬编码
+# 命令：kubectl -n ai-ops create secret generic ai-ops-agent-token --from-literal=token=$(openssl rand -hex 32)
+
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -48,6 +68,8 @@ spec:
       app: ai-ops-agent
   updateStrategy:
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
   template:
     metadata:
       labels:
@@ -55,50 +77,43 @@ spec:
     spec:
       serviceAccountName: ai-ops-agent
 
-      # 看到宿主机所有进程 / 网络栈 / IPC
+      # 看到宿主机所有进程 / 网络栈 / IPC（nsenter 必须）
       hostPID: true
       hostNetwork: true
       hostIPC: true
       dnsPolicy: ClusterFirstWithHostNet
 
-      # 每台都跑（含 master）
+      # 覆盖到 master / control-plane 节点
       tolerations:
         - operator: Exists
 
       priorityClassName: system-node-critical
 
-      # 可选：在 agent 启动前把 crictl 二进制装到容器内（containerd 排障用）
-      # 取消下面 initContainers 的注释，并把版本号 / 镜像源改成你内网可达的地址。
-      #
-      # initContainers:
-      #   - name: install-crictl
-      #     image: curlimages/curl:8.10.1
-      #     command:
-      #       - sh
-      #       - -c
-      #       - |
-      #         set -e
-      #         cd /tmp
-      #         curl -fsSL -o crictl.tgz \
-      #           https://github.com/kubernetes-sigs/cri-tools/releases/download/v1.30.0/crictl-v1.30.0-linux-amd64.tar.gz
-      #         tar -xzf crictl.tgz
-      #         mv crictl /shared/crictl
-      #         chmod +x /shared/crictl
-      #     volumeMounts:
-      #       - { name: shared-bin, mountPath: /shared }
-
       containers:
         - name: agent
-          image: nicolaka/netshoot:latest
+          # ⚠️ 改成你内网 harbor 上的镜像
+          image: ai-ops/agent:1.0
           imagePullPolicy: IfNotPresent
-          # 不监听任何端口，等待 kubectl exec
-          command: ["sleep", "infinity"]
+          ports:
+            - name: agent-http
+              containerPort: 9100
+              hostPort: 9100
+              protocol: TCP
           env:
-            # crictl 在 containerd 下的运行时 socket
+            - name: AGENT_PORT
+              value: "9100"
+            - name: AGENT_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            # crictl 在 containerd 下用的 socket
             - name: CONTAINER_RUNTIME_ENDPOINT
               value: unix:///run/containerd/containerd.sock
             - name: IMAGE_SERVICE_ENDPOINT
               value: unix:///run/containerd/containerd.sock
+            # 可选：限制只接 backend pod 网段；不填 = 任意源（仍要 token）
+            # - name: AGENT_ALLOWED_CIDR
+            #   value: "10.20.0.0/16"
           securityContext:
             privileged: true
             capabilities:
@@ -114,18 +129,43 @@ spec:
             limits:
               cpu: "500m"
               memory: "256Mi"
+
+          # K8s 自己的 health probe 直接打 /livez（无鉴权）
+          livenessProbe:
+            httpGet:
+              path: /livez
+              port: 9100
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /livez
+              port: 9100
+            initialDelaySeconds: 2
+            periodSeconds: 5
+            timeoutSeconds: 2
+
           volumeMounts:
-            # 整个宿主机文件系统只读挂到 /host，供 chroot/查文件用
-            - { name: host-root,  mountPath: /host,    readOnly: true,  mountPropagation: HostToContainer }
-            - { name: host-proc,  mountPath: /host/proc, readOnly: true }
-            - { name: host-sys,   mountPath: /host/sys,  readOnly: true }
-            # 给 host_inspect_container_netns 用：进容器需要其中之一
+            # Token 通过 Secret 挂到固定路径
+            - { name: token,       mountPath: /run/secrets, readOnly: true }
+            # 宿主机文件系统只读挂到 /host
+            - { name: host-root,   mountPath: /host,    readOnly: true,
+                mountPropagation: HostToContainer }
+            - { name: host-proc,   mountPath: /host/proc, readOnly: true }
+            - { name: host-sys,    mountPath: /host/sys,  readOnly: true }
+            # 容器排障：进 pod 自己 netns 时需要其中之一
             - { name: docker-sock, mountPath: /var/run/docker.sock }
             - { name: containerd-sock, mountPath: /run/containerd, readOnly: false }
-            # 如果用上面的 initContainer 装 crictl，把 shared-bin 接到 PATH
-            # - { name: shared-bin, mountPath: /usr/local/bin/crictl, subPath: crictl }
 
       volumes:
+        - name: token
+          secret:
+            secretName: ai-ops-agent-token
+            items:
+              - key: token
+                path: token             # → /run/secrets/token，跟 agent 默认路径对齐
         - name: host-root
           hostPath: { path: / }
         - name: host-proc
@@ -136,9 +176,5 @@ spec:
           hostPath: { path: /var/run/docker.sock, type: "" }
         - name: containerd-sock
           hostPath: { path: /run/containerd, type: "" }
-        # 用 initContainer 装 crictl 时启用
-        # - name: shared-bin
-        #   emptyDir: {}
 
-      # 确保不被驱逐
       terminationGracePeriodSeconds: 5

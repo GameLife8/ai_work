@@ -20,9 +20,9 @@
 #
 # 1. 编辑 ``.env``（同一目录）填这台 Swarm manager 的几个变量：
 #
-#     AGENT_IMAGE=harbor.intra/ops/ai-ops-agent:1.0   # 你内网 harbor 上的镜像
-#     BACKEND_CIDR=10.20.0.0/16                        # 平台 backend 容器所在网段
-#                                                       # （加一道源 IP 限制，可选）
+#     AGENT_IMAGE=mobile.chinasws.com:9990/ops/ai-ops-agent:1.0  # 内网 harbor 镜像
+#     BACKEND_CIDR=10.20.0.0/16                                   # 平台 backend 网段
+#                                                                  # （加一道源 IP 限制，可选）
 #
 # 2. 给整个集群生成一个 token，写成 docker secret：
 #
@@ -49,7 +49,7 @@ version: "3.8"
 
 services:
   ai-ops-agent:
-    image: ${AGENT_IMAGE:-ai-ops/agent:1.0}
+    image: ${AGENT_IMAGE:-mobile.chinasws.com:9990/ops/ai-ops-agent:1.0}
 
     deploy:
       mode: global                       # 每个节点都跑一份

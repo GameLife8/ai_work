@@ -6,3 +6,8 @@ python-dotenv==1.0.0
 pytest==8.3.3
 chainlit==2.5.5
 
+# chainlit/asyncer 的传递依赖在某些 pip resolver 路径下可能漏装，显式锁住。
+# 现象：``ModuleNotFoundError: No module named 'sniffio'`` 容器起不来。
+sniffio>=1.3.0
+anyio>=4.0.0
+

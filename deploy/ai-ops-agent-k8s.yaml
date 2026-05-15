@@ -96,7 +96,7 @@ spec:
       containers:
         - name: agent
           # 内网 harbor 镜像；私有化部署到不同 harbor 时改这里即可
-          image: mobile.chinasws.com:9990/ops/ai-ops-agent:1.0
+          image: mobile.chinasws.com:9990/ops/ai-ops-agent:1.2
           imagePullPolicy: IfNotPresent
           ports:
             - name: agent-http

@@ -227,6 +227,7 @@ def create_connection():
             config=body.get("config") or {},
             is_default=bool(body.get("is_default")),
             created_by=g.current_user["username"],
+            tags=body.get("tags") or [],
         )
     except KeyError as exc:
         return jsonify({"error": str(exc)}), 400
@@ -237,7 +238,7 @@ def create_connection():
 @_login_required("admin")
 def update_connection(connection_id):
     body = request.get_json(silent=True) or {}
-    fields = {k: v for k, v in body.items() if k in {"name", "alias", "config", "is_default", "enabled"}}
+    fields = {k: v for k, v in body.items() if k in {"name", "alias", "config", "tags", "is_default", "enabled"}}
     if "config" in fields:
         existing = _store().get_connection(connection_id) or {}
         fields["config"] = _unmask_config(fields["config"], existing.get("config") or {}, CONNECTION_SECRETS)

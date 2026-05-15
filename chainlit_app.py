@@ -98,55 +98,154 @@ def _build_resource_inventory() -> dict[str, list[dict]]:
     return out
 
 
+def _group_by_logical_cluster(inventory: dict[str, list[dict]]) -> list[dict]:
+    """把多 type 的 connection 按"共享触发关键词"聚合成**逻辑集群**。
+
+    规则：
+    - 共享至少一个 tag → 同一个逻辑集群
+    - 没 tag 的孤儿 connection → 独立成一组（unnamed group）
+    - 一个 connection 可能落到多个逻辑集群（极少见，但允许）
+    """
+    # 先把每条 connection 按 tag 索引
+    flat: list[dict] = []
+    for t, items in inventory.items():
+        for c in items:
+            flat.append({**c, "type_code": t})
+
+    # 用 union-find 思路：每个 tag 看成节点 connection 跟它名下所有 tag 同组
+    tag_to_idx: dict[str, int] = {}
+    groups: list[list[dict]] = []
+    seen_no_tag: list[dict] = []
+
+    def _merge(idx_a: int, idx_b: int) -> int:
+        """把 b 的内容并到 a，返回保留的 idx。"""
+        if idx_a == idx_b:
+            return idx_a
+        a, b = sorted((idx_a, idx_b))
+        for c in groups[b]:
+            if c not in groups[a]:
+                groups[a].append(c)
+        groups[b] = []  # 留空占位，后面过滤
+        # 重指向所有指向 b 的 tag → a
+        for k, v in list(tag_to_idx.items()):
+            if v == b:
+                tag_to_idx[k] = a
+        return a
+
+    for c in flat:
+        tags = [t for t in (c.get("tags") or []) if t]
+        if not tags:
+            seen_no_tag.append(c)
+            continue
+        target_idx: int | None = None
+        for tag in tags:
+            if tag in tag_to_idx:
+                if target_idx is None:
+                    target_idx = tag_to_idx[tag]
+                else:
+                    target_idx = _merge(target_idx, tag_to_idx[tag])
+        if target_idx is None:
+            target_idx = len(groups)
+            groups.append([])
+        if c not in groups[target_idx]:
+            groups[target_idx].append(c)
+        for tag in tags:
+            tag_to_idx[tag] = target_idx
+
+    out: list[dict] = []
+    for g in groups:
+        if not g:
+            continue
+        # 收集这组的所有 tag
+        all_tags: list[str] = []
+        for c in g:
+            for t in (c.get("tags") or []):
+                if t not in all_tags:
+                    all_tags.append(t)
+        # 推一个"主名"——优先 host_agent 的 alias，其次任意
+        primary = next((c for c in g if c["type_code"] == "host_agent"), g[0])
+        out.append({
+            "name": primary.get("alias") or primary["name"],
+            "tags": all_tags,
+            "connections": g,
+        })
+
+    # 没 tag 的孤儿单独成组（一个一组）
+    for c in seen_no_tag:
+        out.append({
+            "name": c.get("alias") or c["name"],
+            "tags": [],
+            "connections": [c],
+        })
+    return out
+
+
 def _format_welcome_message(user: dict | None, inventory: dict[str, list[dict]]) -> str:
     """根据当前 inventory 拼出"专属给当前用户的"欢迎页 markdown。
 
     设计：
     - 顶部一句话身份 + 角色
-    - "你能调度的集群"按 type 分组列出别名 + 节点数 / IP 等关键识别词
-    - "对话技巧"给具体的、能直接复制贴的示例（基于真实集群名）
-    - "写操作流程"提示
+    - "你能调度的集群"按**逻辑集群（共享触发关键词）**聚合 —— 一个集群可能
+      同时有 host_agent + swarm + k8s 类 connection，用户看上去是一个集群
+    - 对话示例基于真实关键词
+    - 写操作流程
     """
     display = (user or {}).get("display_name") or "访客"
     role = (user or {}).get("role", "user")
     role_hint = "👑 管理员（可批准写操作）" if role == "admin" else "👤 普通用户"
 
-    type_labels = {
-        "host_agent":    "🖥️ 节点诊断 Agent（host_* skill）",
-        "swarm":         "🐝 Docker Swarm 集群（swarm_* skill）",
-        "k8s":           "☸️ K8s 集群（k8s_* skill）",
-        "zabbix":        "📊 Zabbix 监控（zabbix_* skill）",
-        "alert_analysis":"📥 告警分析",
-        "http_api":      "🌐 HTTP API 接入",
+    type_icon = {
+        "host_agent":    "🖥️",
+        "swarm":         "🐝",
+        "k8s":           "☸️",
+        "zabbix":        "📊",
+        "alert_analysis":"📥",
+        "http_api":      "🌐",
     }
-    type_order = ["host_agent", "swarm", "k8s", "zabbix", "http_api", "alert_analysis"]
+    type_purpose = {
+        "host_agent":    "host_* skill（进宿主取证）",
+        "swarm":         "swarm_* skill（服务/任务）",
+        "k8s":           "k8s_* skill（pod/deployment）",
+        "zabbix":        "zabbix_* skill（监控数据）",
+        "alert_analysis":"告警预分析",
+        "http_api":      "外部 HTTP API",
+    }
 
     sections: list[str] = []
     sections.append(f"👋 欢迎，**{display}**（{role_hint}）")
     sections.append("")
     sections.append("我是面向运维场景的 AI 助手，**国产模型驱动 + 多集群协同诊断**。"
-                    "你直接说自然语言就行，我会自动选对集群、跑相应 skill 取证。")
+                    "在对话里说出**触发关键词**（下面每个集群有标），我会自动选对集群、跑对应 skill。")
     sections.append("")
     sections.append("---")
-    sections.append("## 🗂️ 你能调度的资源（自动路由）")
-    sections.append("")
-    sections.append("**说出别名 / IP / 节点名前缀，我会自动匹配到对应集群**——")
-    sections.append("不需要先去设置里切。下面是当前平台已接入的全部资源：")
+    sections.append("## 🗂️ 你能调度的逻辑集群（按关键词分组）")
     sections.append("")
 
+    clusters = _group_by_logical_cluster(inventory)
     has_any = False
-    for t in type_order:
-        if t not in inventory:
-            continue
+
+    for cluster in clusters:
         has_any = True
-        sections.append(f"### {type_labels.get(t, t)}")
+        # 跳过 alert_analysis 这种"内置"非物理集群
+        if all(c["type_code"] == "alert_analysis" for c in cluster["connections"]):
+            continue
+        tags = cluster["tags"]
+        sections.append(f"### {cluster['name']}")
+        if tags:
+            kw_inline = " ".join(f"`{t}`" for t in tags)
+            sections.append(f"🏷️ 关键词：{kw_inline}  ← **在对话里说出任一关键词即可路由到本集群**")
+        else:
+            sections.append("⚠️ 未配置触发关键词（建议到管理后台 → 接入管理 → 编辑设置）")
         sections.append("")
-        for c in inventory[t]:
-            alias = c.get("alias") or c["name"]
+        # 该集群下每条 connection 的 type / 用途
+        for c in cluster["connections"]:
+            t = c["type_code"]
+            icon = type_icon.get(t, "·")
+            purpose = type_purpose.get(t, "")
             cfg = c.get("config") or {}
             clue = _describe_connection_for_user(t, cfg)
-            default_tag = "  · 🔧 默认" if c.get("is_default") else ""
-            sections.append(f"- **{alias}**{default_tag}")
+            default_mark = "  · 🔧 该 type 默认" if c.get("is_default") else ""
+            sections.append(f"- {icon} **{c.get('alias') or c['name']}** — {purpose}{default_mark}")
             if clue:
                 sections.append(f"  - {clue}")
         sections.append("")
@@ -216,29 +315,35 @@ def _describe_connection_for_user(type_code: str, cfg: dict) -> str:
 
 
 def _generate_concrete_examples(inventory: dict[str, list[dict]]) -> list[str]:
-    """根据真实 inventory 生成有用的对话示例。
-    例：如果有名为 ``codewave`` 的 K8s connection，就给出
-    ``"codewave 集群 default ns 的 deployment 有哪些"`` 这种具体示例。"""
+    """根据真实逻辑集群（按 tags 聚合）生成有用的对话示例。
+    优先用集群的关键词当锚——这样示例里的关键词跟欢迎页的"路由词"一一对应。"""
     examples: list[str] = []
 
-    # K8s 示例
-    for c in inventory.get("k8s", [])[:2]:
-        alias = c.get("alias") or c["name"]
-        short = (c["name"] or alias).split()[0]
-        examples.append(f"☸️ \"**{short}** 集群上各 namespace 有哪些 deployment\"")
+    clusters = _group_by_logical_cluster(inventory)
+    # 排除 alert_analysis 那种内置组
+    real_clusters = [
+        cl for cl in clusters
+        if not all(c["type_code"] == "alert_analysis" for c in cl["connections"])
+    ]
 
-    # swarm 示例
-    for c in inventory.get("swarm", [])[:2]:
-        alias = c.get("alias") or c["name"]
-        short = (c["name"] or alias).split()[0]
-        examples.append(f"🐝 \"**{short}** 上现在有多少个 service，按 stack 分组看看\"")
+    def _kw(cluster: dict) -> str:
+        # 选第一个 tag 当示例关键词；没 tag 就用名字头一个词
+        if cluster["tags"]:
+            return cluster["tags"][0]
+        return (cluster["name"] or "").split()[0]
 
-    # host_agent 真节点诊断
-    for c in inventory.get("host_agent", [])[:2]:
-        alias = c.get("alias") or c["name"]
-        # 抠 short 的关键词
-        short = (c["name"] or alias).split("-")[0]
-        examples.append(f"🔍 \"**{short}** 集群随便一台节点磁盘怎么样\"")
+    # 用关键词组示例 —— 每个集群挑一个最贴合的 skill 场景
+    for cluster in real_clusters[:4]:
+        kw = _kw(cluster)
+        if not kw:
+            continue
+        types = {c["type_code"] for c in cluster["connections"]}
+        if "host_agent" in types:
+            examples.append(f"🔍 \"**{kw}** 集群随便一台节点根分区使用率如何\"")
+        elif "k8s" in types:
+            examples.append(f"☸️ \"**{kw}** 上 default 命名空间的 deployment 列一下\"")
+        elif "swarm" in types:
+            examples.append(f"🐝 \"**{kw}** 上现在有多少 service，按 stack 分组看看\"")
 
     # 兜底通用
     examples.append("📥 \"这条告警怎么处理：``{...zabbix payload JSON...}``\"")

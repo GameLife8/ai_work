@@ -36,7 +36,8 @@ class ConnectionManager:
         return self.store.get_connection(connection_id)
 
     def create(self, *, type_code: str, name: str, alias: str = "", config: dict[str, Any],
-               is_default: bool = False, created_by: str | None = None) -> dict[str, Any]:
+               is_default: bool = False, created_by: str | None = None,
+               tags: list[str] | None = None) -> dict[str, Any]:
         drivers.get(type_code)  # 校验 driver 存在
         record = self.store.create_connection(
             type_code=type_code,
@@ -45,6 +46,7 @@ class ConnectionManager:
             config=config,
             is_default=is_default,
             created_by=created_by,
+            tags=tags or [],
         )
         return record
 

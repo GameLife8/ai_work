@@ -62,6 +62,24 @@
           </el-form-item>
         </div>
 
+        <el-form-item label="触发关键词（标签）">
+          <el-select
+            v-model="dlg.form.tags"
+            multiple
+            filterable
+            allow-create
+            default-first-option
+            placeholder="输入关键词回车添加；例如 sws、生产、bigdata、192.168.2、master01"
+            style="width: 100%"
+          />
+          <div class="hint">
+            <strong>多条 connection 共享同样的关键词 = 一个"逻辑集群"</strong>。
+            用户对话里命中任一关键词，AI 就会自动选用对应的 connection_id 调 skill。
+            <br>建议同一物理集群的 host_agent / swarm / k8s 三条记录打**相同**关键词，方便 AI 跨 type 路由。
+            例如 SWS 集群可以打：<code>sws</code>、<code>主集群</code>、<code>192.168.2</code>。
+          </div>
+        </el-form-item>
+
         <div class="section-title">接入参数</div>
 
         <el-form-item v-for="f in currentFields" :key="f.key" :label="f.label">
@@ -103,7 +121,7 @@ import CodeEditor from '../components/CodeEditor.vue'
 
 const rows = ref([]); const drivers = ref([]); const loading = ref(false)
 const typeFilter = ref('')
-const dlg = ref({ show: false, id: null, form: { type_code: '', name: '', alias: '', is_default: false, config: {} } })
+const dlg = ref({ show: false, id: null, form: { type_code: '', name: '', alias: '', is_default: false, tags: [], config: {} } })
 const currentFields = computed(() => drivers.value.find(d => d.type === dlg.value.form.type_code)?.fields || [])
 
 function statusTag(s) {
@@ -133,7 +151,7 @@ onMounted(async () => {
 })
 
 function openCreate() {
-  dlg.value = { show: true, id: null, form: { type_code: drivers.value[0]?.type || '', name: '', alias: '', is_default: false, config: {} } }
+  dlg.value = { show: true, id: null, form: { type_code: drivers.value[0]?.type || '', name: '', alias: '', is_default: false, tags: [], config: {} } }
   onTypeChange()
 }
 
@@ -144,7 +162,15 @@ function openEdit(row) {
   for (const f of fields) {
     if (f.type === 'password') cfg[f.key] = ''
   }
-  dlg.value = { show: true, id: row.id, form: { type_code: row.type_code, name: row.name, alias: row.alias, is_default: row.is_default, config: cfg } }
+  dlg.value = {
+    show: true, id: row.id,
+    form: {
+      type_code: row.type_code, name: row.name, alias: row.alias,
+      is_default: row.is_default,
+      tags: Array.isArray(row.tags) ? [...row.tags] : [],
+      config: cfg,
+    },
+  }
 }
 
 function onTypeChange() {

@@ -90,13 +90,20 @@ class InMemoryPlatformStore:
         items = self.connections
         if type_code:
             items = [c for c in items if c["type_code"] == type_code]
-        return [deepcopy(c) for c in items]
+        # 兜底：老记录可能没 tags 字段
+        return [{"tags": [], **deepcopy(c)} if "tags" not in c else deepcopy(c) for c in items]
 
     def get_connection(self, connection_id: str) -> dict | None:
-        return next((deepcopy(c) for c in self.connections if c["id"] == connection_id), None)
+        for c in self.connections:
+            if c["id"] == connection_id:
+                out = deepcopy(c)
+                out.setdefault("tags", [])
+                return out
+        return None
 
     def create_connection(self, *, type_code: str, name: str, alias: str,
-                          config: dict, is_default: bool, created_by: str | None) -> dict:
+                          config: dict, is_default: bool, created_by: str | None,
+                          tags: list[str] | None = None) -> dict:
         with self._lock:
             now = _now()
             if is_default:
@@ -109,6 +116,7 @@ class InMemoryPlatformStore:
                 "name": name,
                 "alias": alias or "",
                 "config": deepcopy(config),
+                "tags": [str(t).strip() for t in (tags or []) if str(t).strip()],
                 "is_default": bool(is_default),
                 "enabled": True,
                 "status": "unknown",
@@ -428,12 +436,33 @@ class SQLPlatformStore:
             for stmt in statements:
                 conn.execute(text(stmt))
 
+        # 增量 schema 迁移（幂等）：老库没有 ``tags_json`` 列就加上
+        self._ensure_columns()
+
         # 启用加密时把存量明文行迁移成密文（幂等：已加密的不会重复加密）
         if crypto_active():
             try:
                 self.migrate_encrypt_existing()
             except Exception as exc:  # pragma: no cover
                 logger.warning("加密迁移跳过：%s", exc)
+
+    def _ensure_columns(self) -> None:
+        """对老数据库做幂等 column 增量。比 IF NOT EXISTS 通用——先 SELECT 探测，
+        没列再 ADD COLUMN（MySQL 5.7/TiDB 不支持 ALTER TABLE IF NOT EXISTS）。"""
+        with self.engine.begin() as conn:
+            try:
+                conn.execute(text("SELECT tags_json FROM platform_connection LIMIT 1"))
+            except Exception:
+                # 不存在；加列
+                try:
+                    is_sqlite = self.engine.dialect.name == "sqlite"
+                    col_type = "TEXT" if is_sqlite else "LONGTEXT"
+                    conn.execute(text(
+                        f"ALTER TABLE platform_connection ADD COLUMN tags_json {col_type}"
+                    ))
+                    logger.info("迁移：platform_connection 加 tags_json 列完毕")
+                except Exception as exc:    # pragma: no cover
+                    logger.warning("加 tags_json 列失败（如已存在/老 DB 不支持）：%s", exc)
 
     def migrate_encrypt_existing(self) -> dict[str, int]:
         """把已存在但还是明文的 ``config_json`` / ``api_key`` 重新写成密文。
@@ -498,6 +527,7 @@ class SQLPlatformStore:
                 name VARCHAR(128) NOT NULL,
                 alias VARCHAR(128),
                 config_json TEXT,
+                tags_json TEXT,
                 is_default INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 status VARCHAR(32),
@@ -638,6 +668,7 @@ class SQLPlatformStore:
                 name VARCHAR(128) NOT NULL,
                 alias VARCHAR(128),
                 config_json LONGTEXT,
+                tags_json LONGTEXT,
                 is_default TINYINT NOT NULL DEFAULT 0,
                 enabled TINYINT NOT NULL DEFAULT 1,
                 status VARCHAR(32),
@@ -768,6 +799,13 @@ class SQLPlatformStore:
         except json.JSONDecodeError:
             logger.warning("config_json 反序列化失败 (id=%s)，可能是加密数据用错了 key", d.get("id"))
             d["config"] = {}
+        # tags_json 不加密（关键词不是机密信息，需要 LLM 看到）
+        tags_raw = d.pop("tags_json", None)
+        try:
+            tags = json.loads(tags_raw) if tags_raw else []
+        except (json.JSONDecodeError, TypeError):
+            tags = []
+        d["tags"] = [str(t).strip() for t in tags if str(t).strip()] if isinstance(tags, list) else []
         d["is_default"] = bool(d.get("is_default"))
         d["enabled"] = bool(d.get("enabled", 1))
         return d
@@ -868,8 +906,10 @@ class SQLPlatformStore:
         return self._row_to_connection(row) if row else None
 
     def create_connection(self, *, type_code: str, name: str, alias: str,
-                          config: dict, is_default: bool, created_by: str | None) -> dict:
+                          config: dict, is_default: bool, created_by: str | None,
+                          tags: list[str] | None = None) -> dict:
         now = _now()
+        clean_tags = [str(t).strip() for t in (tags or []) if str(t).strip()]
         with self._lock, self.engine.begin() as conn:
             if is_default:
                 conn.execute(text("UPDATE platform_connection SET is_default=0 WHERE type_code=:t"),
@@ -880,6 +920,7 @@ class SQLPlatformStore:
                 "name": name,
                 "alias": alias or "",
                 "config_json": encrypt(json.dumps(config, ensure_ascii=False)),
+                "tags_json": json.dumps(clean_tags, ensure_ascii=False),
                 "is_default": 1 if is_default else 0,
                 "enabled": 1,
                 "status": "unknown",
@@ -889,8 +930,8 @@ class SQLPlatformStore:
             }
             conn.execute(
                 text("""INSERT INTO platform_connection
-                        (id, type_code, name, alias, config_json, is_default, enabled, status, created_by, created_at, updated_at)
-                        VALUES (:id, :type_code, :name, :alias, :config_json, :is_default, :enabled, :status, :created_by, :created_at, :updated_at)"""),
+                        (id, type_code, name, alias, config_json, tags_json, is_default, enabled, status, created_by, created_at, updated_at)
+                        VALUES (:id, :type_code, :name, :alias, :config_json, :tags_json, :is_default, :enabled, :status, :created_by, :created_at, :updated_at)"""),
                 record,
             )
         return self.get_connection(record["id"])
@@ -898,7 +939,7 @@ class SQLPlatformStore:
     def update_connection(self, connection_id: str, **fields) -> dict:
         if not fields:
             return self.get_connection(connection_id)
-        allowed = {"name", "alias", "config", "is_default", "enabled", "status"}
+        allowed = {"name", "alias", "config", "tags", "is_default", "enabled", "status"}
         sets = []
         params: dict[str, Any] = {"id": connection_id, "updated_at": _now()}
         for k, v in fields.items():
@@ -907,6 +948,10 @@ class SQLPlatformStore:
             if k == "config":
                 sets.append("config_json=:config_json")
                 params["config_json"] = encrypt(json.dumps(v, ensure_ascii=False))
+            elif k == "tags":
+                clean = [str(t).strip() for t in (v or []) if str(t).strip()]
+                sets.append("tags_json=:tags_json")
+                params["tags_json"] = json.dumps(clean, ensure_ascii=False)
             elif k in {"is_default", "enabled"}:
                 sets.append(f"{k}=:{k}")
                 params[k] = 1 if v else 0

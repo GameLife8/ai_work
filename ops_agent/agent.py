@@ -248,14 +248,19 @@ class UnifiedOpsAgent:
         lines: list[str] = [
             "## 当前平台可用集群（动态注入）",
             "",
-            "下表列出所有已接入的集群。**用户在对话里如果提到表中的别名、关键字、"
-            "IP，你应当从对应行取 ``connection_id`` 作为 skill 的 ``connection_id`` "
-            "参数传**。命中规则：",
-            "- 用户说出别名（中文/英文）或别名里的关键字 → 走那条",
+            "下表列出所有已接入的集群。**用户在对话里如果提到表中的触发关键词、"
+            "别名、IP，你应当从对应行取 ``connection_id`` 作为 skill 的 "
+            "``connection_id`` 参数传**。命中规则（优先级从高到低）：",
+            "- ⭐ 用户文本里**精确命中触发关键词**（tags） → 走那条",
+            "- 用户说出别名（中文/英文）或别名里的子串 → 走那条",
             "- 用户说出 manager IP / kubeconfig server IP / 节点 IP 前缀 → 走匹配那条",
-            "- 用户提到的节点名（如 ``worker2.chinasws.com`` / ``lowcode-master01``）",
+            "- 用户提到的节点名（``worker2.chinasws.com`` / ``lowcode-master01``）"
             "  能在某条的 \"节点命名规律\" 里识别 → 走那条",
             "- 都没命中 → 走该 type 的 ``[默认]``；没默认就用列表第一条",
+            "",
+            "**关键：同一个触发关键词可能命中多条 connection**（同集群的 host_agent + "
+            "swarm/k8s 通常打同样的关键词）。这是**逻辑集群**的设计——你需要哪个 type "
+            "的 skill 就用同一关键词对应该 type 的 connection_id。",
             "",
         ]
 
@@ -272,22 +277,27 @@ class UnifiedOpsAgent:
                 alias = c.get("alias") or c["name"]
                 name = c["name"]
                 cfg = c.get("config") or {}
+                tags = c.get("tags") or []
 
                 # 识别线索：根据 type 提取关键字段
                 clue = self._connection_routing_clue(t, cfg)
 
-                tags = []
+                flag_tags = []
                 if c.get("is_default"):
-                    tags.append("[默认]")
+                    flag_tags.append("[默认]")
                 if selected_connections.get(t) == cid:
-                    tags.append("[当前会话已选]")
-                tag_str = " ".join(tags)
+                    flag_tags.append("[当前会话已选]")
+                flag_str = " ".join(flag_tags)
 
                 lines.append(
-                    f"- **{alias}** {tag_str}  ←  ``connection_id={cid}``\n"
-                    f"  - name=``{name}``，type=``{t}``"
-                    + (f"\n  - 识别线索：{clue}" if clue else "")
+                    f"- **{alias}** {flag_str}  ←  ``connection_id={cid}``"
                 )
+                if tags:
+                    keyword_str = ", ".join(f"``{t}``" for t in tags)
+                    lines.append(f"  - 🏷️ **触发关键词**：{keyword_str}")
+                lines.append(f"  - name=``{name}``，type=``{t}``")
+                if clue:
+                    lines.append(f"  - 识别线索：{clue}")
             lines.append("")
 
         lines.extend([

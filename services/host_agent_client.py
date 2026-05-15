@@ -236,15 +236,18 @@ class HostAgentClient:
         nodes = self.list_nodes()
         if not nodes:
             return {"healthy": False, "message": "未发现已部署的 agent 节点"}
-        # 只 ping 第一个节点，避免拖时间
+        # 只 ping 第一个节点，避免拖时间。
+        # 用 ``cat /proc/uptime`` —— ``cat`` 在 agent 白名单里（``true`` 不在），
+        # 输出短而稳定，几乎所有 Linux 节点都有 /proc/uptime。
         try:
-            r = self.exec_on_node(nodes[0], ["true"], timeout=10)
+            r = self.exec_on_node(nodes[0], ["cat", "/proc/uptime"], timeout=10)
             return {
                 "healthy": r.ok,
                 "kind": self.kind,
                 "transport": self.transport,
                 "nodes": nodes,
                 "probe_node": nodes[0],
+                "probe_output": (r.stdout or "").strip()[:80],
                 "stderr": r.stderr if not r.ok else "",
             }
         except Exception as exc:

@@ -50,6 +50,10 @@ services:
       # 同 backend：覆盖 BuildKit 烧进来的 NO_PROXY 防内网走代理
       NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
       no_proxy: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
+      # 注意：``DATABASE_URL`` 不要在这里 unset。chainlit_app.py 一进 main 就
+      # ``os.environ.pop("DATABASE_URL")`` 给 chainlit 看了一个没 DB 的 env，
+      # 阻止它启用自己需要 asyncpg 的 data layer。平台的 Config 类在 import
+      # 阶段会 fallback 到 ``mysql+pymysql://{TIDB_*}/...`` 拼出同样的 URL。
     ports:
       - "${CHAT_PORT:-8000}:8000"
     depends_on:

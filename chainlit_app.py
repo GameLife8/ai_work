@@ -5,6 +5,27 @@ import json
 import os
 import uuid
 
+
+def _hide_database_url_from_chainlit() -> None:
+    """Chainlit ``get_data_layer()`` 实时检查 ``os.environ.get("DATABASE_URL")``，
+    一旦看到非空就 ``from .chainlit_data_layer import ChainlitDataLayer`` → 触发
+    ``import asyncpg``，我们的镜像没装就 login 接口 500。
+
+    问题：单纯在文件顶 ``os.environ.pop`` 不够——``from config import Config``
+    会触发 ``load_dotenv()``，把 .env 里的 ``DATABASE_URL`` 重新写回 env，绕开了
+    我们的 pop。
+
+    解法：pop 两次（chainlit import 前一次防早期触发，所有 import 完成后再一次
+    清掉 load_dotenv 重新加回去的）。备份保存到 ``PLATFORM_DATABASE_URL``，
+    平台 SQL store 仍可通过 Config.DATABASE_URL 类属性使用（class 已求值完）。
+    """
+    val = os.environ.pop("DATABASE_URL", None)
+    if val:
+        os.environ.setdefault("PLATFORM_DATABASE_URL", val)
+
+
+_hide_database_url_from_chainlit()
+
 import chainlit as cl
 
 from config import Config
@@ -12,6 +33,9 @@ from ops_agent import UnifiedOpsAgent
 from ops_platform.auth import verify_password
 from ops_platform.context import SkillContext
 from runtime import create_runtime
+
+# 关键二次 pop —— config 导入时 load_dotenv 把 DATABASE_URL 加回了 env
+_hide_database_url_from_chainlit()
 
 
 _runtime = create_runtime(Config)

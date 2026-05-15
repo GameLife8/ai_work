@@ -372,6 +372,66 @@ def invoke_skill(code):
     return jsonify(envelope)
 
 
+@admin_bp.post("/agent/ask")
+@_login_required()
+def agent_ask():
+    """让平台 LLM agent 跑一轮 ask 循环。给 chainlit 之外的运维测试 / 自动化用。
+
+    Request body::
+        {
+          "message": "192.168.2.124 /data 告警了，帮我排查",
+          "selected_connections": { "host_agent": "<connection_id>" },   # 可选
+          "session_id": "test-1",                                        # 可选
+          "max_steps": 8                                                  # 可选
+        }
+
+    返回 ``AgentOutcome.__dict__``：``message`` (LLM 最终五段式报告)、
+    ``trace`` (完整工具调用链)、``pending_actions`` (写操作待确认列表)。
+
+    没配模型 / 模型超时 / 任意环节挂掉 → 500 + ``{"error": "..."}``，方便排错。
+    """
+    body = request.get_json(silent=True) or {}
+    message = (body.get("message") or "").strip()
+    if not message:
+        return jsonify({"error": "message_required"}), 400
+
+    from ops_agent import UnifiedOpsAgent
+    try:
+        agent = UnifiedOpsAgent(
+            _runtime(),
+            max_steps=int(body.get("max_steps") or 8),
+        )
+    except Exception as exc:    # noqa: BLE001
+        # 通常是模型没配
+        return jsonify({"error": "agent_init_failed", "message": str(exc)}), 500
+
+    try:
+        outcome = agent.ask(
+            message,
+            user=g.current_user,
+            session_id=body.get("session_id"),
+            selected_connections=body.get("selected_connections") or {},
+        )
+    except Exception as exc:    # noqa: BLE001
+        logger.exception("agent.ask 失败")
+        return jsonify({"error": "agent_ask_failed", "message": str(exc)}), 500
+
+    return jsonify({
+        "message": outcome.message,
+        "trace": outcome.trace,
+        "pending_actions": outcome.pending_actions,
+        "trace_summary": [
+            {
+                "tool": t.get("tool_name"),
+                "args": t.get("tool_args"),
+                "status": t.get("status"),
+                "latency_ms": t.get("latency_ms"),
+            }
+            for t in outcome.trace
+        ],
+    })
+
+
 # ---------- skill call audit ----------
 
 @admin_bp.get("/skill-calls")

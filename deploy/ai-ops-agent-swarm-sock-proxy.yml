@@ -59,7 +59,7 @@ version: "3.6"
 
 services:
   ai-ops-agent:
-    image: ${AGENT_IMAGE:-mobile.chinasws.com:9990/ops/ai-ops-agent:1.1}
+    image: ${AGENT_IMAGE:-mobile.chinasws.com:9990/ops/ai-ops-agent:1.2}
 
     deploy:
       mode: global                       # 每个节点都跑一份
@@ -85,7 +85,7 @@ services:
       # sibling 容器用**digest** 引用而不是 tag——这样 docker run 直接命中 swarm
       # 拉下来的本地缓存（swarm 拉镜像只 pin digest 不打 tag），不会再去 harbor 拉，
       # 也就不需要每节点配 harbor 凭证。每次发布新 agent 版本要更新这里的 digest。
-      AGENT_TOOLS_IMAGE: "${AGENT_TOOLS_IMAGE:-mobile.chinasws.com:9990/ops/ai-ops-agent@sha256:888cfd6486ca3e40d11699d9ed993f3dc08ee87c3b9aff74a4a3060f1462495e}"
+      AGENT_TOOLS_IMAGE: "${AGENT_TOOLS_IMAGE:-mobile.chinasws.com:9990/ops/ai-ops-agent@sha256:1bd0653c508446a13d479426b99a55e26c055dc1e7cee3e2c16ac393c0312161}"
       # 可选源 IP 限制
       AGENT_ALLOWED_CIDR: "${BACKEND_CIDR:-}"
 

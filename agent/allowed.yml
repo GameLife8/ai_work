@@ -65,3 +65,12 @@ read_only:
   - nslookup
   - host
   - getent
+
+  # shell —— 给 host_run_command (admin 审批 + 平台侧 needs_confirmation) 用。
+  # 设计取舍：这俩本来会让"agent 白名单"形同虚设，但 host_run_command 的真正
+  # 安全边界**是平台侧的 admin 审批**，不是 agent 白名单。允许 sh/bash 让
+  # admin 审批通过的 ``df -h`` / ``du -sh /data`` / 复杂 pipe 都能执行。
+  # 其他 read-only skill（host_socket_overview 等）从不调 sh —— 它们直接传
+  # ss / ip / iptables-save 等可执行，跟 sh 这条无关。
+  - sh
+  - bash

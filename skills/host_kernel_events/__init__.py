@@ -74,10 +74,37 @@ def run(
     keyword: str | None = None,
     connection_id: str | None = None,
 ) -> dict:
+    """三段式 fallback 兼容老 dmesg：
+       1. ``dmesg --time-format iso --ctime``  (util-linux ≥ 2.30，CentOS 8+)
+       2. ``dmesg -T``                          (util-linux ≥ 2.20，CentOS 7)
+       3. ``dmesg``                              (任何版本，无时间戳)
+    每次失败就降级一次，避免老节点（CentOS 7 / SLES 12）直接挂掉。
+    """
     client = ctx.connection_for("host_agent", connection_id)
-    inner = ["dmesg", "--time-format", "iso", "--ctime"]
-    result = client.nsenter_on_node(node, inner)
-    lines = result.stdout.splitlines()
+
+    attempts = (
+        ["dmesg", "--time-format", "iso", "--ctime"],
+        ["dmesg", "-T"],
+        ["dmesg"],
+    )
+    result = None
+    used_cmd = None
+    for cmd in attempts:
+        result = client.nsenter_on_node(node, cmd)
+        if result.ok and result.stdout:
+            used_cmd = " ".join(cmd)
+            break
+        # stderr 出现 unrecognized option / invalid option / unknown 就降级
+        err_low = (result.stderr or "").lower()
+        if not any(t in err_low for t in (
+            "unrecognized option", "invalid option", "unknown option",
+        )):
+            # 不是 flag 兼容性问题，没必要再降级
+            used_cmd = " ".join(cmd)
+            break
+        used_cmd = " ".join(cmd)   # 记最后一次尝试的 cmd
+
+    lines = (result.stdout if result else "").splitlines()
     if keyword:
         lines = [ln for ln in lines if keyword.lower() in ln.lower()]
     lines = lines[-int(tail):]
@@ -88,7 +115,8 @@ def run(
         "keyword": keyword,
         "matched_count": len(lines),
         "events": events,
-        "ok": result.ok,
-        "stderr": result.stderr,
+        "dmesg_command": used_cmd,
+        "ok": bool(result and result.ok),
+        "stderr": (result.stderr if result else "")[:2000],
     }
     return attach(payload, _extract_kernel_signals(node, events))

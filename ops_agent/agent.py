@@ -213,6 +213,138 @@ class UnifiedOpsAgent:
             return assemble_default()
         return assemble_from_records(records)
 
+    def _build_cluster_registry_prompt(self, *, selected_connections: dict[str, str]) -> str:
+        """生成"当前平台可用集群名录"prompt，每次 ask 重新求值。
+
+        目的：让 LLM 从用户口语里的别名、节点名前缀、IP 关键字 → 匹配到正确的
+        ``connection_id`` 当作 skill 的 ``connection_id`` 参数传。
+
+        渲染内容：
+          - 按 type 分组列出所有 enabled 的 connection
+          - 每条给：``connection_id``、别名（用户实际打出来的词）、识别线索
+            （manager IP / kubeconfig server / 默认 namespace / 节点命名规律）
+          - 标注 ``[默认]`` / ``[当前会话已选]`` 给 LLM 一个 fallback 优先级
+          - 给一段路由规则的 hint，例：alias 命中 / IP/host 子串命中 → 用对应
+            connection_id；都没命中走默认
+
+        说明：这段也参与 prompt cache（如果模型 SDK 支持）。每次都重算所以
+        admin 在管理后台改 alias 立即对下一句对话生效。
+        """
+        try:
+            conns = self.runtime.connection_manager.list()
+        except Exception:
+            return "## 当前可用集群\n\n（无法列出 connection——可能 store 未就绪）"
+
+        if not conns:
+            return "## 当前可用集群\n\n（平台尚未配置任何 connection；让用户先到管理后台 → 接入管理添加）"
+
+        # 按 type 分组
+        by_type: dict[str, list[dict]] = {}
+        for c in conns:
+            if not c.get("enabled", True):
+                continue
+            by_type.setdefault(c.get("type_code", "other"), []).append(c)
+
+        lines: list[str] = [
+            "## 当前平台可用集群（动态注入）",
+            "",
+            "下表列出所有已接入的集群。**用户在对话里如果提到表中的别名、关键字、"
+            "IP，你应当从对应行取 ``connection_id`` 作为 skill 的 ``connection_id`` "
+            "参数传**。命中规则：",
+            "- 用户说出别名（中文/英文）或别名里的关键字 → 走那条",
+            "- 用户说出 manager IP / kubeconfig server IP / 节点 IP 前缀 → 走匹配那条",
+            "- 用户提到的节点名（如 ``worker2.chinasws.com`` / ``lowcode-master01``）",
+            "  能在某条的 \"节点命名规律\" 里识别 → 走那条",
+            "- 都没命中 → 走该 type 的 ``[默认]``；没默认就用列表第一条",
+            "",
+        ]
+
+        # 优先级：常用类型靠前
+        type_order = ["host_agent", "swarm", "k8s", "zabbix", "http_api", "alert_analysis"]
+        ordered_types = [t for t in type_order if t in by_type] + [
+            t for t in by_type if t not in type_order
+        ]
+
+        for t in ordered_types:
+            lines.append(f"### {t}")
+            for c in by_type[t]:
+                cid = c["id"]
+                alias = c.get("alias") or c["name"]
+                name = c["name"]
+                cfg = c.get("config") or {}
+
+                # 识别线索：根据 type 提取关键字段
+                clue = self._connection_routing_clue(t, cfg)
+
+                tags = []
+                if c.get("is_default"):
+                    tags.append("[默认]")
+                if selected_connections.get(t) == cid:
+                    tags.append("[当前会话已选]")
+                tag_str = " ".join(tags)
+
+                lines.append(
+                    f"- **{alias}** {tag_str}  ←  ``connection_id={cid}``\n"
+                    f"  - name=``{name}``，type=``{t}``"
+                    + (f"\n  - 识别线索：{clue}" if clue else "")
+                )
+            lines.append("")
+
+        lines.extend([
+            "## 路由示例（few-shot）",
+            "",
+            "用户说「**bigdata6** 节点磁盘看一下」→ bigdata6 命中 `BigData Swarm` 的"
+            "节点命名规律 → 调 ``host_storage_overview`` 时传该集群的 ``connection_id``。",
+            "",
+            "用户说「**codewave** 上 default 命名空间 pod 状态」→ codewave 命中 K8s "
+            "集群的别名 → 调 ``k8s_list_pods`` 传该集群的 ``connection_id``。",
+            "",
+            "用户说「**192.168.2.124** 服务起不来」→ 192.168.2.x 段命中 `SWS Swarm` 的"
+            "manager IP → 走 `SWS Swarm` 的 connection_id。",
+            "",
+            "**用户没说具体集群** → 直接走对应 type 的 ``[默认]``，不要追问用户。",
+        ])
+
+        return "\n".join(lines)
+
+    @staticmethod
+    def _connection_routing_clue(type_code: str, cfg: dict[str, Any]) -> str:
+        """从 connection.config 抽出对 LLM 有用的识别线索（脱敏）。"""
+        if type_code == "swarm":
+            host = cfg.get("docker_host") or ""
+            ip = host.replace("tcp://", "").split(":")[0]
+            return f"swarm manager = ``{ip}``；节点 IP 一般跟它同段"
+        if type_code == "host_agent":
+            kind = cfg.get("kind", "?")
+            transport = cfg.get("transport") or "<auto>"
+            if kind == "swarm":
+                host = cfg.get("docker_host") or ""
+                ip = host.replace("tcp://", "").split(":")[0]
+                return f"swarm host_agent；manager = ``{ip}``；transport={transport}"
+            if kind == "k8s":
+                kc = cfg.get("kubeconfig") or ""
+                # 从 kubeconfig YAML 抠 server URL（粗暴 grep）
+                server = ""
+                for line in kc.splitlines():
+                    if "server:" in line:
+                        server = line.split("server:", 1)[1].strip()
+                        break
+                return f"k8s host_agent；API={server or '?'}；transport={transport}"
+            return f"kind={kind}"
+        if type_code == "k8s":
+            kc = cfg.get("kubeconfig") or ""
+            server = ""
+            for line in kc.splitlines():
+                if "server:" in line:
+                    server = line.split("server:", 1)[1].strip()
+                    break
+            return f"K8s API server = ``{server or '?'}``"
+        if type_code == "zabbix":
+            return f"Zabbix = ``{cfg.get('base_url','')}``"
+        if type_code == "http_api":
+            return f"HTTP API base = ``{cfg.get('base_url','')}``"
+        return ""
+
     def ask(
         self,
         user_message: str,
@@ -232,6 +364,11 @@ class UnifiedOpsAgent:
 
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self._load_system_prompt()},
+            # 关键：把"当前可用集群"动态注入第二条 system 消息——让 LLM 能从用户
+            # 口语里的别名 / IP / 节点名 推断要传哪个 connection_id 给 skill。
+            {"role": "system", "content": self._build_cluster_registry_prompt(
+                selected_connections=selected_connections or {},
+            )},
             {"role": "user", "content": user_message},
         ]
         trace: list[dict[str, Any]] = []

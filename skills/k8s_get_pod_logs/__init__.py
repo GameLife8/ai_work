@@ -5,6 +5,7 @@ from ops_platform.signals import (
     SEV_WARNING,
     SIG_CONFIG_ERROR,
     SIG_CONNECTION_REFUSED,
+    SIG_DNS_RESOLVE_FAIL,
     SIG_NETWORK_TIMEOUT,
     SIG_OOM_KILL,
     SIG_PERMISSION_DENIED,
@@ -87,6 +88,27 @@ def _scan_logs(text: str, *, pod: str, namespace: str | None) -> list[dict]:
             severity=SEV_WARNING,
             evidence=f"Pod {pod} 日志报网络超时（i/o timeout / context deadline exceeded）",
             context={"namespace": namespace, "pod": pod},
+        ))
+
+    # DNS 解析失败——容器内 /etc/resolv.conf / coredns / 网络策略阻断常见根因
+    if any(k in lower for k in (
+        "no such host",
+        "getaddrinfo",
+        "name resolution",
+        "unknownhostexception",
+        "temporary failure in name resolution",
+    )):
+        sigs.append(signal(
+            SIG_DNS_RESOLVE_FAIL,
+            severity=SEV_CRITICAL,
+            evidence=(
+                f"Pod {pod} 日志报 DNS 解析失败——可能是 CoreDNS 故障 / 网络策略阻断 / "
+                "容器 resolv.conf 错"
+            ),
+            next_skill="k8s_describe_pod",
+            next_args={"name": pod, "namespace": namespace} if namespace else {"name": pod},
+            context={"namespace": namespace, "pod": pod,
+                     "hint": "再查 host_inspect_container_netns 看容器内 DNS 配置"},
         ))
 
     # 权限 / 配置错——应用层根因，不是平台层

@@ -60,6 +60,9 @@ SIG_FAILED_SCHEDULING     = "failed_scheduling"
 SIG_EVICTED               = "pod_evicted"
 SIG_CRASH_LOOP            = "crash_loop_backoff"
 SIG_OOM_LOG               = "oom_in_kernel_log"
+SIG_CONNTRACK_FULL        = "conntrack_table_full"
+SIG_DISK_IO_ERROR         = "disk_io_error"
+SIG_DNS_RESOLVE_FAIL      = "dns_resolve_fail"
 
 
 # 严重程度

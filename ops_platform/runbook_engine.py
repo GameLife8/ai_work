@@ -436,10 +436,31 @@ def _jsonpath_get(obj: Any, path: str) -> Any:
 def resolve_ref(value: Any, ctx: "ExecutionContext") -> Any:
     """把单个值（可能含 $-引用）解析成实际值。
 
+    支持的语法：
+      ``$user.X``               用户输入
+      ``$nodes.<id>.<path>``    某节点结果
+      ``$signals.<type>.<f>``   第一条匹配类型的 signal
+      ``$a||$b||literal``       fallback 链：第一个非 None/空 的胜出。
+                                **关键场景**：``$user.pod_name||$nodes.list.pods[0].name``
+                                —— 用户不传 pod_name 时回退到 list skill 的第一个 pod，
+                                避免 runbook 因为 ``field_ne ... != None`` 的 if_when
+                                guard 把所有诊断节点都 skip 掉。
+
     非引用字符串原样返回；不识别的 $-串当作字面值返回（防止误删用户字符串）。
     """
     if not isinstance(value, str) or not value.startswith("$"):
         return value
+
+    # ``a||b||c`` 任意一段非空就返回它；都空返回 None
+    if "||" in value:
+        for token in value.split("||"):
+            token = token.strip()
+            if not token:
+                continue
+            sub = resolve_ref(token, ctx)
+            if sub not in (None, "", [], {}):
+                return sub
+        return None
 
     # $user.<field>
     if value.startswith("$user."):
@@ -935,6 +956,15 @@ DEFAULT_REPORT_PROMPT = """\
 **判断结论**：根因是什么；不能 100% 确认就写"高度疑似 + 备选"。
 **建议操作**：具体可执行——重启 / 扩容 / 清理。如果建议是写操作，
 明确告诉用户「我可以帮你执行 ``swarm_xxx``，请下方点击确认」。
+
+⚠️ **诊断完整性硬性要求**——查报告里 ``node_states`` 找：
+- 有 ``status == "error"`` 或 ``status == "timeout"`` 的节点 → 在"检测过程"段
+  **明确写出哪一步失败、失败原因 (state.error)**，不要绕过；
+- 全局 ``global_status != "done"`` 或 ``abort_reason`` 非空 → 在"判断结论"段
+  开头第一句声明"⚠️ 本次诊断中途中止：<原因>，证据可能不完整"。
+- 关键 pivot 节点（zabbix_get_host_overview / host_storage_overview /
+  host_kernel_events 等）失败时不能只贴前置节点的证据就下结论——必须告诉用户
+  缺了什么信息、补什么 skill 能补全。
 
 请只引用 node_states 里 status=done 节点的真实证据，不要编造。
 执行中已经有 _signals 数组，是各节点主动发出的结构化信号——这些信号的 evidence 字段

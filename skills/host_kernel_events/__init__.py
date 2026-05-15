@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from ops_platform.signals import (
     SEV_CRITICAL, SEV_WARNING,
+    SIG_CONNTRACK_FULL,
+    SIG_DISK_IO_ERROR,
     SIG_OOM_LOG,
     attach, signal,
 )
@@ -50,18 +52,23 @@ def _extract_kernel_signals(node: str, events_text: str) -> list[dict]:
             context={"node": node},
         ))
     if "nf_conntrack: table full" in low:
+        # 降级为 warning：conntrack 满通常是瞬时高并发，几秒内自愈，不算 critical 故障
+        # （要做 critical 升级需要看是否持续命中 / 是否有 dropped 包统计）
         sigs.append(signal(
-            "conntrack_table_full", severity=SEV_CRITICAL,
-            evidence=f"节点 {node} conntrack 表满，将丢弃新连接",
+            SIG_CONNTRACK_FULL, severity=SEV_WARNING,
+            evidence=f"节点 {node} conntrack 表满（nf_conntrack: table full），新连接将被丢",
             next_skill="host_iptables_dump",
             next_args={"node": node},
+            context={"node": node},
         ))
     if "i/o error" in low or "ata.*error" in low or "blk_update_request" in low:
+        # 磁盘 IO 错误保持 critical —— 硬件层面警示
         sigs.append(signal(
-            "disk_io_error", severity=SEV_CRITICAL,
+            SIG_DISK_IO_ERROR, severity=SEV_CRITICAL,
             evidence=f"节点 {node} 内核报磁盘 I/O 错误，硬件层面有风险",
             next_skill="zabbix_get_host_storage_overview",
             next_args={"host_query": node},
+            context={"node": node},
         ))
     return sigs
 

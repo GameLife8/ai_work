@@ -136,12 +136,22 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
             "describe": {
                 "skill": "k8s_describe_pod",
                 "description": "看 Events 找根因",
-                # 优先用用户指定的 pod_name；没指定就用 list 第一个有问题的
+                # Fallback 链：用户传 → list 里第一个 crashloop pod → 第一个
+                # imagepull 失败 pod → list 第一个 pod。覆盖 "用户没传 pod_name 整
+                # 个诊断链全 skip" 的死路。
                 "args": {
-                    "name": "$user.pod_name",
-                    "namespace": "$user.namespace",
+                    "name": (
+                        "$user.pod_name"
+                        "||$signals.crash_loop_backoff.next_args.name"
+                        "||$signals.image_pull_fail.next_args.name"
+                        "||$nodes.list.pods[0].name"
+                    ),
+                    "namespace": (
+                        "$user.namespace"
+                        "||$signals.crash_loop_backoff.next_args.namespace"
+                        "||$nodes.list.pods[0].namespace"
+                    ),
                 },
-                "if_when": {"type": "field_ne", "path": "$user.pod_name", "value": None},
                 "on_error": "continue",
                 "edges": [
                     {
@@ -177,21 +187,27 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
                 "skill": "k8s_get_pod_logs",
                 "description": "CrashLoop 必须 previous=true 看上次崩溃前的输出",
                 "args": {
-                    "name": "$user.pod_name",
-                    "namespace": "$user.namespace",
+                    "name": (
+                        "$user.pod_name"
+                        "||$signals.crash_loop_backoff.next_args.name"
+                        "||$nodes.list.pods[0].name"
+                    ),
+                    "namespace": "$user.namespace||$nodes.list.pods[0].namespace",
                     "previous": True,
                 },
-                "if_when": {"type": "field_ne", "path": "$user.pod_name", "value": None},
                 "on_error": "skip",
             },
             "logs_now": {
                 "skill": "k8s_get_pod_logs",
                 "description": "当前日志兜底",
                 "args": {
-                    "name": "$user.pod_name",
-                    "namespace": "$user.namespace",
+                    "name": (
+                        "$user.pod_name"
+                        "||$signals.crash_loop_backoff.next_args.name"
+                        "||$nodes.list.pods[0].name"
+                    ),
+                    "namespace": "$user.namespace||$nodes.list.pods[0].namespace",
                 },
-                "if_when": {"type": "field_ne", "path": "$user.pod_name", "value": None},
                 "on_error": "skip",
             },
         },

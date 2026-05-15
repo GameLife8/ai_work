@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from ops_platform.signals import (
     SEV_CRITICAL, SEV_WARNING,
-    SIG_CONNECTION_REFUSED, SIG_NETWORK_TIMEOUT, SIG_NO_SPACE,
-    SIG_OOM_KILL, SIG_PERMISSION_DENIED,
+    SIG_CONNECTION_REFUSED, SIG_DNS_RESOLVE_FAIL, SIG_NETWORK_TIMEOUT,
+    SIG_NO_SPACE, SIG_OOM_KILL, SIG_PERMISSION_DENIED,
     attach, signal,
 )
 
@@ -45,19 +45,46 @@ def _scan_log_signals(service_name: str, log_text: str) -> list[dict]:
 
     if ("connection refused" in low or "ecconnrefused" in low) and SIG_CONNECTION_REFUSED not in seen:
         seen.add(SIG_CONNECTION_REFUSED)
+        # 没 node 信息时**不**带 next_skill —— 避免给模型递空 args 让下游 skill 直接
+        # 报"node 必填"。模型看到 evidence + signal type 自己会知道下一步该追主机层。
         sigs.append(signal(
             SIG_CONNECTION_REFUSED, severity=SEV_CRITICAL,
-            evidence=f"日志中出现 'connection refused'（服务 {service_name}），可能下游不可达 / 端口未监听",
-            next_skill="host_socket_overview",
-            next_args=None,  # 让模型自己决定 node
+            evidence=(
+                f"日志中出现 'connection refused'（服务 {service_name}），可能下游不可达 / "
+                "端口未监听。建议先 swarm_get_failed_tasks 拿 Node，再 host_socket_overview 看监听。"
+            ),
+            next_skill="swarm_get_failed_tasks",
+            next_args={"service_name": service_name},
         ))
 
     if ("context deadline exceeded" in low or "i/o timeout" in low or "request timeout" in low) and SIG_NETWORK_TIMEOUT not in seen:
         seen.add(SIG_NETWORK_TIMEOUT)
         sigs.append(signal(
             SIG_NETWORK_TIMEOUT, severity=SEV_WARNING,
-            evidence=f"日志中出现网络 timeout（服务 {service_name}）",
-            next_skill="host_route_overview",
+            evidence=(
+                f"日志中出现网络 timeout（服务 {service_name}）。先拿 Node 再查路由 / "
+                "conntrack / DNS。"
+            ),
+            next_skill="swarm_get_failed_tasks",
+            next_args={"service_name": service_name},
+        ))
+
+    # DNS 解析失败 —— Go/Java/Python 各自的 DNS 错误关键词
+    if any(p in low for p in (
+        "no such host", "getaddrinfo", "name resolution",
+        "unknownhostexception", "temporary failure in name resolution",
+    )) and SIG_DNS_RESOLVE_FAIL not in seen:
+        seen.add(SIG_DNS_RESOLVE_FAIL)
+        sigs.append(signal(
+            SIG_DNS_RESOLVE_FAIL, severity=SEV_CRITICAL,
+            evidence=(
+                f"日志中出现 DNS 解析失败（服务 {service_name}）—— 关键词命中"
+                " ``no such host`` / ``getaddrinfo`` 等。先看节点 /etc/resolv.conf 跟"
+                " coredns 状态。"
+            ),
+            next_skill="swarm_get_failed_tasks",
+            next_args={"service_name": service_name},
+            context={"hint": "下一步可 host_inspect_container_netns 看容器内 DNS 配置 + host_route_overview 看节点路由"},
         ))
 
     if ("out of memory" in low or "oomkill" in low or "java.lang.outofmemoryerror" in low) and SIG_OOM_KILL not in seen:

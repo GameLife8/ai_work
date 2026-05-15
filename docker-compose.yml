@@ -21,6 +21,12 @@ services:
       APP_HOST: 0.0.0.0
       APP_PORT: "5000"
       STORE_BACKEND: ${STORE_BACKEND:-sql}
+      # 关键：BuildKit 通过 ~/.docker/config.json 的 proxies 块把 HTTP_PROXY/
+      # HTTPS_PROXY 烧进了镜像 ENV，让 kubectl / requests 跑内网 HTTPS 时被
+      # Windows 代理拦截。这里通过 compose 把 NO_PROXY 扩到所有内网网段，让
+      # 内网请求绕开代理直连。
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
+      no_proxy: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
     ports:
       - "${BACKEND_PORT:-5000}:5000"
     networks: [opsnet]
@@ -41,6 +47,9 @@ services:
     env_file: .env
     environment:
       STORE_BACKEND: ${STORE_BACKEND:-sql}
+      # 同 backend：覆盖 BuildKit 烧进来的 NO_PROXY 防内网走代理
+      NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
+      no_proxy: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
     ports:
       - "${CHAT_PORT:-8000}:8000"
     depends_on:
@@ -65,3 +74,15 @@ services:
 networks:
   opsnet:
     driver: bridge
+    # WSL2 over Hyper-V 的 eth0 MTU 是 1450 而不是常规 1500——容器走默认 1500
+    # 发出 1450~1500 字节的 TCP 包会被中间设备 drop（典型现象：TLS ClientHello
+    # 超时、HTTPS 握手卡住）。daemon.json.mtu 只影响 default bridge，compose 自己
+    # 起的 network 必须显式声明。1450 在物理网卡 / 公网环境下也安全。
+    driver_opts:
+      # MTU 1280 —— IPv6 最小 MTU，几乎在任何隧道（Hyper-V switch / WireGuard /
+      # IPSec / GRE）下都安全。WSL2 实测：
+      #   1500 → TLS ClientHello 超时
+      #   1450 → 普通 HTTPS 通，但 kubectl (带 client cert 的 mTLS) 仍 timeout
+      #   1380 → curl OK，但 kubectl 仍 timeout（client cert 让 handshake 更大）
+      #   1280 → kubectl 也通。性能微损可忽略，部到物理网络可以删掉。
+      com.docker.network.driver.mtu: "1280"

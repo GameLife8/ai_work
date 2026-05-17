@@ -1,40 +1,27 @@
-"""列某节点上所有异步任务（运维盲查 / LLM 自我恢复用）。
-
-read_only，不需要 admin 审批。
+"""列出异步任务（**走 DB**，看全集群所有任务）。
 
 典型用法
 ========
 - 用户问 "你刚才让我跑的 du 跑完没？" —— 模型忘了 task_id，可以 ``host_list_tasks``
   扫一遍 command 字段
-- 排查 agent 内存占用——同时跑 16 个任务封顶 (ASYNC_MAX_CONCURRENT_TASKS)，
-  本 skill 看下到底有多少在跑
 - 模型 self-recovery：上次对话 ``host_run_command_async`` 提交后断了，重新对话
-  时调本 skill 找 ``running`` 任务接着等
+  时调本 skill 拿 ``status=running`` 的任务接着等
+- 排查后台任务积压
 
-返回结构
-========
-::
-
-    {
-      "node": "bigdata6",
-      "running": 2,
-      "limits": {"max_concurrent": 16, "max_runtime_sec": 1800, ...},
-      "tasks": [
-        {"task_id": "...", "status": "running", "command": [...], ...},
-        ...
-      ]
-    }
+跟旧版本不同：**直接读 DB**，不再要求传 node，可以看跨节点跨连接的所有任务。
+保留 ``node`` 字段做筛选用。
 """
 
 from __future__ import annotations
 
 MANIFEST = {
     "code": "host_list_tasks",
-    "name": "列宿主机上所有异步任务",
+    "name": "列异步任务（走 DB）",
     "description": (
-        "列出指定节点 agent 内存里当前所有异步任务（含 running/done/error/timeout/cancelled）。"
-        "用来：找忘记 task_id 的任务、查 agent 并发占用、对话恢复时接着轮询。"
-        "默认按启动时间倒序，最新的在前面。"
+        "列出平台 DB 里的异步任务（含 running/done/error/timeout/cancelled/lost）。"
+        "默认按 submitted_at 倒序，最新的在前面。可按节点 / 状态 / session 过滤。"
+        "**注意**：本 skill 读 DB 不连 agent；如要拿 agent 内存 GC 后丢的任务原始结果，"
+        "需要重跑命令。"
     ),
     "category": "host",
     "required_connection_type": "host_agent",
@@ -43,14 +30,19 @@ MANIFEST = {
     "params_schema": {
         "type": "object",
         "properties": {
-            "node": {"type": "string"},
-            "status_filter": {
+            "node": {"type": "string", "description": "可选；按 node 筛选"},
+            "status": {
                 "type": "string",
-                "description": "可选；只看某状态：running/done/error/timeout/cancelled",
+                "description": "可选；按状态筛选：running/done/error/timeout/cancelled/lost/submitting",
+            },
+            "session_id": {"type": "string", "description": "可选；只看本会话的任务"},
+            "submitted_by": {"type": "string", "description": "可选；按提交用户筛选"},
+            "limit": {
+                "type": "integer", "default": 50, "minimum": 1, "maximum": 500,
+                "description": "返回条数上限",
             },
             "connection_id": {"type": "string"},
         },
-        "required": ["node"],
     },
 }
 
@@ -58,39 +50,58 @@ MANIFEST = {
 def run(
     ctx,
     *,
-    node: str,
-    status_filter: str | None = None,
+    node: str | None = None,
+    status: str | None = None,
+    session_id: str | None = None,
+    submitted_by: str | None = None,
+    limit: int = 50,
     connection_id: str | None = None,
 ) -> dict:
-    client = ctx.connection_for("host_agent", connection_id)
-    payload = client.task_list_on_node(node)
+    service = getattr(ctx.runtime, "async_task_service", None)
+    if service is None:
+        return {"ok": False, "error": "AsyncTaskService 未初始化", "tasks": []}
 
-    if "error" in payload and "tasks" not in payload:
-        return {
-            "node": node,
-            "ok": False,
-            "error": payload.get("error"),
-            "tasks": [],
-            "running": 0,
-        }
-
-    tasks = payload.get("tasks") or []
-    if status_filter:
-        tasks = [t for t in tasks if t.get("status") == status_filter]
+    # connection_id 是 host_agent 维度的筛选；如果没传就不限制
+    items = service.list(
+        connection_id=connection_id,
+        node=node,
+        status=status,
+        session_id=session_id,
+        submitted_by=submitted_by,
+        limit=int(limit),
+    )
 
     # 截断 stdout/stderr —— 列表场景下不需要全文，给个尾巴预览
-    for t in tasks:
-        if t.get("stdout"):
-            t["stdout"] = t["stdout"][-2000:]
-        if t.get("stderr"):
-            t["stderr"] = t["stderr"][-1000:]
+    out = []
+    for t in items:
+        out.append({
+            "task_id":         t.get("task_id"),
+            "status":          t.get("status"),
+            "node":            t.get("node"),
+            "connection_id":   t.get("connection_id"),
+            "connection_name": t.get("connection_name"),
+            "command":         (t.get("command") or "")[:200],
+            "submitted_by":    t.get("submitted_by"),
+            "session_id":      t.get("session_id"),
+            "submitted_at":    t.get("submitted_at"),
+            "started_at":      t.get("started_at"),
+            "ended_at":        t.get("ended_at"),
+            "duration_ms":     t.get("duration_ms"),
+            "exit_code":       t.get("exit_code"),
+            "stdout_preview":  (t.get("stdout") or "")[-1500:],
+            "stderr_preview":  (t.get("stderr") or "")[-800:],
+            "truncated":       t.get("truncated"),
+            "poll_count":      t.get("poll_count"),
+            "last_poll_at":    t.get("last_poll_at"),
+            "last_poll_error": t.get("last_poll_error"),
+        })
 
     return {
-        "node": node,
         "ok": True,
-        "running": payload.get("running"),
-        "limits": payload.get("limits"),
-        "status_filter": status_filter,
-        "count": len(tasks),
-        "tasks": tasks,
+        "filters": {
+            "node": node, "status": status, "session_id": session_id,
+            "submitted_by": submitted_by, "connection_id": connection_id,
+        },
+        "count": len(out),
+        "tasks": out,
     }

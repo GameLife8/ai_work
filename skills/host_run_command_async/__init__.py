@@ -1,9 +1,9 @@
-"""异步执行宿主机命令（**admin 二次确认**）——给长命令兜底。
+"""异步执行宿主机命令——给长命令兜底（**admin 二次确认**）。
 
 为啥要这个 skill
 ================
 同步 ``host_run_command`` 走 ``/v1/exec``，agent 端硬上限 300s；超过 timeout 后
-agent 会 SIGKILL 子进程，调用方也早就 HTTP 超时了。但实际排障常有这种命令：
+agent SIGKILL 子进程，调用方也早就 HTTP 超时了。但实际排障常有这种命令：
 
 - ``du -sh /*`` —— 节点磁盘各顶级目录占用，几十 GB 的根分区可能跑 5~15min
 - ``find / -mtime -1 -size +100M`` —— 找一天内变大的文件
@@ -12,13 +12,14 @@ agent 会 SIGKILL 子进程，调用方也早就 HTTP 超时了。但实际排�
 
 这类长命令同步等就是死路。解法：
 
-1. 用本 skill 提交 → agent 返回 ``task_id`` 立即结束（200ms 量级）
-2. agent 端在后台继续跑（asyncio fire-and-forget），完成后把 stdout/stderr 存
-   内存里 30 分钟可查
-3. 模型隔几秒调 ``host_check_task(task_id=...)`` 拿状态——running 就再等，done
-   就读结果
+1. 平台 ``AsyncTaskService.submit()`` → **先写 DB**（status=submitting，task_id
+   由平台生成 PK）→ 调 agent → 回写 DB（status=running）
+2. agent 后台跑命令；DB 是 source of truth
+3. 模型/用户隔几秒调 ``host_check_task(task_id=...)`` 拿状态；后台 poller 也会
+   定期同步
 
-跟同步 ``host_run_command`` 一样**强制 admin 二次确认**，全审计。
+**所有任务全部持久化到 ``platform_async_task`` 表**——agent 重启、chat 会话
+中断、30min agent GC 都不影响平台拿结果。
 """
 
 from __future__ import annotations
@@ -29,9 +30,10 @@ MANIFEST = {
     "description": (
         "**异步**在指定节点宿主机 namespace 跑长命令。立即返回 ``task_id``，命令在 agent "
         "后台跑，最长 30 分钟。"
+        "**任务全程持久化到平台 DB**：agent 重启、会话中断都不会丢结果。"
         "**用法**："
         "  1. 调本 skill → 拿 ``task_id``；"
-        "  2. 隔 5~30s 调 ``host_check_task(node=..., task_id=...)`` 轮询；"
+        "  2. 隔 5~30s 调 ``host_check_task(task_id=...)`` 轮询；"
         "  3. status=done/error/timeout 时 ``stdout``/``stderr`` 字段就有结果了。"
         "**适用场景**：``du -sh /*`` / ``find / ...`` / ``tcpdump -G N -W 1 -w ...`` / "
         "``journalctl --since ...`` 等估计 > 30s 的命令。"
@@ -85,34 +87,51 @@ def run(
     max_output_bytes: int | None = None,
     connection_id: str | None = None,
 ) -> dict:
-    client = ctx.connection_for("host_agent", connection_id)
+    service = getattr(ctx.runtime, "async_task_service", None)
+    if service is None:
+        return {
+            "ok": False,
+            "error": "AsyncTaskService 未初始化；请检查 runtime 启动日志",
+        }
+
+    # 解析最终 connection_id 入库审计
+    resolved_conn_id = ctx.resolve_connection_id("host_agent", connection_id)
+    if not resolved_conn_id:
+        return {"ok": False, "error": "未找到 host_agent 类型的 connection"}
 
     # 跟同步 host_run_command 一样把 command 包成 sh -c —— agent 白名单已放行 sh
-    inner = ["sh", "-c", command]
-    ns_tuple = tuple(c for c in namespaces if c in {"m", "u", "i", "n", "p", "U", "C"})
-    ns_tuple = ns_tuple or ("m", "u", "i", "n", "p")
+    argv = ["sh", "-c", command]
+    ns_clean = "".join(c for c in namespaces if c in {"m", "u", "i", "n", "p", "U", "C"}) or "muinp"
 
-    payload = client.exec_async_on_node(
-        node, inner,
-        namespaces=ns_tuple,
+    user = (ctx.user or {}).get("username")
+    rec = service.submit(
+        connection_id=resolved_conn_id,
+        node=node,
+        command=command,
+        argv=argv,
+        nsenter=ns_clean,
         max_runtime_sec=max_runtime_sec,
         max_output_bytes=max_output_bytes,
+        submitted_by=user or "system",
+        session_id=ctx.session_id,
     )
-    # 兜底：agent 端返回 error 时把 ok=False 暴露给模型
-    is_err = "error" in payload and not payload.get("task_id")
+
+    is_err = rec["status"] == "error" or not rec.get("status")
     return {
+        "ok": not is_err,
+        "task_id": rec["task_id"],
+        "status": rec["status"],
         "node": node,
         "command": command,
-        "namespaces": namespaces,
-        "max_runtime_sec": max_runtime_sec,
-        "ok": not is_err,
-        "task_id": payload.get("task_id"),
-        "status": payload.get("status"),
-        "started_at": payload.get("started_at"),
-        "poll_endpoint": payload.get("poll_endpoint"),
-        "error": payload.get("error"),
+        "namespaces": ns_clean,
+        "connection_id": resolved_conn_id,
+        "submitted_at": rec.get("submitted_at"),
+        "started_at": rec.get("started_at"),
+        "max_runtime_sec": rec.get("max_runtime_sec"),
+        "error": rec.get("last_poll_error") if is_err else None,
         "_hint": (
-            "稍等 5~30s 再调 host_check_task(node='{node}', task_id='{tid}') 拿结果"
-            .format(node=node, tid=payload.get("task_id"))
+            f"任务已落库（DB 是 source of truth）。隔 5~30s 调 "
+            f"host_check_task(task_id='{rec['task_id']}') 拿结果；"
+            f"agent / 会话异常都不会丢数据。"
         ) if not is_err else None,
     }

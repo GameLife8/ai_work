@@ -594,7 +594,22 @@ async def exec_async(request: web.Request) -> web.Response:
     max_runtime = float(payload.get("max_runtime_sec") or ASYNC_DEFAULT_RUNTIME_SEC)
     max_runtime = min(max(max_runtime, 5), ASYNC_MAX_RUNTIME_SEC)
 
-    task_id = _new_task_id()
+    # 调用方可在 body 里传 ``task_id``——平台 DB 是 source of truth，需要在调 agent
+    # **之前**就生成 PK 并写库，再把同一个 ID 透传给 agent。如果调用方不传就 fallback
+    # 到本地生成。冲突保护：传进来的 task_id 必须没被占用。
+    client_task_id = payload.get("task_id")
+    if client_task_id:
+        if not isinstance(client_task_id, str) or not (4 <= len(client_task_id) <= 64):
+            return web.json_response(
+                {"error": "task_id must be a 4~64 char string"}, status=400,
+            )
+        if client_task_id in _state["tasks"]:
+            return web.json_response(
+                {"error": "task_id_collision", "task_id": client_task_id}, status=409,
+            )
+        task_id = client_task_id
+    else:
+        task_id = _new_task_id()
     now = time.time()
     task: dict = {
         "task_id":     task_id,

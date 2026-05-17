@@ -421,6 +421,99 @@ class InMemoryPlatformStore:
         with self._lock:
             self.http_skills.pop(code, None)
 
+    # ---- async tasks ----------------------------------------------------- #
+
+    def __init_async_tasks_attr__(self) -> None:
+        if not hasattr(self, "async_tasks"):
+            self.async_tasks: dict[str, dict] = {}
+
+    def create_async_task(self, **fields) -> dict:
+        """新增异步任务记录。``task_id`` 必填且不能冲突。"""
+        self.__init_async_tasks_attr__()
+        with self._lock:
+            task_id = fields["task_id"]
+            if task_id in self.async_tasks:
+                raise ValueError(f"async_task 主键冲突：{task_id}")
+            now = _now()
+            rec = {
+                "task_id":              task_id,
+                "connection_id":        fields["connection_id"],
+                "connection_name":      fields.get("connection_name"),
+                "node":                 fields["node"],
+                "command":              fields["command"],
+                "argv_json":            deepcopy(fields.get("argv") or []),
+                "nsenter":              fields.get("nsenter"),
+                "max_runtime_sec":      fields.get("max_runtime_sec"),
+                "status":               fields.get("status", "submitting"),
+                "exit_code":            None,
+                "stdout":               "",
+                "stderr":               "",
+                "truncated":            False,
+                "submitted_by":         fields.get("submitted_by"),
+                "session_id":           fields.get("session_id"),
+                "skill_call_id":        fields.get("skill_call_id"),
+                "pending_action_token": fields.get("pending_action_token"),
+                "submitted_at":         fields.get("submitted_at") or now,
+                "started_at":           fields.get("started_at"),
+                "ended_at":             None,
+                "duration_ms":          None,
+                "last_poll_at":         None,
+                "last_poll_error":      None,
+                "poll_count":           0,
+                "created_at":           now,
+                "updated_at":           now,
+            }
+            self.async_tasks[task_id] = rec
+            return deepcopy(rec)
+
+    def get_async_task(self, task_id: str) -> dict | None:
+        self.__init_async_tasks_attr__()
+        rec = self.async_tasks.get(task_id)
+        return deepcopy(rec) if rec else None
+
+    def update_async_task(self, task_id: str, **fields) -> dict | None:
+        """部分字段更新。``task_id`` 不可改。"""
+        self.__init_async_tasks_attr__()
+        with self._lock:
+            rec = self.async_tasks.get(task_id)
+            if not rec:
+                return None
+            for k, v in fields.items():
+                if k in {"task_id", "created_at"}:
+                    continue
+                rec[k] = v
+            rec["updated_at"] = _now()
+            return deepcopy(rec)
+
+    def list_async_tasks(
+        self,
+        *,
+        connection_id: str | None = None,
+        node: str | None = None,
+        status: str | None = None,
+        session_id: str | None = None,
+        submitted_by: str | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        self.__init_async_tasks_attr__()
+        items = list(self.async_tasks.values())
+        if connection_id:
+            items = [t for t in items if t["connection_id"] == connection_id]
+        if node:
+            items = [t for t in items if t["node"] == node]
+        if status:
+            items = [t for t in items if t["status"] == status]
+        if session_id:
+            items = [t for t in items if t["session_id"] == session_id]
+        if submitted_by:
+            items = [t for t in items if t["submitted_by"] == submitted_by]
+        items.sort(key=lambda t: t.get("submitted_at") or "", reverse=True)
+        return [deepcopy(t) for t in items[:limit]]
+
+    def list_running_async_tasks(self, *, limit: int = 500) -> list[dict]:
+        """给后台 poller 用——一次性拿所有 running 任务。"""
+        return self.list_async_tasks(status="running", limit=limit)
+
 
 class SQLPlatformStore:
     """SQL 版本的平台存储；与 SQLStore 共用同一个 engine。"""
@@ -644,6 +737,43 @@ class SQLPlatformStore:
                 updated_at VARCHAR(64)
             )
             """,
+            # platform_async_task —— 持久化所有异步任务（agent 内存只是短期镜像）
+            #
+            # 关键设计：
+            #   - DB 是 source of truth，agent 重启 / 30min GC 都不影响平台拿结果
+            #   - task_id 由平台生成 PK，先写库再调 agent；agent 1.3+ 接受调用方传入的 task_id
+            #   - 后台 poller 每 N 秒扫 status='running' 的任务，去 agent 拉最新状态写库
+            #   - 终态(done/error/timeout/cancelled/lost)不再轮询，但记录永久保留供审计/回查
+            """
+            CREATE TABLE IF NOT EXISTS platform_async_task (
+                task_id VARCHAR(64) PRIMARY KEY,
+                connection_id VARCHAR(64) NOT NULL,
+                connection_name VARCHAR(255),
+                node VARCHAR(255) NOT NULL,
+                command TEXT NOT NULL,
+                argv_json TEXT,
+                nsenter VARCHAR(32),
+                max_runtime_sec INTEGER,
+                status VARCHAR(32) NOT NULL,
+                exit_code INTEGER,
+                stdout TEXT,
+                stderr TEXT,
+                truncated INTEGER NOT NULL DEFAULT 0,
+                submitted_by VARCHAR(128),
+                session_id VARCHAR(128),
+                skill_call_id INTEGER,
+                pending_action_token VARCHAR(64),
+                submitted_at VARCHAR(64),
+                started_at VARCHAR(64),
+                ended_at VARCHAR(64),
+                duration_ms INTEGER,
+                last_poll_at VARCHAR(64),
+                last_poll_error TEXT,
+                poll_count INTEGER NOT NULL DEFAULT 0,
+                created_at VARCHAR(64),
+                updated_at VARCHAR(64)
+            )
+            """,
         ]
 
     @staticmethod
@@ -783,6 +913,40 @@ class SQLPlatformStore:
                 version INT NOT NULL DEFAULT 1,
                 updated_by VARCHAR(128),
                 updated_at VARCHAR(64)
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS platform_async_task (
+                task_id VARCHAR(64) PRIMARY KEY,
+                connection_id VARCHAR(64) NOT NULL,
+                connection_name VARCHAR(255),
+                node VARCHAR(255) NOT NULL,
+                command LONGTEXT NOT NULL,
+                argv_json LONGTEXT,
+                nsenter VARCHAR(32),
+                max_runtime_sec INT,
+                status VARCHAR(32) NOT NULL,
+                exit_code INT,
+                stdout LONGTEXT,
+                stderr LONGTEXT,
+                truncated TINYINT NOT NULL DEFAULT 0,
+                submitted_by VARCHAR(128),
+                session_id VARCHAR(128),
+                skill_call_id BIGINT,
+                pending_action_token VARCHAR(64),
+                submitted_at VARCHAR(64),
+                started_at VARCHAR(64),
+                ended_at VARCHAR(64),
+                duration_ms INT,
+                last_poll_at VARCHAR(64),
+                last_poll_error TEXT,
+                poll_count INT NOT NULL DEFAULT 0,
+                created_at VARCHAR(64),
+                updated_at VARCHAR(64),
+                INDEX idx_async_task_status (status, updated_at),
+                INDEX idx_async_task_session (session_id),
+                INDEX idx_async_task_submitted_by (submitted_by),
+                INDEX idx_async_task_node (connection_id, node)
             )
             """,
         ]
@@ -1453,6 +1617,136 @@ class SQLPlatformStore:
             )
         return self.get_pending_action(token)
 
+    # ---------- async tasks ---------- #
+
+    _ASYNC_TASK_UPDATABLE = {
+        "connection_name", "status", "exit_code", "stdout", "stderr", "truncated",
+        "started_at", "ended_at", "duration_ms", "last_poll_at", "last_poll_error",
+        "poll_count", "skill_call_id", "pending_action_token",
+    }
+
+    @staticmethod
+    def _row_to_async_task(row) -> dict:
+        d = dict(row)
+        # argv_json 落库时序列化；读出来反序列化
+        if d.get("argv_json"):
+            try:
+                d["argv_json"] = json.loads(d["argv_json"])
+            except (ValueError, json.JSONDecodeError):
+                pass
+        d["truncated"] = bool(d.get("truncated") or 0)
+        return d
+
+    def create_async_task(self, **fields) -> dict:
+        now = _now()
+        record = {
+            "task_id":              fields["task_id"],
+            "connection_id":        fields["connection_id"],
+            "connection_name":      fields.get("connection_name"),
+            "node":                 fields["node"],
+            "command":              fields["command"],
+            "argv_json":            json.dumps(fields.get("argv") or [], ensure_ascii=False),
+            "nsenter":              fields.get("nsenter"),
+            "max_runtime_sec":      fields.get("max_runtime_sec"),
+            "status":               fields.get("status", "submitting"),
+            "exit_code":            None,
+            "stdout":               "",
+            "stderr":               "",
+            "truncated":            0,
+            "submitted_by":         fields.get("submitted_by"),
+            "session_id":           fields.get("session_id"),
+            "skill_call_id":        fields.get("skill_call_id"),
+            "pending_action_token": fields.get("pending_action_token"),
+            "submitted_at":         fields.get("submitted_at") or now,
+            "started_at":           fields.get("started_at"),
+            "ended_at":             None,
+            "duration_ms":          None,
+            "last_poll_at":         None,
+            "last_poll_error":      None,
+            "poll_count":           0,
+            "created_at":           now,
+            "updated_at":           now,
+        }
+        with self.engine.begin() as conn:
+            conn.execute(
+                text("""INSERT INTO platform_async_task
+                        (task_id, connection_id, connection_name, node, command, argv_json,
+                         nsenter, max_runtime_sec, status, exit_code, stdout, stderr, truncated,
+                         submitted_by, session_id, skill_call_id, pending_action_token,
+                         submitted_at, started_at, ended_at, duration_ms,
+                         last_poll_at, last_poll_error, poll_count, created_at, updated_at)
+                        VALUES (:task_id, :connection_id, :connection_name, :node, :command, :argv_json,
+                                :nsenter, :max_runtime_sec, :status, :exit_code, :stdout, :stderr, :truncated,
+                                :submitted_by, :session_id, :skill_call_id, :pending_action_token,
+                                :submitted_at, :started_at, :ended_at, :duration_ms,
+                                :last_poll_at, :last_poll_error, :poll_count, :created_at, :updated_at)"""),
+                record,
+            )
+        return self.get_async_task(record["task_id"])
+
+    def get_async_task(self, task_id: str) -> dict | None:
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text("SELECT * FROM platform_async_task WHERE task_id=:t"),
+                {"t": task_id},
+            ).mappings().first()
+        return self._row_to_async_task(row) if row else None
+
+    def update_async_task(self, task_id: str, **fields) -> dict | None:
+        if not fields:
+            return self.get_async_task(task_id)
+        sets, params = [], {"t": task_id, "updated_at": _now()}
+        for k, v in fields.items():
+            if k not in self._ASYNC_TASK_UPDATABLE:
+                continue
+            sets.append(f"{k}=:{k}")
+            if k == "truncated":
+                params[k] = 1 if v else 0
+            else:
+                params[k] = v
+        if not sets:
+            return self.get_async_task(task_id)
+        sets.append("updated_at=:updated_at")
+        with self.engine.begin() as conn:
+            conn.execute(
+                text(f"UPDATE platform_async_task SET {', '.join(sets)} WHERE task_id=:t"),
+                params,
+            )
+        return self.get_async_task(task_id)
+
+    def list_async_tasks(
+        self,
+        *,
+        connection_id: str | None = None,
+        node: str | None = None,
+        status: str | None = None,
+        session_id: str | None = None,
+        submitted_by: str | None = None,
+        limit: int = 200,
+    ) -> list[dict]:
+        sql = "SELECT * FROM platform_async_task"
+        clauses, params = [], {}
+        if connection_id:
+            clauses.append("connection_id=:cid"); params["cid"] = connection_id
+        if node:
+            clauses.append("node=:nd"); params["nd"] = node
+        if status:
+            clauses.append("status=:st"); params["st"] = status
+        if session_id:
+            clauses.append("session_id=:sid"); params["sid"] = session_id
+        if submitted_by:
+            clauses.append("submitted_by=:sb"); params["sb"] = submitted_by
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY submitted_at DESC LIMIT :limit"
+        params["limit"] = int(limit)
+        with self.engine.begin() as conn:
+            rows = conn.execute(text(sql), params).mappings().all()
+        return [self._row_to_async_task(r) for r in rows]
+
+    def list_running_async_tasks(self, *, limit: int = 500) -> list[dict]:
+        return self.list_async_tasks(status="running", limit=limit)
+
 
 def attach_platform_store(store: Any) -> Any:
     """根据已有 store 类型创建对应的 platform store，并把方法 bind 到原 store。"""
@@ -1472,6 +1766,8 @@ def attach_platform_store(store: Any) -> Any:
         "list_runbooks", "get_runbook", "upsert_runbook", "delete_runbook",
         "save_runbook_execution", "list_runbook_executions", "get_runbook_execution",
         "list_http_skills", "get_http_skill", "upsert_http_skill", "delete_http_skill",
+        "create_async_task", "get_async_task", "update_async_task",
+        "list_async_tasks", "list_running_async_tasks",
     ]
     for name in method_names:
         setattr(store, name, getattr(platform, name))

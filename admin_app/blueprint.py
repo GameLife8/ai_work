@@ -804,6 +804,77 @@ def reject_pending_action(token):
     return jsonify(envelope)
 
 
+# ---------- async tasks（长命令后台任务）-------------------------------------- #
+
+@admin_bp.get("/async-tasks")
+@_login_required()
+def list_async_tasks():
+    """列异步任务。
+
+    支持过滤：status / node / connection_id / session_id / submitted_by。
+    普通 user 角色只能看到自己提交的。
+    """
+    args = request.args
+    status = args.get("status") or None
+    node = args.get("node") or None
+    connection_id = args.get("connection_id") or None
+    session_id = args.get("session_id") or None
+    submitted_by = args.get("submitted_by") or None
+    limit = min(int(args.get("limit") or 200), 1000)
+
+    # 非 admin 默认只看自己的
+    if g.current_user.get("role") != "admin":
+        submitted_by = g.current_user["username"]
+
+    items = _store().list_async_tasks(
+        connection_id=connection_id, node=node, status=status,
+        session_id=session_id, submitted_by=submitted_by, limit=limit,
+    )
+    return jsonify(items)
+
+
+@admin_bp.get("/async-tasks/<task_id>")
+@_login_required()
+def get_async_task(task_id):
+    """单任务详情。如果还在 running 会触发 service 同步刷新一次。"""
+    service = getattr(_runtime(), "async_task_service", None)
+    if service is None:
+        return jsonify({"error": "async_task_service 未初始化"}), 500
+    rec = service.get(task_id, refresh=True)
+    if not rec:
+        return jsonify({"error": "not_found"}), 404
+    # 非 admin 只能看自己的
+    if g.current_user.get("role") != "admin" and rec.get("submitted_by") != g.current_user["username"]:
+        return jsonify({"error": "forbidden"}), 403
+    return jsonify(rec)
+
+
+@admin_bp.post("/async-tasks/<task_id>/cancel")
+@_login_required(role="admin")
+def cancel_async_task(task_id):
+    """取消任务。admin only——能 cancel 别人的任务是个高敏感操作。"""
+    service = getattr(_runtime(), "async_task_service", None)
+    if service is None:
+        return jsonify({"error": "async_task_service 未初始化"}), 500
+    rec = service.cancel(task_id, by=g.current_user.get("username"))
+    if not rec:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(rec)
+
+
+@admin_bp.post("/async-tasks/<task_id>/refresh")
+@_login_required()
+def refresh_async_task(task_id):
+    """强制同步一次 agent 状态。前端 UI 上的"刷新"按钮用。"""
+    service = getattr(_runtime(), "async_task_service", None)
+    if service is None:
+        return jsonify({"error": "async_task_service 未初始化"}), 500
+    rec = service.get(task_id, refresh=True)
+    if not rec:
+        return jsonify({"error": "not_found"}), 404
+    return jsonify(rec)
+
+
 # ---------- chat sessions for the current user (for chat history page) ----------
 
 @admin_bp.get("/chat/sessions")

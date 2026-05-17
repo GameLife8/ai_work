@@ -11,6 +11,7 @@ from ops_platform import (
     SkillInvoker,
     SkillRegistry,
 )
+from ops_platform.async_tasks import AsyncTaskService, attach_async_task_service
 from ops_platform.http_skill_loader import HttpSkillLoader
 from ops_platform.http_skill_seeds import seed_default_http_skills
 from ops_platform.loader import load_skills_from_package
@@ -52,6 +53,7 @@ class AppRuntime:
     runbook_registry: RunbookRegistry
     http_skill_loader: HttpSkillLoader
     mcp_skill_loader: MCPSkillLoader
+    async_task_service: AsyncTaskService | None = None
 
 
 def create_runtime(config_cls=Config) -> AppRuntime:
@@ -124,6 +126,15 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     except Exception as exc:    # noqa: BLE001
         import logging
         logging.getLogger(__name__).warning("MCP skill 初次加载失败（不阻塞启动）：%s", exc)
+
+    # ---- AsyncTaskService：异步宿主机任务的平台门面 ----
+    # 必须在 connection_manager 之后构造（依赖它解析 host_agent client）。
+    # 内部启动后台 poller 线程跑（daemon），进程退出自动收尾。
+    try:
+        attach_async_task_service(runtime, start_poller=True)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("AsyncTaskService 初始化失败（不阻塞启动）")
 
     _attach_refresh_method(runtime, config_cls)
     _log_data_source_state(runtime, config_cls)

@@ -38,3 +38,21 @@ class SkillContext:
                 f"未找到 {type_code} 类型的接入；请在管理员后台先创建 Connection 或在会话里选择。"
             )
         return manager.get_client(default["id"])
+
+    def resolve_connection_id(
+        self,
+        type_code: str,
+        override_id: str | None = None,
+    ) -> str | None:
+        """返回当前会话/参数最终解析到的 connection_id。
+
+        给"需要把 connection_id 入库审计"的 skill 用——比如 async task 落库时
+        要知道是哪条接入提交的，``connection_for`` 只返回 client，不暴露 ID。
+        """
+        if override_id:
+            return override_id
+        selected = self.selected_connections.get(type_code)
+        if selected:
+            return selected
+        default = self.runtime.connection_manager.get_default(type_code)
+        return (default or {}).get("id")

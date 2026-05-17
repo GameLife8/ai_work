@@ -17,6 +17,7 @@ const routes = [
       { path: 'runbook-runs', component: () => import('./views/RunbookRuns.vue'), meta: { adminOnly: true } },
       { path: 'prompts', component: () => import('./views/Prompts.vue'), meta: { adminOnly: true } },
       { path: 'pending', component: () => import('./views/PendingActions.vue') },
+      { path: 'async-tasks', component: () => import('./views/AsyncTasks.vue') },
       { path: 'users', component: () => import('./views/Users.vue'), meta: { adminOnly: true } },
       { path: 'audit', component: () => import('./views/Audit.vue'), meta: { adminOnly: true } },
     ],

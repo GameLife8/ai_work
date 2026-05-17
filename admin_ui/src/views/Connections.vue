@@ -42,7 +42,7 @@
       <el-table-column label="类型" width="120">
         <template #default="{ row }">
           <el-tooltip :content="typeTooltip(row.type_code)" placement="right" :show-after="200">
-            <span class="code-mono type-code-pill" :style="{background: typeColor(row.type_code)}">{{ row.type_code }}</span>
+            <span class="code-mono">{{ row.type_code }}</span>
           </el-tooltip>
         </template>
       </el-table-column>
@@ -202,7 +202,10 @@ const TYPE_HELP = [
 ]
 const TYPE_HELP_MAP = Object.fromEntries(TYPE_HELP.map(t => [t.code, t]))
 
-function typeColor(code) { return TYPE_HELP_MAP[code]?.color || '#94a3b8' }
+// typeColor 之前给表格"类型"列的彩色徽章用；用户反馈想保留原始的等宽字体纯文本，
+// 已去掉徽章效果。颜色现在只在顶部"什么是接入类型？"面板的卡片里出现，那里直接
+// 用 t.color，所以不再需要这个函数。
+
 function typeTooltip(code) {
   const t = TYPE_HELP_MAP[code]
   if (!t) return code

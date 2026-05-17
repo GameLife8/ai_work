@@ -1,7 +1,34 @@
 <template>
   <div>
     <h1 class="page-title">接入管理</h1>
-    <p class="page-subtitle">每个接入是一份某种类型的具体连接配置（凭证 + 地址）。同类型可存多份，会话/skill 调用时按 connection_id 路由。</p>
+    <p class="page-subtitle">
+      每个接入是一份某种类型的具体连接配置（凭证 + 地址）。同类型可存多份，会话/skill 调用时按 connection_id 路由。
+      <el-link type="primary" :underline="false" @click="showTypeHelp = !showTypeHelp" style="margin-left: 8px">
+        {{ showTypeHelp ? '收起' : '什么是接入类型？' }}
+      </el-link>
+    </p>
+
+    <el-alert v-if="showTypeHelp" type="info" :closable="false" style="margin-bottom: 14px">
+      <div class="type-help">
+        <p class="help-intro">
+          一个真实集群通常需要 <b>多种类型的接入同时存在</b>——它们职责不同，配合工作。
+          以"SWS Swarm 集群"举例：
+          <code>swarm</code> 类型管 docker manager（看服务/扩缩容），
+          <code>host_agent</code> 类型管每个节点上的诊断 Agent（在宿主机执行命令）。
+          用<b>标签</b>把同一集群的多个接入聚合成"逻辑集群"，LLM 路由时识别。
+        </p>
+        <div class="type-grid">
+          <div class="type-card" v-for="t in TYPE_HELP" :key="t.code">
+            <div class="type-card-head">
+              <span class="code-mono type-code-pill" :style="{background: t.color}">{{ t.code }}</span>
+              <span class="type-name">{{ t.name }}</span>
+            </div>
+            <div class="type-desc">{{ t.desc }}</div>
+            <div class="type-when" v-if="t.when">何时用：{{ t.when }}</div>
+          </div>
+        </div>
+      </div>
+    </el-alert>
 
     <div class="toolbar">
       <el-button type="primary" @click="openCreate">+ 新增接入</el-button>
@@ -14,7 +41,9 @@
     <el-table :data="rows" v-loading="loading" stripe>
       <el-table-column label="类型" width="120">
         <template #default="{ row }">
-          <span class="code-mono">{{ row.type_code }}</span>
+          <el-tooltip :content="typeTooltip(row.type_code)" placement="right" :show-after="200">
+            <span class="code-mono type-code-pill" :style="{background: typeColor(row.type_code)}">{{ row.type_code }}</span>
+          </el-tooltip>
         </template>
       </el-table-column>
       <el-table-column prop="name" label="名称" />
@@ -121,8 +150,64 @@ import CodeEditor from '../components/CodeEditor.vue'
 
 const rows = ref([]); const drivers = ref([]); const loading = ref(false)
 const typeFilter = ref('')
+const showTypeHelp = ref(false)
 const dlg = ref({ show: false, id: null, form: { type_code: '', name: '', alias: '', is_default: false, tags: [], config: {} } })
 const currentFields = computed(() => drivers.value.find(d => d.type === dlg.value.form.type_code)?.fields || [])
+
+// 接入类型解释——给运维快速理解每种 type 的职责。
+// 颜色按 category 区分：监控蓝、容器编排紫、宿主层橙、其他灰。
+const TYPE_HELP = [
+  {
+    code: 'zabbix', name: 'Zabbix 监控',
+    color: '#3b82f6',
+    desc: '对接 Zabbix API，拉主机/服务指标、告警事件、历史趋势。',
+    when: '需要看 CPU/内存/磁盘趋势或告警时间线时。',
+  },
+  {
+    code: 'swarm', name: 'Docker Swarm 集群',
+    color: '#7c3aed',
+    desc: '对接 Swarm manager 的 docker daemon（DOCKER_HOST=tcp://...），管服务（list/scale/rollout/inspect）。',
+    when: '看服务副本状态、调副本数、回滚镜像、查失败 Task 时。',
+  },
+  {
+    code: 'k8s', name: 'Kubernetes 集群',
+    color: '#7c3aed',
+    desc: '用 kubeconfig 调 K8s API Server，管 Pod/Deployment/DaemonSet/Node。',
+    when: '看 pod 状态、describe pod、滚动重启 deployment、看 node 容量时。',
+  },
+  {
+    code: 'host_agent', name: '节点诊断 Agent',
+    color: '#ea580c',
+    desc: '对接每个节点上跑的 ai-ops-agent（DaemonSet/global service），用 HTTP /v1/exec 在宿主机 namespace 跑 ss/iptables/tcpdump/dmesg/du/find 等取证命令。',
+    when: '需要进宿主机执行命令——网络/磁盘/内核取证、长命令异步任务。',
+  },
+  {
+    code: 'http_api', name: 'HTTP API（外部系统）',
+    color: '#64748b',
+    desc: '通用 HTTP 接入。配 base_url + auth 后，配合"HTTP Skill"可包装任意外部 REST API 成 skill。',
+    when: '想把工单/CMDB/堡垒机这类系统的 API 接进来给 LLM 调时。',
+  },
+  {
+    code: 'mcp_client', name: '外部 MCP Server',
+    color: '#64748b',
+    desc: '反向接入符合 Anthropic MCP 协议的外部工具服务，启动时拉远端 tools 列表注册成本地 skill。',
+    when: '已有 MCP server 想直接复用其 tools 时。',
+  },
+  {
+    code: 'alert_analysis', name: '内置告警分析',
+    color: '#94a3b8',
+    desc: '平台内部驱动，不连外部服务。结构化解析 Zabbix/普罗等系统推过来的 alert payload。',
+    when: '系统自带，一般不用动。',
+  },
+]
+const TYPE_HELP_MAP = Object.fromEntries(TYPE_HELP.map(t => [t.code, t]))
+
+function typeColor(code) { return TYPE_HELP_MAP[code]?.color || '#94a3b8' }
+function typeTooltip(code) {
+  const t = TYPE_HELP_MAP[code]
+  if (!t) return code
+  return `${t.name}：${t.desc}` + (t.when ? `\n何时用：${t.when}` : '')
+}
 
 function statusTag(s) {
   if (s === 'ok' || s === 'healthy') return 'success'
@@ -242,5 +327,61 @@ async function onDelete(row) {
   font-size: 11px;
   color: var(--text-muted);
   font-family: var(--font-mono);
+}
+
+/* 类型徽章——色块 + 等宽字体，鼠标悬停看完整描述 */
+.type-code-pill {
+  display: inline-block;
+  padding: 2px 8px;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.3px;
+  white-space: nowrap;
+  cursor: help;
+}
+
+/* 类型帮助面板 */
+.type-help { font-size: 13px; }
+.help-intro {
+  color: var(--text-secondary);
+  margin: 0 0 12px;
+  line-height: 1.7;
+}
+.help-intro code {
+  background: rgba(15, 23, 42, 0.06);
+  padding: 1px 6px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.type-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 10px;
+}
+.type-card {
+  background: #fff;
+  border: 1px solid var(--border-soft, #e2e8f0);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.type-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.type-name { font-weight: 600; font-size: 13px; }
+.type-desc {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.type-when {
+  margin-top: 4px;
+  color: #16a34a;
+  font-size: 12px;
 }
 </style>

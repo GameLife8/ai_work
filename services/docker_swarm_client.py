@@ -43,12 +43,16 @@ class DockerSwarmClient:
         self.log_max_tail = log_max_tail
 
     def healthcheck(self) -> dict:
+        # 历史遗留：原本有个 ``self.docker_runner`` 字段（用来跑命令的辅助对象），
+        # 后来重构成直接 ``docker_bin + DOCKER_HOST`` 走 subprocess，这里字段一直
+        # 没删，admin 点验证按钮时报 AttributeError。现在改成回显 docker_bin
+        # 让运维知道实际用的哪个 CLI binary。
         result = self.run(["info", "--format", "{{json .Swarm}}"])
         return {
             "healthy": result.ok,
             "stdout": result.stdout,
             "stderr": result.stderr,
-            "runner": self.docker_runner,
+            "docker_bin": self.docker_bin,
             "docker_host": self.docker_host,
         }
 

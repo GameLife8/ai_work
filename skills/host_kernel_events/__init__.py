@@ -1,21 +1,39 @@
+"""宿主机内核事件（dmesg）—— 薄包装 + 老节点 dmesg 兼容性 fallback。
+
+为什么保留这个 skill 而不是直接用 host_query
+============================================
+``host_query(command='dmesg --time-format iso')`` 在 CentOS 7 / SLES 12 这类
+util-linux < 2.30 的老节点上**会直接报错**——这些节点的 dmesg 不识别
+``--time-format`` flag。
+
+模型不知道这种兼容性细节。本 skill 封装三段降级：
+  1. ``dmesg --time-format iso --ctime``  (util-linux ≥ 2.30 / CentOS 8+)
+  2. ``dmesg -T``                         (util-linux ≥ 2.20 / CentOS 7)
+  3. ``dmesg``                            (任何版本，无时间戳)
+
+每步失败就降级一次。配合 ``scanners.host_kernel`` 自动识别 OOM killer / conntrack
+table full / 磁盘 I/O 错误。
+
+这是 host_query 体系**唯一保留的薄包装**，理由：兼容性逻辑无法靠 description 引导。
+"""
+
 from __future__ import annotations
 
-from ops_platform.signals import (
-    SEV_CRITICAL, SEV_WARNING,
-    SIG_CONNTRACK_FULL,
-    SIG_DISK_IO_ERROR,
-    SIG_OOM_LOG,
-    attach, signal,
-)
+from ops_platform.scanners import host_kernel as scan_kernel
+from ops_platform.signals import attach
+
 
 MANIFEST = {
     "code": "host_kernel_events",
-    "name": "宿主机内核事件",
+    "name": "宿主机内核事件（带老节点兼容）",
     "description": (
-        "拉取节点的 ``dmesg`` 最近 N 行（默认 200），可选关键词过滤。"
-        "用于发现：OOM killer / conntrack table full / network drop / 文件系统 I/O 错误 / "
-        "TCP 限流（tcp_collapse） / iptables nf_table 警告 / NFS RPC error 等。"
+        "拉取节点 ``dmesg`` 最近 N 行（默认 200），可选关键词过滤。**自动处理老 CentOS 7 / "
+        "SLES 12 的 dmesg flag 兼容**：先试 ``--time-format iso --ctime``，失败降到 ``-T``，"
+        "再失败就用裸 ``dmesg``。"
+        "**用于发现**：OOM killer / conntrack table full / network drop / 文件系统 I/O 错误 / "
+        "TCP 限流 / iptables nf_table 警告 / NFS RPC error 等。"
         "**关键词建议**：oom / conntrack / drop / blocked / nfs / xfs / ext4 / nf_table。"
+        "返回的 ``_signals`` 自动识别 OOM / conntrack 满 / 磁盘 I/O 错误并 pivot。"
     ),
     "category": "host",
     "required_connection_type": "host_agent",
@@ -34,45 +52,6 @@ MANIFEST = {
 }
 
 
-def _extract_kernel_signals(node: str, events_text: str) -> list[dict]:
-    sigs: list[dict] = []
-    low = (events_text or "").lower()
-    if "out of memory" in low or "killed process" in low or "invoked oom-killer" in low:
-        # 抓一行作为证据
-        sample = ""
-        for line in events_text.splitlines():
-            if "out of memory" in line.lower() or "killed process" in line.lower():
-                sample = line.strip()
-                break
-        sigs.append(signal(
-            SIG_OOM_LOG, severity=SEV_CRITICAL,
-            evidence=f"节点 {node} 内核日志中检测到 OOM killer 事件：{sample[:160]}",
-            next_skill="zabbix_get_host_overview",
-            next_args={"host_query": node},
-            context={"node": node},
-        ))
-    if "nf_conntrack: table full" in low:
-        # 降级为 warning：conntrack 满通常是瞬时高并发，几秒内自愈，不算 critical 故障
-        # （要做 critical 升级需要看是否持续命中 / 是否有 dropped 包统计）
-        sigs.append(signal(
-            SIG_CONNTRACK_FULL, severity=SEV_WARNING,
-            evidence=f"节点 {node} conntrack 表满（nf_conntrack: table full），新连接将被丢",
-            next_skill="host_iptables_dump",
-            next_args={"node": node},
-            context={"node": node},
-        ))
-    if "i/o error" in low or "ata.*error" in low or "blk_update_request" in low:
-        # 磁盘 IO 错误保持 critical —— 硬件层面警示
-        sigs.append(signal(
-            SIG_DISK_IO_ERROR, severity=SEV_CRITICAL,
-            evidence=f"节点 {node} 内核报磁盘 I/O 错误，硬件层面有风险",
-            next_skill="zabbix_get_host_storage_overview",
-            next_args={"host_query": node},
-            context={"node": node},
-        ))
-    return sigs
-
-
 def run(
     ctx,
     *,
@@ -81,12 +60,7 @@ def run(
     keyword: str | None = None,
     connection_id: str | None = None,
 ) -> dict:
-    """三段式 fallback 兼容老 dmesg：
-       1. ``dmesg --time-format iso --ctime``  (util-linux ≥ 2.30，CentOS 8+)
-       2. ``dmesg -T``                          (util-linux ≥ 2.20，CentOS 7)
-       3. ``dmesg``                              (任何版本，无时间戳)
-    每次失败就降级一次，避免老节点（CentOS 7 / SLES 12）直接挂掉。
-    """
+    """三段式 fallback 兼容老 dmesg。"""
     client = ctx.connection_for("host_agent", connection_id)
 
     attempts = (
@@ -101,15 +75,14 @@ def run(
         if result.ok and result.stdout:
             used_cmd = " ".join(cmd)
             break
-        # stderr 出现 unrecognized option / invalid option / unknown 就降级
         err_low = (result.stderr or "").lower()
         if not any(t in err_low for t in (
             "unrecognized option", "invalid option", "unknown option",
         )):
-            # 不是 flag 兼容性问题，没必要再降级
+            # 非 flag 兼容性问题，没必要继续降级
             used_cmd = " ".join(cmd)
             break
-        used_cmd = " ".join(cmd)   # 记最后一次尝试的 cmd
+        used_cmd = " ".join(cmd)
 
     lines = (result.stdout if result else "").splitlines()
     if keyword:
@@ -126,4 +99,4 @@ def run(
         "ok": bool(result and result.ok),
         "stderr": (result.stderr if result else "")[:2000],
     }
-    return attach(payload, _extract_kernel_signals(node, events))
+    return attach(payload, scan_kernel.scan(node, events))

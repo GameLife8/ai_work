@@ -5,6 +5,15 @@
 
 新增剧本只要往 ``DEFAULT_RUNBOOKS`` 里加一项；改动现有剧本时，admin 在后台编辑覆盖
 即可，下次 restart 不会被 seed 覆盖（只在表为空时 seed）。
+
+重构注 (skill 体系简化)
+------------------------
+原 runbook 引用的浅封装 skill 已被通用查询 skill 替代：
+- ``swarm_check_service_health`` / ``swarm_get_failed_tasks`` / ``swarm_get_service_detail``
+  / ``swarm_get_service_logs_filter``    →  ``swarm_query`` 配 category/verb
+- ``k8s_list_pods`` / ``k8s_describe_pod`` / ``k8s_get_pod_logs``  →  ``kube_query``
+- ``host_socket_overview`` / ``host_iptables_dump`` / ``host_route_overview``
+  / ``host_kernel_events``                                         →  ``host_query``
 """
 
 from __future__ import annotations
@@ -37,39 +46,29 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
         "description": "覆盖大多数 Swarm 服务异常根因：OOM / 磁盘满 / 镜像拉不下来 / 配置错。",
         "triggers": ["起不来", "启动失败", "不停重启", "CrashLoop", "swarm 异常", "服务异常"],
         "inputs": ["service_name"],
-        "start_node": "health",
+        "start_node": "status",
         "max_total_seconds": 240,
         "nodes": {
-            "health": {
-                "skill": "swarm_check_service_health",
-                "description": "总览：副本/更新状态/失败任务",
-                "args": {"service_name": "$user.service_name"},
-                "edges": [{"target": "tasks"}],
+            "status": {
+                "skill": "swarm_query",
+                "description": "服务整体状态（副本/更新状态）",
+                "args": {"category": "service", "verb": "inspect",
+                         "name": "$user.service_name"},
+                "edges": [{"target": "failed_tasks"}],
             },
-            "tasks": {
-                "skill": "swarm_get_failed_tasks",
+            "failed_tasks": {
+                "skill": "swarm_query",
                 "description": "近期失败任务的 exit code + Node",
-                "args": {"service_name": "$user.service_name"},
+                "args": {"category": "service", "verb": "ps",
+                         "name": "$user.service_name",
+                         "filters": {"desired-state": "failed"}},
                 "edges": [
-                    # OOM 信号 → 直接查宿主机内存
-                    {
-                        "target": "host_overview",
-                        "label": "if oom_kill",
-                        "when": {"type": "has_signal", "signal_type": "oom_kill"},
-                    },
-                    # 磁盘信号 → 查宿主机存储
-                    {
-                        "target": "host_storage",
-                        "label": "if no_space",
-                        "when": {"type": "has_signal", "signal_type": "no_space_left"},
-                    },
-                    # 镜像拉取失败 → 查 service 详情
-                    {
-                        "target": "service_detail",
-                        "label": "if image_pull_fail",
-                        "when": {"type": "has_signal", "signal_type": "image_pull_fail"},
-                    },
-                    # 兜底：所有情况都额外抓一遍 error 日志
+                    {"target": "host_overview", "label": "if oom_kill",
+                     "when": {"type": "has_signal", "signal_type": "oom_kill"}},
+                    {"target": "host_storage", "label": "if no_space",
+                     "when": {"type": "has_signal", "signal_type": "no_space_left"}},
+                    {"target": "service_detail", "label": "if image_pull_fail",
+                     "when": {"type": "has_signal", "signal_type": "image_pull_fail"}},
                     {"target": "logs_error"},
                 ],
             },
@@ -88,15 +87,18 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
                 "edges": [{"target": "logs_error"}],
             },
             "service_detail": {
-                "skill": "swarm_get_service_detail",
+                "skill": "swarm_query",
                 "description": "镜像拉取失败：看完整镜像引用 + 凭证配置",
-                "args": {"service_name": "$user.service_name"},
+                "args": {"category": "service", "verb": "inspect",
+                         "name": "$user.service_name"},
                 "on_error": "skip",
             },
             "logs_error": {
-                "skill": "swarm_get_service_logs_filter",
-                "description": "应用层 error 日志",
-                "args": {"service_name": "$user.service_name", "keyword": "error"},
+                "skill": "swarm_query",
+                "description": "应用层 error 日志（关键字过滤）",
+                "args": {"category": "service", "verb": "logs",
+                         "name": "$user.service_name",
+                         "filters": {"grep": "error", "tail": 500}},
                 "on_error": "skip",
                 "edges": [{"target": "logs_oom",
                            "when": {"type": "not", "conditions": [
@@ -104,9 +106,11 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
                            ]}}],
             },
             "logs_oom": {
-                "skill": "swarm_get_service_logs_filter",
+                "skill": "swarm_query",
                 "description": "再换 OOM 关键词捞一次（应用层 java OOM 等）",
-                "args": {"service_name": "$user.service_name", "keyword": "OOM"},
+                "args": {"category": "service", "verb": "logs",
+                         "name": "$user.service_name",
+                         "filters": {"grep": "OOM", "tail": 500}},
                 "on_error": "skip",
             },
         },
@@ -125,47 +129,42 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
         "start_node": "list",
         "nodes": {
             "list": {
-                "skill": "k8s_list_pods",
-                "description": "namespace 下整体状态、谁有问题",
-                "args": {
-                    "namespace": "$user.namespace",
-                    "label_selector": "$user.label_selector",
-                },
+                "skill": "kube_query",
+                "description": "namespace 下整体状态、谁有问题（output=json 让 scanner 自动扫 waiting_reasons）",
+                "args": {"verb": "get", "resource": "pods",
+                         "namespace": "$user.namespace",
+                         "output": "json",
+                         "selector": "$user.label_selector"},
                 "edges": [{"target": "describe"}],
             },
             "describe": {
-                "skill": "k8s_describe_pod",
+                "skill": "kube_query",
                 "description": "看 Events 找根因",
-                # Fallback 链：用户传 → list 里第一个 crashloop pod → 第一个
-                # imagepull 失败 pod → list 第一个 pod。覆盖 "用户没传 pod_name 整
-                # 个诊断链全 skip" 的死路。
+                # Fallback 链：用户传 → list 里 scanner 抓到的 crashloop/imagepull pod →
+                # parsed.items[0]。覆盖 "用户没传 pod_name 整链全 skip" 的死路。
                 "args": {
+                    "verb": "describe",
+                    "resource": "pod",
                     "name": (
                         "$user.pod_name"
                         "||$signals.crash_loop_backoff.next_args.name"
                         "||$signals.image_pull_fail.next_args.name"
-                        "||$nodes.list.pods[0].name"
+                        "||$nodes.list.parsed.items[0].metadata.name"
                     ),
                     "namespace": (
                         "$user.namespace"
                         "||$signals.crash_loop_backoff.next_args.namespace"
-                        "||$nodes.list.pods[0].namespace"
+                        "||$nodes.list.parsed.items[0].metadata.namespace"
                     ),
                 },
                 "on_error": "continue",
                 "edges": [
-                    {
-                        "target": "host_check_oom",
-                        "label": "if oom_kill",
-                        "when": {"type": "has_signal", "signal_type": "oom_kill"},
-                    },
-                    {
-                        "target": "host_check_disk",
-                        "label": "if disk evicted",
-                        "when": {"type": "all_of", "conditions": [
-                            {"type": "has_signal", "signal_type": "pod_evicted"},
-                        ]},
-                    },
+                    {"target": "host_check_oom", "label": "if oom_kill",
+                     "when": {"type": "has_signal", "signal_type": "oom_kill"}},
+                    {"target": "host_check_disk", "label": "if disk evicted",
+                     "when": {"type": "all_of", "conditions": [
+                         {"type": "has_signal", "signal_type": "pod_evicted"},
+                     ]}},
                     {"target": "logs_previous", "label": "if crashloop",
                      "when": {"type": "has_signal", "signal_type": "crash_loop_backoff"}},
                     {"target": "logs_now"},
@@ -184,29 +183,37 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
                 "on_error": "skip",
             },
             "logs_previous": {
-                "skill": "k8s_get_pod_logs",
+                "skill": "kube_query",
                 "description": "CrashLoop 必须 previous=true 看上次崩溃前的输出",
                 "args": {
+                    "verb": "logs",
                     "name": (
                         "$user.pod_name"
                         "||$signals.crash_loop_backoff.next_args.name"
-                        "||$nodes.list.pods[0].name"
+                        "||$nodes.list.parsed.items[0].metadata.name"
                     ),
-                    "namespace": "$user.namespace||$nodes.list.pods[0].namespace",
+                    "namespace": (
+                        "$user.namespace"
+                        "||$nodes.list.parsed.items[0].metadata.namespace"
+                    ),
                     "previous": True,
                 },
                 "on_error": "skip",
             },
             "logs_now": {
-                "skill": "k8s_get_pod_logs",
+                "skill": "kube_query",
                 "description": "当前日志兜底",
                 "args": {
+                    "verb": "logs",
                     "name": (
                         "$user.pod_name"
                         "||$signals.crash_loop_backoff.next_args.name"
-                        "||$nodes.list.pods[0].name"
+                        "||$nodes.list.parsed.items[0].metadata.name"
                     ),
-                    "namespace": "$user.namespace||$nodes.list.pods[0].namespace",
+                    "namespace": (
+                        "$user.namespace"
+                        "||$nodes.list.parsed.items[0].metadata.namespace"
+                    ),
                 },
                 "on_error": "skip",
             },
@@ -232,35 +239,29 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
                 "edges": [{"target": "sockets"}],
             },
             "sockets": {
-                "skill": "host_socket_overview",
+                "skill": "host_query",
                 "description": "宿主机视角看监听端口",
-                "args": {"node": "$user.node", "filter": "$user.port_filter"},
-                "edges": [
-                    {
-                        "target": "iptables",
-                        "label": "if port_not_listening",
-                        "when": {"type": "has_signal", "signal_type": "port_not_listening"},
-                    },
-                    {"target": "iptables"},
-                ],
+                "args": {"node": "$user.node", "command": "ss -ltnup"},
+                "edges": [{"target": "iptables"}],
             },
             "iptables": {
-                "skill": "host_iptables_dump",
-                "description": "看防火墙是否拦了",
-                "args": {"node": "$user.node"},
+                "skill": "host_query",
+                "description": "看防火墙是否拦了端口",
+                "args": {"node": "$user.node", "command": "iptables-save",
+                         "probe_port": "$user.port_filter"},
                 "on_error": "skip",
                 "edges": [{"target": "routes"}],
             },
             "routes": {
-                "skill": "host_route_overview",
-                "description": "路由 + 接口 + netns",
-                "args": {"node": "$user.node"},
+                "skill": "host_query",
+                "description": "路由表",
+                "args": {"node": "$user.node", "command": "ip route"},
                 "on_error": "skip",
                 "edges": [{"target": "kernel"}],
             },
             "kernel": {
                 "skill": "host_kernel_events",
-                "description": "看 conntrack table full / drop / NIC 错",
+                "description": "内核事件（看 conntrack table full / drop / NIC 错；自动兼容老节点 dmesg）",
                 "args": {"node": "$user.node", "keyword": "conntrack"},
                 "on_error": "skip",
             },
@@ -296,7 +297,7 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
             },
             "kernel": {
                 "skill": "host_kernel_events",
-                "description": "Zabbix 看不到的内核层事件（OOM / I/O error / hardware error）",
+                "description": "Zabbix 看不到的内核层事件（OOM / I/O error / hardware error；自动兼容老节点）",
                 "args": {"node": "$user.agent_node", "keyword": "oom"},
                 "if_when": {"type": "field_ne", "path": "$user.agent_node", "value": None},
                 "on_error": "skip",
@@ -329,8 +330,7 @@ def seed_default_runbooks(store) -> dict[str, list[str]]:
         except RunbookLoadError as e:
             seeded[definition.get("key", "?")] = [f"load 失败：{e}"]
             continue
-        # seed 阶段不一定有 skill registry，能拿就拿，拿不到不强制
-        errs = validate_runbook(rb)  # 不传 known_skills，只做结构校验
+        errs = validate_runbook(rb)
         if errs:
             seeded[rb.key] = errs
             logger.warning("seed runbook %s 校验有问题（仍写入，admin 后台修）：%s", rb.key, errs)

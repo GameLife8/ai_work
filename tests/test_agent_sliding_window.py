@@ -114,11 +114,11 @@ def test_pick_fallback_mid_session_uses_critical_signal():
     """有 trace 时优先读 critical signal 推荐的 next_skill。"""
     out = UnifiedOpsAgent._pick_fallback(
         user_message="web 起不来",
-        trace=[{"tool_name": "swarm_check_service_health", "tool_args": {}}],
+        trace=[{"tool_name": "swarm_query", "tool_args": {}}],
         all_signals=[
             # 一条 warning + 一条 critical —— 应该选 critical
             {"type": "permission_denied", "severity": "warning",
-             "next_skill": "swarm_get_service_logs_filter",
+             "next_skill": "swarm_query",
              "next_args": {"service_name": "web", "keyword": "denied"}},
             {"type": "oom_kill", "severity": "critical",
              "next_skill": "zabbix_get_host_overview",
@@ -139,7 +139,7 @@ def test_pick_fallback_skips_already_routed_keys():
                json.dumps({"host_query": "node-3"}, sort_keys=True, ensure_ascii=False))}
     out = UnifiedOpsAgent._pick_fallback(
         user_message="web 起不来",
-        trace=[{"tool_name": "swarm_check_service_health", "tool_args": {}}],
+        trace=[{"tool_name": "swarm_query", "tool_args": {}}],
         all_signals=[
             {"type": "oom_kill", "severity": "critical",
              "next_skill": "zabbix_get_host_overview",
@@ -154,24 +154,24 @@ def test_pick_fallback_skips_already_routed_keys():
 def test_pick_fallback_falls_through_warning_when_no_critical():
     out = UnifiedOpsAgent._pick_fallback(
         user_message="web",
-        trace=[{"tool_name": "swarm_check_service_health", "tool_args": {}}],
+        trace=[{"tool_name": "swarm_query", "tool_args": {}}],
         all_signals=[
             {"type": "permission_denied", "severity": "warning",
-             "next_skill": "swarm_get_service_logs_filter",
+             "next_skill": "swarm_query",
              "next_args": {"service_name": "web", "keyword": "denied"}},
         ],
         force_routed_keys=set(),
     )
     assert out is not None
     name, _args, _reason = out
-    assert name == "swarm_get_service_logs_filter"
+    assert name == "swarm_query"
 
 
 def test_pick_fallback_skips_signals_without_next_skill():
     """没有 next_skill 的 signal（仅证据）不能驱动 pivot——避免给模型乱递空 args。"""
     out = UnifiedOpsAgent._pick_fallback(
         user_message="web",
-        trace=[{"tool_name": "swarm_check_service_health", "tool_args": {}}],
+        trace=[{"tool_name": "swarm_query", "tool_args": {}}],
         all_signals=[
             {"type": "high_cpu", "severity": "critical",
              "evidence": "host 'mystery' CPU 95%"},
@@ -213,7 +213,7 @@ class _ModelEmitsToolThenGoesQuiet:
                 "content": "",
                 "tool_calls": [{
                     "id": "c1", "type": "function",
-                    "function": {"name": "swarm_check_service_health",
+                    "function": {"name": "swarm_query",
                                  "arguments": json.dumps({"service_name": "web"})},
                 }],
             }
@@ -225,7 +225,7 @@ class _ModelEmitsToolThenGoesQuiet:
 
 
 class _SignalEmittingInvoker:
-    """第一次调 swarm_check_service_health 返回 OOM 信号；
+    """第一次调 swarm_query 返回 OOM 信号；
     后续 zabbix_get_host_overview 返回 memory_used_percent=94。"""
 
     def __init__(self) -> None:
@@ -233,7 +233,7 @@ class _SignalEmittingInvoker:
 
     def invoke(self, name, args, ctx):
         self.invocations.append((name, dict(args)))
-        if name == "swarm_check_service_health":
+        if name == "swarm_query":
             return {"skill": name, "status": "ok", "latency_ms": 1, "result": {
                 "service_name": args.get("service_name"),
                 "_signals": [{
@@ -285,7 +285,7 @@ def test_agent_force_routes_on_critical_signal_when_model_silent():
     outcome = agent.ask("web 起不来", user={"role": "admin"}, session_id="s1")
 
     invoked_names = [n for n, _ in runtime.skill_invoker.invocations]
-    # 第一次模型调 swarm_check_service_health；第二次模型空手——agent 应该 force-route 到 host_overview
-    assert invoked_names == ["swarm_check_service_health", "zabbix_get_host_overview"]
+    # 第一次模型调 swarm_query；第二次模型空手——agent 应该 force-route 到 host_overview
+    assert invoked_names == ["swarm_query", "zabbix_get_host_overview"]
     # final report 来自第三轮（模型基于完整上下文给的总结）
     assert "node-3" in outcome.message or "内存压力" in outcome.message

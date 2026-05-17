@@ -128,12 +128,13 @@ _LEGACY_SYSTEM_PROMPT = """
 所以你必须**跨层联动取证**：
 
 1. 容器层信号 → 立刻判断要不要追到主机层。
-   - swarm_get_failed_tasks 的 Node 列 / k8s 的 pod.node 字段 → 当作 zabbix host_query。
+   - swarm_query(verb=ps) 的 Node 列 / kube_query(verb=get,resource=pods,output=json) 的 spec.nodeName
+     → 当作 zabbix host_query。
    - 看到 OOMKilled / exit 137 / Evicted / no space / DiskPressure / connection refused
      这类关键词时，**必须**追加一次 zabbix_get_host_overview 或 zabbix_get_host_storage_overview。
 2. 主机层信号 → 反向回到容器层。
-   - 主机 CPU/MEM/DISK 告警时，确认这台 Node 上跑的服务是否同步异常（swarm_list_services 过滤 Node、
-     或 k8s_list_pods 在该 node 上的 pod）。
+   - 主机 CPU/MEM/DISK 告警时，确认这台 Node 上跑的服务是否同步异常
+     （swarm_query(verb=ls) 看服务、kube_query(verb=get,resource=pods,selector=…) 看 pod）。
 3. 告警 payload → 结构化研判后，按结果展开继续查证（用 alerts_analyze_payload）。
 
 ## 工作流
@@ -304,10 +305,10 @@ class UnifiedOpsAgent:
             "## 路由示例（few-shot）",
             "",
             "用户说「**bigdata6** 节点磁盘看一下」→ bigdata6 命中 `BigData Swarm` 的"
-            "节点命名规律 → 调 ``host_storage_overview`` 时传该集群的 ``connection_id``。",
+            "节点命名规律 → 调 ``host_query(node='bigdata6', command='df -h')`` 传该集群的 ``connection_id``。",
             "",
             "用户说「**codewave** 上 default 命名空间 pod 状态」→ codewave 命中 K8s "
-            "集群的别名 → 调 ``k8s_list_pods`` 传该集群的 ``connection_id``。",
+            "集群的别名 → 调 ``kube_query(verb='get', resource='pods', namespace='default')`` 传该集群的 ``connection_id``。",
             "",
             "用户说「**192.168.2.124** 服务起不来」→ 192.168.2.x 段命中 `SWS Swarm` 的"
             "manager IP → 走 `SWS Swarm` 的 connection_id。",
@@ -605,7 +606,9 @@ class UnifiedOpsAgent:
         if any(k in user_message for k in ["主机情况", "主机状态", "主机概况", "主机概览"]) and host_match:
             return "zabbix_get_host_overview", {"host_query": host_match.group(1)}
         if any(k in user_message for k in ["起不来", "启动失败", "异常", "排查"]) and service_match:
-            return "swarm_check_service_health", {"service_name": service_match.group(1)}
+            # 重构后没有 swarm_check_service_health；改走 swarm_query inspect 作为入口诊断
+            return "swarm_query", {"category": "service", "verb": "inspect",
+                                   "name": service_match.group(1)}
 
         payload_match = re.search(r"(\{[\s\S]*\})", user_message)
         if payload_match:

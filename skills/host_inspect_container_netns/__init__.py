@@ -25,7 +25,7 @@ MANIFEST = {
         "``ss -tnlp / ip a / ip route / iptables-save``。"
         "用于排查「容器自己网络配错 / 容器内监听端口 / 容器看到的路由」。"
         "支持 docker / containerd（自动探测，containerd 集群挂 /run/containerd/containerd.sock 即可）。"
-        "vs ``host_socket_overview`` 看的是宿主机视角；本 skill 看的是容器视角。"
+        "vs ``host_query(command='ss -ltnup')`` 看的是宿主机视角；本 skill 看的是容器视角。"
     ),
     "category": "host",
     "required_connection_type": "host_agent",

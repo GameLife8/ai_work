@@ -170,6 +170,86 @@ class _HttpExec:
             int(data.get("exit_code", -1)),
         )
 
+    # --- 异步任务路径（agent 1.3+） ----------------------------------------- #
+    # 跟同步 /v1/exec 区别：
+    #   - POST /v1/exec_async 立即 201 返回 task_id，命令在 agent 后台跑
+    #   - GET  /v1/task/<id>  轮询状态（running / done / error / timeout / cancelled）
+    #   - DELETE /v1/task/<id> 取消
+    #   - GET  /v1/tasks      列当前节点上的所有任务
+    # 为啥要这条路径：``du -sh /*`` / ``find /`` / ``tcpdump`` 这种命令同步路径
+    # 走完后 HTTP 客户端早超时了，agent 又被 SIGKILL；改成异步后客户端 200ms 拿
+    # task_id 走人，回头慢慢轮询。
+
+    def _request(self, method: str, node_ip: str, path: str, *, json_body: dict | None = None,
+                 timeout_seconds: int | None = None) -> tuple[int, dict]:
+        """通用请求方法。失败时 status_code=-1 + ``{"error": "..."}``，不抛。"""
+        url = f"http://{node_ip}:{self.port}{path}"
+        try:
+            resp = requests.request(
+                method,
+                url,
+                json=json_body,
+                headers={"Authorization": f"Bearer {self.token}"},
+                timeout=timeout_seconds or self.timeout_seconds,
+            )
+        except requests.RequestException as exc:
+            return -1, {"error": f"network error: {exc}"}
+
+        try:
+            data = resp.json() if resp.content else {}
+        except (ValueError, json.JSONDecodeError) as exc:
+            return resp.status_code, {"error": f"bad JSON: {exc}", "raw": resp.text[:500]}
+        return resp.status_code, data
+
+    def exec_async(
+        self,
+        node_ip: str,
+        cmd: list[str],
+        *,
+        nsenter: str = DEFAULT_NSENTER_STR,
+        max_runtime_sec: int | None = None,
+        max_output_bytes: int | None = None,
+    ) -> dict:
+        """提交一个异步任务。返回 agent 的原始 JSON（含 task_id）或 ``{"error": "..."}``。"""
+        body: dict = {
+            "cmd": list(cmd),
+            "nsenter": nsenter or "",
+        }
+        if max_runtime_sec:
+            body["max_runtime_sec"] = int(max_runtime_sec)
+        if max_output_bytes:
+            body["max_output_bytes"] = int(max_output_bytes)
+        # 提交请求本身只要 10s 内回包就行（实际任务在后台跑）
+        status, data = self._request("POST", node_ip, "/v1/exec_async",
+                                     json_body=body, timeout_seconds=10)
+        if status != 201:
+            return {"error": data.get("error") or f"submit failed: status={status}",
+                    "status": status, "raw": data}
+        return data
+
+    def task_get(self, node_ip: str, task_id: str) -> dict:
+        status, data = self._request("GET", node_ip, f"/v1/task/{task_id}", timeout_seconds=10)
+        if status == 200:
+            return data
+        if status == 404:
+            return {"error": "task_not_found", "task_id": task_id, "status": status}
+        return {"error": data.get("error") or f"task_get failed: status={status}",
+                "status": status, "raw": data}
+
+    def task_cancel(self, node_ip: str, task_id: str) -> dict:
+        status, data = self._request("DELETE", node_ip, f"/v1/task/{task_id}", timeout_seconds=10)
+        return data if status in (200, 202) else {
+            "error": data.get("error") or f"cancel failed: status={status}",
+            "status": status, "raw": data,
+        }
+
+    def task_list(self, node_ip: str) -> dict:
+        status, data = self._request("GET", node_ip, "/v1/tasks", timeout_seconds=10)
+        if status == 200:
+            return data
+        return {"error": data.get("error") or f"task_list failed: status={status}",
+                "status": status, "raw": data}
+
 
 # --------------------------------------------------------------------------- #
 # 抽象 + 两种实现
@@ -231,6 +311,59 @@ class HostAgentClient:
     ) -> HostExecResult:
         """子类提供 node→ip 映射后，在这里调用 _HttpExec。"""
         raise NotImplementedError("transport=http 的子类必须实现 _http_exec_with_nsenter")
+
+    # ---- 异步任务（仅 http transport 支持；exec transport 抛 NotImplementedError）---- #
+
+    def exec_async_on_node(
+        self,
+        node: str,
+        cmd: list[str],
+        *,
+        namespaces: tuple[str, ...] = DEFAULT_NSENTER_NS,
+        max_runtime_sec: int | None = None,
+        max_output_bytes: int | None = None,
+    ) -> dict:
+        """提交异步任务（不阻塞）。返回 ``{"task_id": "...", "status": "running", ...}``。
+
+        只在 transport=http 时可用——exec transport（kubectl/docker exec）本质是同步
+        的，agent 退出 = 任务死，无法异步。
+        """
+        if self.transport != "http":
+            raise NotImplementedError(
+                f"transport={self.transport} 不支持异步任务（需要 transport=http）"
+            )
+        ip = self._node_ip(node)
+        ns_str = "".join(namespaces)
+        return self.http.exec_async(
+            ip, cmd, nsenter=ns_str,
+            max_runtime_sec=max_runtime_sec,
+            max_output_bytes=max_output_bytes,
+        )
+
+    def task_get_on_node(self, node: str, task_id: str) -> dict:
+        if self.transport != "http":
+            raise NotImplementedError(
+                f"transport={self.transport} 不支持异步任务查询"
+            )
+        return self.http.task_get(self._node_ip(node), task_id)
+
+    def task_cancel_on_node(self, node: str, task_id: str) -> dict:
+        if self.transport != "http":
+            raise NotImplementedError(
+                f"transport={self.transport} 不支持异步任务取消"
+            )
+        return self.http.task_cancel(self._node_ip(node), task_id)
+
+    def task_list_on_node(self, node: str) -> dict:
+        if self.transport != "http":
+            raise NotImplementedError(
+                f"transport={self.transport} 不支持异步任务列表"
+            )
+        return self.http.task_list(self._node_ip(node))
+
+    def _node_ip(self, node: str) -> str:
+        """子类必须实现：把 node hostname 解析成 agent 监听的 IP。"""
+        raise NotImplementedError
 
     def healthcheck(self) -> dict:
         nodes = self.list_nodes()
@@ -355,6 +488,10 @@ class K8sHostAgent(HostAgentClient):
         return HostExecResult(node=node, command=cmd, stdout=stdout, stderr=stderr,
                               returncode=rc, transport="http")
 
+    # 给基类异步任务路径用——所有 http 调用都走 InternalIP
+    def _node_ip(self, node: str) -> str:
+        return self._node_internal_ip(node)
+
 
 # --------------------------------------------------------------------------- #
 # Swarm 实现：默认 http（exec 在 18.03 不通），可选 exec
@@ -455,3 +592,6 @@ class SwarmHostAgent(HostAgentClient):
         stdout, stderr, rc = self.http.exec(ip, cmd, nsenter=nsenter, timeout=timeout)
         return HostExecResult(node=node, command=cmd, stdout=stdout, stderr=stderr,
                               returncode=rc, transport="http")
+
+    def _node_ip(self, node: str) -> str:
+        return self._node_internal_ip(node)

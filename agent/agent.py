@@ -62,6 +62,7 @@ import ipaddress
 import json
 import logging
 import os
+import secrets
 import signal
 import socket
 import time
@@ -71,7 +72,7 @@ import yaml
 from aiohttp import web
 
 
-AGENT_VERSION = "1.2.0"
+AGENT_VERSION = "1.3.0"
 
 # ---------- 配置 ----------
 
@@ -102,10 +103,17 @@ AGENT_TOOLS_IMAGE = os.getenv("AGENT_TOOLS_IMAGE", "")
 DOCKER_BIN = os.getenv("DOCKER_BIN", "docker")
 
 # 全局上限——单次调用兜底
-MAX_TIMEOUT_SEC = 300
+MAX_TIMEOUT_SEC = 300         # /v1/exec 同步路径硬上限
 MAX_OUTPUT_BYTES = 10 * 1024 * 1024
 DEFAULT_TIMEOUT_SEC = 30
 DEFAULT_OUTPUT_BYTES = 1024 * 1024
+
+# /v1/exec_async 异步路径上限：远比同步路径宽，给 ``du -sh /*`` /
+# ``find / -size`` 这种长任务用
+ASYNC_MAX_RUNTIME_SEC = 30 * 60      # 30 分钟，agent 内强制 SIGKILL
+ASYNC_DEFAULT_RUNTIME_SEC = 5 * 60
+ASYNC_MAX_CONCURRENT_TASKS = 16      # 同时跑的异步任务上限，超就 429
+ASYNC_RETAIN_DONE_SEC = 30 * 60      # 完成后保留结果可查的时长
 
 # 运行时状态（不需要原子操作；GIL 已经保证 int +1 原子）
 _state: dict[str, object] = {
@@ -113,6 +121,7 @@ _state: dict[str, object] = {
     "allowed_commands": set(),
     "start_time": time.time(),
     "exec_count": 0,
+    "tasks": {},                # task_id -> TaskState dict（异步任务）
 }
 
 logger = logging.getLogger("ai-ops-agent")
@@ -505,6 +514,258 @@ async def _sse(resp: web.StreamResponse, event: str, data) -> None:
         raise
 
 
+# ============================================================================
+#  Async task path —— /v1/exec_async / /v1/task/<id>
+# ============================================================================
+#
+# 痛点：``du -sh /*`` 这种命令在大盘上跑 5+ 分钟很正常，远超 ``/v1/exec``
+# 60s 同步上限。直接超时会让 LLM 拿到"已超时无输出"残废结果，写出来的诊断报告毫无价值。
+#
+# 解法：另开一条 ``/v1/exec_async`` 路径——立即返回 task_id，命令在 agent 的
+# asyncio loop 里跑（独立 task），结果累积到内存 ``_state["tasks"]`` 表。
+# 调用方（平台 skill / LLM）轮询 ``GET /v1/task/<id>`` 拿当前状态。
+#
+# 设计取舍：
+#   - 任务**只活在 agent 进程内存里**，agent 容器重启 = 任务消失。这是 acceptable，
+#     因为 swarm/k8s 会自动重启，且任务最长 30min，跨越运维周期窗口短。
+#   - 任务 ASYNC_MAX_CONCURRENT_TASKS=16 上限——防内存爆炸。
+#   - 完成后保留 ASYNC_RETAIN_DONE_SEC=30min 让调用方有机会取结果，之后 GC 掉。
+#   - SIGTERM → 2s → SIGKILL 跟同步路径一致。
+
+
+def _new_task_id() -> str:
+    return secrets.token_urlsafe(16)
+
+
+def _now_iso() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _gc_done_tasks() -> int:
+    """清掉完成超过 ASYNC_RETAIN_DONE_SEC 的任务。返回清掉数。"""
+    tasks: dict = _state["tasks"]
+    now = time.time()
+    purged = 0
+    for tid in list(tasks.keys()):
+        t = tasks[tid]
+        if t.get("status") in {"running"}:
+            continue
+        ended = t.get("_ended_epoch", 0)
+        if ended and (now - ended) > ASYNC_RETAIN_DONE_SEC:
+            del tasks[tid]
+            purged += 1
+    return purged
+
+
+def _running_task_count() -> int:
+    return sum(1 for t in _state["tasks"].values() if t.get("status") == "running")
+
+
+def _public_task_view(t: dict) -> dict:
+    """把内部 TaskState 中"私有字段"剥掉，给 HTTP 客户端用。"""
+    excl = {"_proc", "_runner_task", "_ended_epoch", "_started_epoch", "_max_output_bytes"}
+    return {k: v for k, v in t.items() if k not in excl}
+
+
+async def exec_async(request: web.Request) -> web.Response:
+    """提交一个异步任务，立即返回 task_id。"""
+    _gc_done_tasks()
+    if _running_task_count() >= ASYNC_MAX_CONCURRENT_TASKS:
+        return web.json_response(
+            {"error": "too_many_running_tasks",
+             "running": _running_task_count(),
+             "limit": ASYNC_MAX_CONCURRENT_TASKS},
+            status=429,
+        )
+
+    try:
+        payload = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return web.json_response({"error": "invalid_json"}, status=400)
+
+    try:
+        argv, _ignored_sync_timeout, max_bytes = _build_argv(payload)
+    except PermissionError as exc:
+        return web.json_response({"error": str(exc)}, status=403)
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+
+    # 异步路径用独立的 max_runtime_sec 字段（单位秒），跟同步 timeout_sec 区分
+    max_runtime = float(payload.get("max_runtime_sec") or ASYNC_DEFAULT_RUNTIME_SEC)
+    max_runtime = min(max(max_runtime, 5), ASYNC_MAX_RUNTIME_SEC)
+
+    task_id = _new_task_id()
+    now = time.time()
+    task: dict = {
+        "task_id":     task_id,
+        "status":      "running",        # running / done / timeout / error / cancelled
+        "stdout":      "",
+        "stderr":      "",
+        "exit_code":   None,
+        "started_at":  _now_iso(),
+        "ended_at":    None,
+        "duration_ms": None,
+        "max_runtime_sec": max_runtime,
+        "command":     argv,
+        "nsenter":     payload.get("nsenter", "muinp"),
+        "truncated":   False,
+        "_started_epoch": now,
+        "_max_output_bytes": max_bytes,
+    }
+    _state["tasks"][task_id] = task
+
+    # 在 asyncio loop 里 fire-and-forget 跑 _run_task；不 await
+    runner = asyncio.create_task(_run_task(task_id, argv, max_runtime, max_bytes))
+    task["_runner_task"] = runner
+
+    _state["exec_count"] += 1
+    logger.info("async task %s started: %s", task_id, " ".join(argv[:8]))
+
+    return web.json_response({
+        "task_id":   task_id,
+        "status":    "running",
+        "started_at": task["started_at"],
+        "max_runtime_sec": max_runtime,
+        "poll_endpoint": f"/v1/task/{task_id}",
+    }, status=201)
+
+
+async def _run_task(task_id: str, argv: list[str], max_runtime: float, max_bytes: int) -> None:
+    """真正跑子进程的协程；存活在 agent loop 内，结果回写 _state['tasks'][task_id]。"""
+    task = _state["tasks"].get(task_id)
+    if task is None:
+        return
+
+    started = time.time()
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        task["_proc"] = proc
+    except FileNotFoundError as exc:
+        task.update({
+            "status": "error",
+            "stderr": f"binary_not_found: {exc}",
+            "exit_code": -1,
+            "ended_at": _now_iso(),
+            "duration_ms": int((time.time() - started) * 1000),
+            "_ended_epoch": time.time(),
+        })
+        return
+
+    timed_out = False
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=max_runtime)
+    except asyncio.TimeoutError:
+        timed_out = True
+        proc.terminate()
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=2.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            stdout = stderr = b""
+            try:
+                await proc.wait()
+            except ProcessLookupError:
+                pass
+    except asyncio.CancelledError:
+        # 客户端调了 DELETE /v1/task/<id>
+        proc.kill()
+        try:
+            await proc.wait()
+        except ProcessLookupError:
+            pass
+        task.update({
+            "status": "cancelled",
+            "exit_code": -1,
+            "stderr": "cancelled by client",
+            "ended_at": _now_iso(),
+            "duration_ms": int((time.time() - started) * 1000),
+            "_ended_epoch": time.time(),
+        })
+        return
+
+    sb = stdout or b""
+    se = stderr or b""
+    truncated = False
+    if len(sb) > max_bytes:
+        sb = sb[:max_bytes]
+        truncated = True
+    if len(se) > max_bytes:
+        se = se[:max_bytes]
+        truncated = True
+
+    if timed_out:
+        status = "timeout"
+        exit_code = -1
+        se = se + (f"\n[agent] task exceeded max_runtime_sec={max_runtime}".encode())
+    elif proc.returncode == 0:
+        status = "done"
+        exit_code = 0
+    else:
+        status = "error"
+        exit_code = proc.returncode if proc.returncode is not None else -1
+
+    task.update({
+        "status": status,
+        "stdout": sb.decode("utf-8", errors="replace"),
+        "stderr": se.decode("utf-8", errors="replace"),
+        "exit_code": exit_code,
+        "ended_at": _now_iso(),
+        "duration_ms": int((time.time() - started) * 1000),
+        "truncated": truncated,
+        "_ended_epoch": time.time(),
+    })
+    logger.info(
+        "async task %s finished: status=%s exit=%s duration_ms=%s",
+        task_id, status, exit_code, task["duration_ms"],
+    )
+
+
+async def task_get(request: web.Request) -> web.Response:
+    task_id = request.match_info.get("task_id", "")
+    _gc_done_tasks()
+    task = _state["tasks"].get(task_id)
+    if task is None:
+        return web.json_response({"error": "task_not_found", "task_id": task_id}, status=404)
+    return web.json_response(_public_task_view(task))
+
+
+async def task_cancel(request: web.Request) -> web.Response:
+    task_id = request.match_info.get("task_id", "")
+    task = _state["tasks"].get(task_id)
+    if task is None:
+        return web.json_response({"error": "task_not_found", "task_id": task_id}, status=404)
+    if task["status"] != "running":
+        # 已完成；幂等返回当前状态
+        return web.json_response(_public_task_view(task))
+    runner = task.get("_runner_task")
+    if isinstance(runner, asyncio.Task):
+        runner.cancel()
+    return web.json_response({"task_id": task_id, "status": "cancelling"})
+
+
+async def task_list(_request: web.Request) -> web.Response:
+    """列当前内存里所有任务（含 done/running/error）。给运维排查 + LLM 主动查询用。"""
+    _gc_done_tasks()
+    items = sorted(
+        _state["tasks"].values(),
+        key=lambda t: t.get("_started_epoch", 0),
+        reverse=True,
+    )
+    return web.json_response({
+        "tasks": [_public_task_view(t) for t in items],
+        "running": _running_task_count(),
+        "limits": {
+            "max_concurrent": ASYNC_MAX_CONCURRENT_TASKS,
+            "max_runtime_sec": ASYNC_MAX_RUNTIME_SEC,
+            "retain_done_sec": ASYNC_RETAIN_DONE_SEC,
+        },
+    })
+
+
 # ---------- main ----------
 
 def make_app() -> web.Application:
@@ -513,6 +774,11 @@ def make_app() -> web.Application:
     app.router.add_get("/v1/health", health)
     app.router.add_post("/v1/exec", exec_oneshot)
     app.router.add_post("/v1/exec/stream", exec_stream)
+    # 异步任务
+    app.router.add_post("/v1/exec_async", exec_async)
+    app.router.add_get("/v1/task/{task_id}", task_get)
+    app.router.add_delete("/v1/task/{task_id}", task_cancel)
+    app.router.add_get("/v1/tasks", task_list)
     return app
 
 

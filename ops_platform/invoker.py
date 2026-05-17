@@ -251,9 +251,15 @@ class SkillInvoker:
         "logs", "matched_logs", "events", "describe",
         "stdout", "stderr", "summary",
     }
-    _MAX_FIELD_CHARS = 2000          # 单个文本字段最大字符数
+    # **配置类查询的特殊字段**——这些字段一旦命中就给更宽的预算，因为用户问
+    # "看 stack 配置" 时希望模型把完整 YAML/JSON 贴出来。
+    # ``stdout`` / ``parsed`` 在 kube_query / swarm_query / host_query 里都是
+    # 主要内容字段，太小就丢配置原文。
+    _CONFIG_FIELDS = {"stdout", "parsed"}
+    _MAX_FIELD_CHARS = 2000          # 普通文本字段上限
+    _MAX_CONFIG_CHARS = 6000         # 配置/raw 字段上限（约 200 行 YAML）
     _MAX_LIST_LEN = 12               # 列表只保留前 N 项
-    _TOTAL_BUDGET = 8000             # 整个 tool message 最终字符上限
+    _TOTAL_BUDGET = 24_000           # 整个 tool message 上限（≈ 6K token，给配置类留足空间）
 
     @classmethod
     def serialize_for_model(cls, envelope: dict[str, Any]) -> str:
@@ -281,17 +287,20 @@ class SkillInvoker:
         return cls._final_cap(json.dumps(out, ensure_ascii=False, default=str))
 
     @classmethod
-    def _compact_value(cls, v: Any, depth: int = 0) -> Any:
+    def _compact_value(cls, v: Any, depth: int = 0, *, field_key: str | None = None) -> Any:
+        """递归压缩 result 给模型看。``field_key`` 用于识别"配置类大字段"放宽截断。"""
         if depth > 8:  # 防御深嵌套
             return "[...]"
         if isinstance(v, str):
-            if len(v) <= cls._MAX_FIELD_CHARS:
+            # 配置类大字段（stdout / parsed 等）—— 用更宽的预算保证用户能看到完整 YAML/JSON
+            limit = cls._MAX_CONFIG_CHARS if field_key in cls._CONFIG_FIELDS else cls._MAX_FIELD_CHARS
+            if len(v) <= limit:
                 return v
-            head_len = int(cls._MAX_FIELD_CHARS * 0.6)
-            tail_len = cls._MAX_FIELD_CHARS - head_len
+            head_len = int(limit * 0.7)   # 配置类偏向保留头部（image / env / labels）
+            tail_len = limit - head_len
             return (
                 v[:head_len]
-                + f"\n...[middle {len(v) - cls._MAX_FIELD_CHARS}c truncated; full in trace]\n"
+                + f"\n...[middle {len(v) - limit}c truncated; full in trace]\n"
                 + v[-tail_len:]
             )
         if isinstance(v, list):
@@ -302,7 +311,8 @@ class SkillInvoker:
             return [cls._compact_value(x, depth + 1) for x in v]
         if isinstance(v, dict):
             return {
-                k: cls._compact_value(val, depth + 1)
+                # 把当前 key 传下去，让子字符串能识别"自己处在配置类字段路径上"
+                k: cls._compact_value(val, depth + 1, field_key=k if isinstance(k, str) else None)
                 for k, val in v.items()
                 if not (isinstance(k, str) and k.startswith("_") and k != "_signals")
             }

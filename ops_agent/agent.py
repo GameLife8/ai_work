@@ -49,6 +49,210 @@ _SUMMARY_PROMPT = (
 )
 
 
+# ----- 意图分类 + 输出模式动态注入 ---------------------------------------- #
+#
+# 设计：基于用户当前消息的中文关键词识别 8 类意图，命中后返回一段"重申输出模式"
+# 的 system 提示。这段紧贴当前 user message 注入，比开头长篇 system prompt 更显眼，
+# 显著提升模型遵循对应输出模式的概率。
+#
+# 关键词按"专属程度"匹配——查看类（"看一下"+"配置/YAML/原文"组合）专属性强，
+# 优先匹配；闲聊类专属性弱，最后兜底。
+
+# 触发词字典：意图 → 关键词列表（OR 关系）
+_INTENT_KEYWORDS: dict[str, list[str]] = {
+    # B 类：查看 / 配置原文 (强专属)
+    "config_view": [
+        "yaml", "json", "原始", "原文", "完整配置", "完整 yaml", "完整 json",
+        "配置文件", "配置内容", "配置详情", "raw", "spec",
+        "看一下配置", "看看配置", "展示配置",
+        "ConfigMap", "configmap", "Secret",
+        # 镜像/env 类
+        "环境变量", "挂载配置", "镜像配置",
+    ],
+    # F 类：异步长任务
+    "async_task": [
+        "异步", "长命令", "跑一会", "后台跑",
+        "du -sh", "find /", "journalctl", "tcpdump",
+        "看刚才那个任务", "任务跑完了吗", "任务结果",
+    ],
+    # E 类：写操作
+    "write_action": [
+        "重启服务", "扩容", "缩容", "扩到", "缩到", "扩成", "改成",
+        "回滚", "删除服务", "下线服务", "强制更新", "改镜像",
+        "替换镜像", "重新部署", "升级版本",
+    ],
+    # D 类：资源 / 监控
+    "monitor": [
+        "CPU", "cpu", "内存", "memory", "磁盘", "disk", "IO", "io",
+        "负载", "load", "趋势", "峰值", "近 1 小时", "近 N 小时", "网络流量",
+    ],
+    # C 类：列表 / 状态总览
+    "list_state": [
+        "列一下", "列出", "都有哪些", "有哪些", "多少个",
+        "全部服务", "全部 pod", "全部 deployment", "所有",
+        "状态总览", "概况", "概览",
+    ],
+    # G 类：知识 / 引导
+    "knowledge": [
+        "怎么排查", "怎么诊断", "怎么用", "应该用什么",
+        "有哪些剧本", "有哪些 runbook", "有哪些工具",
+        "教我", "推荐一个", "建议怎么",
+    ],
+    # H 类：闲聊 / 不明
+    "chat_intro": [
+        "你好", "你是谁", "你能做什么", "你能干啥", "能问什么",
+        "介绍下", "你有什么功能",
+    ],
+    # A 类（诊断）兜底，靠关键词识别强信号
+    "diagnose": [
+        "为什么", "起不来", "启动失败", "失败", "异常", "报错", "出错",
+        "crashloop", "CrashLoop", "OOM", "oomkilled", "evicted",
+        "连不上", "不通", "丢包", "502", "504", "卡顿", "慢",
+        "排查", "诊断", "分析下", "看看怎么回事",
+    ],
+}
+
+
+_INTENT_HINTS: dict[str, str] = {
+    "config_view": (
+        "🎯 **本次用户意图：查看 / 配置 / 看原文（B 类）**\n"
+        "**必须按这个格式输出**：\n"
+        "1. 先用 ```yaml 或 ```json 代码块原样贴 skill 返回的原始内容（取 result.parsed "
+        "或 result.stdout）。完整、不重排、不省字段。如果太长就贴关键段。\n"
+        "2. 再用 1–3 段中文逐项翻译关键配置（image / replicas / networks / labels / "
+        "placement / healthcheck / env / mounts）。\n"
+        "3. 可选给一句运维建议。\n"
+        "**严禁**跳过原文直接概括成「该服务是 X，运行健康……」。"
+    ),
+    "list_state": (
+        "🎯 **本次用户意图：列表 / 状态总览（C 类）**\n"
+        "**必须按这个格式输出**：\n"
+        "1. 用 markdown 表格列关键字段（名字 / 状态 / 副本 / 重启次数 / 创建时间 / Node）。\n"
+        "2. 异常项行首加 ⚠️ 或 🚨；行末注一句原因。\n"
+        "3. 表格下方给 1–2 句总览结论：「共 N 个，M 个异常」。\n"
+        "4. 有异常时追问：「想详细看哪一个？」\n"
+        "**严禁**写成段落式分析报告。"
+    ),
+    "monitor": (
+        "🎯 **本次用户意图：资源 / 性能监控（D 类）**\n"
+        "**必须按这个格式输出**：\n"
+        "1. markdown 表格展示「指标 / 当前值 / 阈值 / 状态(✅/⚠️/🚨)」。\n"
+        "2. 1–2 段解读：哪个指标接近/超阈，趋势怎样，可能影响什么。\n"
+        "3. 一句下一步建议。\n"
+        "**严禁**只贴一大段文字描述。"
+    ),
+    "write_action": (
+        "🎯 **本次用户意图：执行写操作（E 类）**\n"
+        "调用对应写 skill 后会返回 ``status=needs_confirmation``。**禁止再调任何 tool**。\n"
+        "用中文清楚说明四点：(1) 打算做什么 (2) 为什么 (3) 影响范围 (4) 回滚方式，\n"
+        "然后提示「请在下方点击确认/取消」。如果 ``requires_admin_approval=True``，\n"
+        "明确说「需 admin 审批」。"
+    ),
+    "async_task": (
+        "🎯 **本次用户意图：异步长任务（F 类）**\n"
+        "估计 > 30s 的命令一律用 ``host_run_command_async``。\n"
+        "提交时给「task_id + 节点 + 命令 + 预计时长」的简短回执，结束本轮。\n"
+        "查询任务时调 ``host_check_task``，把 stdout 用代码块贴出来。"
+    ),
+    "knowledge": (
+        "🎯 **本次用户意图：知识 / 引导（G 类）**\n"
+        "用结构化清单输出：(1) 一句话引言；(2) 编号的步骤列表（每步对应 skill）；\n"
+        "(3) 关键注意点；(4) 如果有现成 runbook，告诉用户直接调 ``platform_run_runbook``。"
+    ),
+    "chat_intro": (
+        "🎯 **本次用户意图：闲聊 / 自介（H 类）**\n"
+        "简短一句自我介绍，列 4–6 个场景化能力（诊断 / 看配置 / 查状态 / 监控 / "
+        "执行操作 / 长任务），邀请用户给具体场景。\n"
+        "**严禁**堆砌 skill 列表 / 长篇大论。"
+    ),
+    "diagnose": (
+        "🎯 **本次用户意图：诊断 / 排障（A 类）**\n"
+        "按五段式中文报告输出：**当前状态** / **检测过程** / **关键证据**（用代码块引用原文）"
+        " / **判断结论**（不确定就写「高度疑似 + 备选」）/ **建议操作**（具体可执行）。"
+    ),
+}
+
+
+def _classify_intent(user_message: str) -> str | None:
+    """识别用户当前消息的意图标签（8 类之一）。
+
+    匹配优先级：config_view（强专属）> async_task > write_action > monitor >
+    list_state > knowledge > chat_intro > diagnose。
+    """
+    if not user_message:
+        return None
+    text = user_message.lower()
+    priority = ["config_view", "async_task", "write_action", "monitor",
+                "list_state", "knowledge", "chat_intro", "diagnose"]
+    for intent in priority:
+        for kw in _INTENT_KEYWORDS.get(intent, []):
+            if kw.lower() in text:
+                return intent
+    return None
+
+
+def _classify_intent_hint(user_message: str) -> str | None:
+    """根据用户消息返回对应输出模式的强化提示（注入到 system role）。"""
+    intent = _classify_intent(user_message)
+    return _INTENT_HINTS.get(intent) if intent else None
+
+
+def _augment_message_for_intent(message: str, trace: list[dict], user_message: str) -> str:
+    """**平台保证机制**：模型偷懒不照输出模式办的时候，平台兜底补全。
+
+    现在覆盖最关键的一个：
+    - 用户问"查看 / 配置 / yaml"类问题，但模型回答里**没有 ``` 代码块**
+    - 平台自动从 trace 抽 stdout / parsed 字段拼一段"## 📋 完整原始配置"附在末尾
+
+    其他意图（list/monitor/...）模型遵循率高，先不强补，留观察。
+    """
+    if not message:
+        return message
+    intent = _classify_intent(user_message)
+    if intent != "config_view":
+        return message
+    # 已有代码块 → 模型自己贴了，不动
+    if "```" in message:
+        return message
+
+    # 从 trace 里抽最后一次 ok 的 kube_query / swarm_query / host_query 结果
+    raw_text = ""
+    raw_lang = "yaml"
+    for item in reversed(trace):
+        if item.get("status") != "ok":
+            continue
+        tool = item.get("tool_name", "")
+        if tool not in ("kube_query", "swarm_query", "host_query"):
+            continue
+        result = item.get("tool_result") or {}
+        # 优先取 stdout / parsed 字段
+        stdout = result.get("stdout") or ""
+        parsed = result.get("parsed")
+        if parsed:
+            try:
+                # parsed 是 dict/list，序列化成漂亮 JSON
+                raw_text = json.dumps(parsed, ensure_ascii=False, indent=2, default=str)
+                raw_lang = "json"
+                break
+            except Exception:
+                pass
+        if stdout and isinstance(stdout, str) and stdout.strip():
+            raw_text = stdout
+            raw_lang = "yaml" if any(c in stdout[:200] for c in (":", "-")) else "text"
+            break
+    if not raw_text:
+        return message
+    # 太长截到 12K 字符（用户能 scroll 看完）
+    if len(raw_text) > 12_000:
+        raw_text = raw_text[:12_000] + "\n# ...（更多内容已截断，完整原文在 trace 里）"
+    return (
+        message.rstrip()
+        + "\n\n---\n\n"
+        + "## 📋 完整原始配置（平台自动补全——模型未单独贴出来）\n\n"
+        + f"```{raw_lang}\n{raw_text}\n```"
+    )
+
+
 def _messages_size_chars(messages: list[dict[str, Any]]) -> int:
     """估算 messages 序列化后的字符数。粗略代理 token 数。"""
     try:
@@ -425,6 +629,16 @@ class UnifiedOpsAgent:
             })
         # 历史原文（user / assistant 交替）
         messages.extend(history_msgs)
+
+        # ---- 意图分类 + 输出模式动态注入（临门一脚）----
+        # 纯靠 system prompt 描述模式，模型遵循度受 prompt 长度衰减影响。
+        # 这里基于用户当前消息的关键词识别意图（B/C/D/F/G/H），用一条独立 system
+        # 消息**重申**对应输出模式——这条紧贴当前 user message，比开头的 system 长篇
+        # 更显眼，模型遵循率显著提升。
+        intent_hint = _classify_intent_hint(user_message)
+        if intent_hint:
+            messages.append({"role": "system", "content": intent_hint})
+
         # 当前用户消息（保证总在最后）
         messages.append({"role": "user", "content": user_message})
         trace: list[dict[str, Any]] = []
@@ -523,7 +737,9 @@ class UnifiedOpsAgent:
                         pending_actions=pending_actions,
                     )
                 return AgentOutcome(
-                    message=message.get("content") or "未获得明确结论。",
+                    message=_augment_message_for_intent(
+                        message.get("content") or "未获得明确结论。",
+                        trace, user_message),
                     trace=trace,
                     pending_actions=pending_actions,
                 )
@@ -603,7 +819,9 @@ class UnifiedOpsAgent:
             ],
         )
         return AgentOutcome(
-            message=summary.get("content") or "已完成排查，但模型没有输出总结。",
+            message=_augment_message_for_intent(
+                summary.get("content") or "已完成排查，但模型没有输出总结。",
+                trace, user_message),
             trace=trace,
             pending_actions=pending_actions,
         )

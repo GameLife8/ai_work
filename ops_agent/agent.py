@@ -26,6 +26,29 @@ MAX_MESSAGE_CHARS = 50_000
 KEEP_TAIL_MESSAGES = 6
 
 
+# ----- 会话记忆：跨轮上下文（同会话多轮对话保持记忆）---------------------- #
+
+# 每次 ask() 进来从 DB 拉最近 N 条原文塞进 prompt（user/assistant 文本，不含 tool 调用）
+CHAT_HISTORY_RECENT = 20
+
+# 当未摘要的历史消息数超过此阈值，自动调用模型生成新摘要，把"摘要边界之前"的对话
+# 压缩成一段 200 字以内的中文摘要，落库 role=summary。
+# 设计：30 条 ≈ 15 轮，足够覆盖大部分故障诊断的"主线 + 关键证据 + 结论"
+CHAT_HISTORY_SUMMARIZE_AT = 30
+
+# 摘要 prompt 模板——给模型一段对话原文，让它压成结构化摘要
+_SUMMARY_PROMPT = (
+    "你是 AI 运维助手的会话摘要生成器。下面是用户与助手的多轮对话原文。"
+    "请压缩成不超过 250 字的中文摘要，保留以下要点：\n"
+    "  - 用户问题主线（一句话）\n"
+    "  - 已诊断到的关键事实（如节点名 / 服务名 / 异常类型 / 已定位的根因）\n"
+    "  - 用户表达的偏好或操作约束（'不要重启' / '只在维护窗口' 等）\n"
+    "  - 已经下结论的部分，避免下次重复诊断\n"
+    "**省略**：寒暄、具体命令输出、调试细节、未确认的猜测。\n"
+    "直接给摘要文本，不要其它前言/后语。\n\n对话原文：\n"
+)
+
+
 def _messages_size_chars(messages: list[dict[str, Any]]) -> int:
     """估算 messages 序列化后的字符数。粗略代理 token 数。"""
     try:
@@ -373,6 +396,16 @@ class UnifiedOpsAgent:
         visibility = "user" if user and user.get("role") != "admin" else None
         tools = self.registry.openai_tools(visibility=visibility)
 
+        # ---- 会话记忆：把历史对话拼进 messages（同会话多轮上下文）----
+        # 设计：
+        #   1) 取最近 ``CHAT_HISTORY_RECENT`` 条 user/assistant 消息原文
+        #   2) 若历史 > ``CHAT_HISTORY_SUMMARIZE_AT`` 条，自动用模型把"摘要边界之前"
+        #      的对话压成一段摘要（落库 role=summary），新轮次只带"最新摘要 + 近 N 条"
+        #   3) 摘要表是 chat_message 里 role=summary 的伪行，admin UI 也能看
+        history_msgs, summary_text = self._load_session_memory(
+            session_id=session_id, user_message=user_message,
+        )
+
         messages: list[dict[str, Any]] = [
             {"role": "system", "content": self._load_system_prompt()},
             # 关键：把"当前可用集群"动态注入第二条 system 消息——让 LLM 能从用户
@@ -380,8 +413,20 @@ class UnifiedOpsAgent:
             {"role": "system", "content": self._build_cluster_registry_prompt(
                 selected_connections=selected_connections or {},
             )},
-            {"role": "user", "content": user_message},
         ]
+        if summary_text:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "## 会话历史摘要（早于以下原文部分）\n\n"
+                    + summary_text
+                    + "\n\n（以上是平台自动压缩的旧对话；下面是最近 N 轮原文。）"
+                ),
+            })
+        # 历史原文（user / assistant 交替）
+        messages.extend(history_msgs)
+        # 当前用户消息（保证总在最后）
+        messages.append({"role": "user", "content": user_message})
         trace: list[dict[str, Any]] = []
         pending_actions: list[dict[str, Any]] = []
         seen_signal_keys: set[tuple] = set()
@@ -594,6 +639,174 @@ class UnifiedOpsAgent:
             "latency_ms": envelope.get("latency_ms"),
             "pending_token": envelope.get("pending_token"),
             "signals": collect_signals(envelope),
+        }
+
+    # ----- 会话记忆：加载历史 + 自动摘要 ----------------------------------- #
+
+    def _load_session_memory(
+        self,
+        *,
+        session_id: str | None,
+        user_message: str,
+    ) -> tuple[list[dict[str, Any]], str]:
+        """从 store 拉历史 + 必要时生成摘要。
+
+        Returns:
+            (history_messages, summary_text)
+            - history_messages: 最近 N 条 user/assistant 原文，OpenAI 格式
+            - summary_text: 摘要文本（如果有），插入到 system 消息里；没有就空串
+        """
+        if not session_id:
+            return [], ""
+        store = getattr(self.runtime, "store", None)
+        if store is None or not hasattr(store, "list_chat_messages"):
+            return [], ""
+
+        try:
+            total_count = store.count_chat_messages(session_id, exclude_summary=True)
+            latest_summary = store.get_latest_chat_summary(session_id)
+        except Exception as exc:
+            logger.warning("load_session_memory: 读历史失败：%s", exc)
+            return [], ""
+
+        # 1) 决定要不要先生成新摘要
+        summary_covers_until = 0
+        if latest_summary:
+            meta = latest_summary.get("metadata_json") or {}
+            try:
+                summary_covers_until = int(meta.get("covers_until_id") or 0)
+            except (TypeError, ValueError):
+                summary_covers_until = 0
+
+        # "未摘要"条数 = 总条数（不含 summary） - 已被摘要覆盖到的位置
+        # 这里是粗算：count 是当前未删的总条数；summary_covers_until 是消息 id，
+        # 它们量纲不同。但只要 count > 阈值 + 上次摘要后增长很多，就再生成一次。
+        if total_count > CHAT_HISTORY_SUMMARIZE_AT:
+            # 看看自上次摘要后是否累积超过阈值
+            # 简单策略：每超过阈值一次就生成一次摘要，覆盖到 当前总数 - CHAT_HISTORY_RECENT
+            new_summary = self._summarize_old_messages(
+                session_id=session_id, store=store,
+                exclude_recent=CHAT_HISTORY_RECENT,
+                prev_summary_text=(latest_summary or {}).get("content", ""),
+            )
+            if new_summary:
+                latest_summary = new_summary
+
+        # 2) 拉最近 N 条原文给 prompt 用
+        try:
+            rows = store.list_chat_messages(
+                session_id, limit=CHAT_HISTORY_RECENT, exclude_summary=True,
+            )
+        except Exception as exc:
+            logger.warning("load_session_memory: list_chat_messages 失败：%s", exc)
+            rows = []
+
+        history_msgs: list[dict[str, Any]] = []
+        for row in rows:
+            role = row.get("role")
+            content = (row.get("content") or "").strip()
+            if not content:
+                continue
+            # 只带 user / assistant 纯文本——tool_calls / tool 响应不带（避免撑爆 context
+            # 且旧数据可能已过期）
+            if role not in ("user", "assistant"):
+                continue
+            # 注意：当前轮 user 消息已经在 store 里了（chainlit 调 ask 前先 save）。
+            # 不能让 history 里再出现一条跟 user_message 完全相同的——会变成"用户问了
+            # 两次"。这里做去重：尾部如果是同样的 user content 就丢掉。
+            if (
+                history_msgs and role == "user"
+                and content == user_message.strip()
+                and row is rows[-1]
+            ):
+                continue
+            history_msgs.append({"role": role, "content": content})
+
+        # 极端兜底：list_chat_messages 返回的最后一条还是当前 user_message，再剥一次
+        if (
+            history_msgs
+            and history_msgs[-1].get("role") == "user"
+            and (history_msgs[-1].get("content") or "").strip() == user_message.strip()
+        ):
+            history_msgs.pop()
+
+        summary_text = (latest_summary or {}).get("content", "") if latest_summary else ""
+        return history_msgs, summary_text
+
+    def _summarize_old_messages(
+        self,
+        *,
+        session_id: str,
+        store,
+        exclude_recent: int,
+        prev_summary_text: str,
+    ) -> dict | None:
+        """调模型把"早于最近 N 条的旧对话"压成摘要，落库 role=summary。
+
+        失败不阻塞主流程——返回 None，调用方降级到"没摘要"。
+        """
+        try:
+            # 拉全部（不含 summary），然后截掉最后 exclude_recent 条
+            all_msgs = store.list_chat_messages(
+                session_id, limit=10_000, exclude_summary=True,
+            )
+        except Exception as exc:
+            logger.warning("summarize: list 全量失败：%s", exc)
+            return None
+        if len(all_msgs) <= exclude_recent:
+            return None  # 没多少东西可摘要
+
+        to_summarize = all_msgs[:-exclude_recent]
+        if not to_summarize:
+            return None
+
+        # 拼"对话原文"喂给模型
+        original_chunks: list[str] = []
+        if prev_summary_text:
+            original_chunks.append(f"[之前的摘要]\n{prev_summary_text}\n\n[之后的对话]")
+        for m in to_summarize:
+            role = m.get("role", "?")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            tag = {"user": "用户", "assistant": "助手"}.get(role, role)
+            original_chunks.append(f"{tag}：{content}")
+        original = "\n\n".join(original_chunks)
+        # 控制摘要 prompt 总长度——模型再多也只能吃 30K char 左右；超过截断头部
+        if len(original) > 30_000:
+            original = "[早期更老的对话已省略]\n\n" + original[-29_000:]
+
+        try:
+            # 不传 tools——纯文本生成，跟主对话循环复用同一个 model client
+            resp = self.model.create_completion(
+                messages=[
+                    {"role": "system", "content": _SUMMARY_PROMPT},
+                    {"role": "user", "content": original},
+                ],
+            )
+            summary_text = (resp.get("content") or "").strip()
+        except Exception as exc:
+            logger.warning("summarize: 模型调用失败：%s", exc)
+            return None
+        if not summary_text:
+            return None
+
+        # 落库 role=summary，metadata 记 covers_until_id（最后一条被摘要消息的 id）
+        covers_until_id = int(to_summarize[-1].get("id") or 0)
+        try:
+            store.save_chat_message(
+                session_id, "summary", summary_text,
+                metadata={"covers_until_id": covers_until_id,
+                          "summarized_count": len(to_summarize)},
+            )
+        except Exception as exc:
+            logger.warning("summarize: 落库失败：%s", exc)
+            return None
+        return {
+            "role": "summary",
+            "content": summary_text,
+            "metadata_json": {"covers_until_id": covers_until_id,
+                              "summarized_count": len(to_summarize)},
         }
 
     @staticmethod

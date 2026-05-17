@@ -263,6 +263,41 @@ class InMemoryStore:
             self.chat_sessions[session_id]["last_message_at"] = now
         return message_id
 
+    # ----- 会话记忆：读历史 / 摘要 ----- #
+
+    def list_chat_messages(
+        self,
+        session_id: str,
+        *,
+        limit: int = 20,
+        exclude_summary: bool = True,
+    ) -> list[dict]:
+        """取最近 ``limit`` 条对话消息，时间正序返回（老的在前）。
+
+        ``exclude_summary=True`` 时不返回 role=summary 的伪消息——给 prompt 拼装
+        用是默认行为。admin UI 想看全部就传 False。
+        """
+        rows = [m for m in self.chat_messages if m["session_id"] == session_id]
+        if exclude_summary:
+            rows = [m for m in rows if m.get("role") != "summary"]
+        # chat_messages 是按 append 顺序追加，id 单调递增；直接尾部取 limit
+        tail = rows[-int(limit):]
+        return [deepcopy(m) for m in tail]
+
+    def count_chat_messages(self, session_id: str, *, exclude_summary: bool = True) -> int:
+        rows = [m for m in self.chat_messages if m["session_id"] == session_id]
+        if exclude_summary:
+            rows = [m for m in rows if m.get("role") != "summary"]
+        return len(rows)
+
+    def get_latest_chat_summary(self, session_id: str) -> dict | None:
+        """拿最新一条 role=summary 的摘要消息（含 metadata.covers_until_id）。"""
+        summaries = [m for m in self.chat_messages
+                     if m["session_id"] == session_id and m.get("role") == "summary"]
+        if not summaries:
+            return None
+        return deepcopy(summaries[-1])
+
     @staticmethod
     def _build_root_key(alert: dict) -> str:
         service = alert.get("tags", {}).get("service", "")
@@ -1103,6 +1138,75 @@ class SQLStore:
                 },
             )
             return int(result.lastrowid)
+
+    # ----- 会话记忆：读历史 / 摘要 ----- #
+
+    def list_chat_messages(
+        self,
+        session_id: str,
+        *,
+        limit: int = 20,
+        exclude_summary: bool = True,
+    ) -> list[dict]:
+        """SQL 版本：从 chat_message 表取最近 N 条，时间正序返回。"""
+        from sqlalchemy import text
+
+        where = ["session_id = :sid"]
+        params: dict[str, Any] = {"sid": session_id, "limit": int(limit)}
+        if exclude_summary:
+            where.append("role <> 'summary'")
+        # 倒序取 N 条再正序——这样能拿"最近"的，又保持时间顺序方便拼 prompt
+        sql = (
+            "SELECT id, session_id, role, content, trace_json, metadata_json, created_at "
+            "FROM chat_message WHERE " + " AND ".join(where) +
+            " ORDER BY id DESC LIMIT :limit"
+        )
+        with self.engine.begin() as conn:
+            rows = list(conn.execute(text(sql), params).mappings().all())
+        rows.reverse()
+        out = []
+        for r in rows:
+            d = dict(r)
+            # 反序列化 JSON 字段（旧 InMem 路径是 list/dict，这里也保持一致）
+            try:
+                d["trace_json"] = json.loads(d.get("trace_json") or "[]")
+            except (ValueError, TypeError):
+                d["trace_json"] = []
+            try:
+                d["metadata_json"] = json.loads(d.get("metadata_json") or "{}")
+            except (ValueError, TypeError):
+                d["metadata_json"] = {}
+            out.append(d)
+        return out
+
+    def count_chat_messages(self, session_id: str, *, exclude_summary: bool = True) -> int:
+        from sqlalchemy import text
+        where = ["session_id = :sid"]
+        if exclude_summary:
+            where.append("role <> 'summary'")
+        sql = "SELECT COUNT(1) FROM chat_message WHERE " + " AND ".join(where)
+        with self.engine.begin() as conn:
+            return int(conn.execute(text(sql), {"sid": session_id}).scalar_one() or 0)
+
+    def get_latest_chat_summary(self, session_id: str) -> dict | None:
+        from sqlalchemy import text
+        with self.engine.begin() as conn:
+            row = conn.execute(
+                text(
+                    "SELECT id, session_id, role, content, trace_json, metadata_json, created_at "
+                    "FROM chat_message WHERE session_id=:sid AND role='summary' "
+                    "ORDER BY id DESC LIMIT 1"
+                ),
+                {"sid": session_id},
+            ).mappings().first()
+        if not row:
+            return None
+        d = dict(row)
+        try:
+            d["metadata_json"] = json.loads(d.get("metadata_json") or "{}")
+        except (ValueError, TypeError):
+            d["metadata_json"] = {}
+        return d
 
     @staticmethod
     def _generate_incident_no(conn: Any) -> str:

@@ -74,6 +74,29 @@ class OpsModelClient:
                 f"如 https://ark.cn-beijing.volces.com/api/coding/v3。",
                 response=response,
             )
+        # 4xx/5xx：在抛之前把 ark 返回的错误正文 + 请求 messages 摘要打日志
+        # （400 这种状态码 ark 都会带 ``error.message`` 字段告诉你具体哪不对——
+        # 上下文太长 / 字段非法 / tool_calls 不配对……）
+        if response.status_code >= 400:
+            body_preview = response.text[:1500]
+            n_msgs = len(messages)
+            roles = [m.get("role") for m in messages]
+            char_total = sum(len(str(m.get("content") or "")) for m in messages)
+            tool_msg_with_no_id = sum(
+                1 for m in messages
+                if m.get("role") == "tool" and not m.get("tool_call_id")
+            )
+            empty_content = sum(
+                1 for m in messages
+                if m.get("role") in ("user", "system") and not (m.get("content") or "").strip()
+            )
+            logger.error(
+                "model %s returned %d: %s\n"
+                "  request: msgs=%d roles=%s content_chars=%d empty=%d tool_no_id=%d tools=%s",
+                response.url, response.status_code, body_preview,
+                n_msgs, roles, char_total, empty_content,
+                tool_msg_with_no_id, bool(tools),
+            )
         response.raise_for_status()
         data = response.json()
         return data["choices"][0]["message"]

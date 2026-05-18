@@ -12,7 +12,7 @@ def main() -> int:
     agent = UnifiedOpsAgent(runtime)
     user = {"username": "smoketest", "role": "admin"}
 
-    q = "低代码平台的k8s 的coredns 配置可以展示一下么"
+    q = "低代码平台的coredns 的配置是什么，并给我解释一下"
     print(f"Q: {q}")
     print(f"意图分类: {_classify_intent(q)}")
     print()

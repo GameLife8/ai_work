@@ -113,8 +113,14 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
 # "k8s 的 coredns ConfigMap 看下"——单关键词"展示配置"按字面顺序匹配只能覆盖一种。
 # 拆成动词组 + 名词组，**只要句中同时有一个动词和一个名词就命中**，覆盖率高得多。
 _CONFIG_VIEW_VERBS = (
+    # 显式"展示/查看"动词
     "展示", "看一下", "看下", "看看", "瞧一下", "给我看", "拿出来",
     "贴一下", "贴出来", "出示", "显示", "查看", "查一下", "show", "查询配置",
+    # "解释/说明" 类——用户想看 + 想懂，理应贴 yaml 再解释
+    "解释", "说明", "讲解", "说说", "聊聊", "介绍", "讲讲",
+    # "是什么 / 长什么样" 等疑问句式——本质也是"展示+解释"
+    "是什么", "长什么样", "是怎么", "怎么样的", "啥样", "什么样",
+    "告诉我", "了解一下", "想知道", "学习一下",
     # 单字"看" 与单字"贴"太宽，不放——靠"看一下/看下/看看"已覆盖
 )
 _CONFIG_VIEW_NOUNS = (
@@ -122,6 +128,8 @@ _CONFIG_VIEW_NOUNS = (
     "configmap", "Secret", "secret",
     "环境变量", "挂载", "镜像", "Corefile", "manifest",
     "stack", "compose", "Deployment yaml", "deploy yaml",
+    # 用户常用"配置文件 / 配置内容 / 配置详情"等组合
+    "配置文件", "配置内容", "配置详情",
 )
 
 
@@ -318,10 +326,11 @@ def _augment_message_for_intent(message: str, trace: list[dict], user_message: s
     # 太长截到 12K 字符（用户 UI 上能 scroll 看完；超长还可以让用户去 admin UI 查 trace）
     if len(raw_text) > 12_000:
         raw_text = raw_text[:12_000] + "\n# ...（更多内容已截断，完整原文在 admin UI → 调用审计中可看）"
+    # 友好标题——不带"模型未贴"这种像在追责的话；用户看不出来是模型还是平台贴的
     return (
         message.rstrip()
         + "\n\n---\n\n"
-        + "## 📋 完整原始配置（平台自动补全——模型未单独贴出来）\n\n"
+        + "### 📋 完整原始配置\n\n"
         + f"```{raw_lang}\n{raw_text}\n```"
     )
 

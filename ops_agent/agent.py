@@ -133,62 +133,185 @@ _CONFIG_VIEW_NOUNS = (
 )
 
 
+# ----- 意图 → 相关 skill 子集 -------------------------------------------- #
+# tools schema 是 prompt 最大头（~5K tokens / 56%）。每次 27 个 skill 全传给模型
+# 大多数浪费——用户问"看配置"用不到 scale/rollback；用户问"重启服务"用不到 metric。
+#
+# 按意图过滤后能省 ~3.5K tokens / 次（−14%）。失败回退：如果模型空手回了（既没
+# 调 tool 也没给文本），自动重试一次 full tool set。
+#
+# 设计原则：
+#   - 写操作意图也带 read query（写之前模型常常先查一下状态）
+#   - 诊断 / unknown 走全集——出错风险最高
+#   - chat_intro 不给 tool，纯文本即可
+_INTENT_TOOLS: dict[str | None, list[str] | None] = {
+    "config_view": [
+        # 通用查询三把口 + 日志（带 previous 引导，看配置时也常需要看 logs 验证）
+        "kube_query", "swarm_query", "host_query",
+        "k8s_get_pod_logs",
+        # 配置 + 引导
+        "platform_get_runbooks", "platform_run_runbook",
+    ],
+    "list_state": [
+        "kube_query", "swarm_query", "host_query",
+        "host_list_nodes", "host_list_tasks",
+        "platform_get_runbooks",
+    ],
+    "monitor": [
+        # 监控指标系列
+        "zabbix_get_host_overview", "zabbix_get_host_storage_overview",
+        "metric_query_peak", "metric_query_window_around",
+        # 补一手宿主机命令（vmstat / iostat 等）
+        "host_query",
+    ],
+    "write_action": [
+        # 全部写操作 skill
+        "k8s_scale_deployment", "k8s_restart_deployment", "k8s_rollout_undo",
+        "swarm_scale_service", "swarm_update_service_image",
+        "swarm_rollback_service", "swarm_remove_service", "swarm_force_update_service",
+        "host_run_command", "host_run_command_async", "host_capture_packets",
+        # 写之前要先查状态确认目标
+        "kube_query", "swarm_query", "host_query",
+        # 也允许直接走 runbook（含写动作的 runbook）
+        "platform_get_runbooks", "platform_run_runbook",
+    ],
+    "async_task": [
+        "host_run_command_async", "host_check_task", "host_list_tasks",
+        # 顺手查一下要在哪个 node 跑
+        "host_query", "kube_query", "swarm_query", "host_list_nodes",
+    ],
+    "knowledge": [
+        # 知识 / 引导类——只需要 runbook 入口
+        "platform_get_runbooks", "platform_run_runbook",
+    ],
+    "chat_intro": [
+        # 闲聊 / 自介——模型通常会纯文本回复，给 2 个 runbook 入口意思一下
+        "platform_get_runbooks", "platform_run_runbook",
+    ],
+    "diagnose": [
+        # 诊断意图保守一点——可能跨域追根因，全集（不过滤）
+        # 用 None 标记，调用方知道走 full set
+    ],
+    None: [
+        # 未识别意图：走 full set，避免漏 tool
+    ],
+}
+
+
+def _filter_tools_by_intent(
+    full_tools: list[dict],
+    intent: str | None,
+) -> tuple[list[dict], bool]:
+    """根据意图过滤 tools。返回 (过滤后的 tools, 是否被过滤过)。
+
+    diagnose / unknown / chat_intro 等不过滤的意图：返回 full_tools + False。
+    """
+    whitelist = _INTENT_TOOLS.get(intent)
+    if not whitelist:
+        return full_tools, False
+    allowed = set(whitelist)
+    filtered = [t for t in full_tools if t.get("function", {}).get("name") in allowed]
+    # 如果过滤后 < 2 个工具，安全起见走 full set（防意图识别错导致模型无 tool 用）
+    if len(filtered) < 2:
+        return full_tools, False
+    return filtered, True
+
+
 _INTENT_HINTS: dict[str, str] = {
     "config_view": (
         "🎯 **本次用户意图：查看 / 配置 / 看原文（B 类）**\n"
+        "用户要的是真实原始数据，不是你的总结。**严禁**跳过原文直接概括「该服务是 X，运行健康……」。\n"
+        "\n"
         "**必须按这个格式输出**：\n"
-        "1. 先用 ```yaml 或 ```json 代码块原样贴 skill 返回的原始内容（取 result.parsed "
-        "或 result.stdout）。完整、不重排、不省字段。如果太长就贴关键段。\n"
-        "2. 再用 1–3 段中文逐项翻译关键配置（image / replicas / networks / labels / "
-        "placement / healthcheck / env / mounts）。\n"
-        "3. 可选给一句运维建议。\n"
-        "**严禁**跳过原文直接概括成「该服务是 X，运行健康……」。"
+        "1. **先用 ``` 代码块（``` yaml / ``` json）原样贴 skill 返回的原文**——\n"
+        "   取 ``result.parsed`` 或 ``result.stdout``。完整、不重排、不省字段、不折叠。\n"
+        "   超长（> 200 行）按段贴：先关键段（image/replicas/networks/labels/placement/"
+        "healthcheck/env/mounts），告诉用户「完整原文在 trace 里」。\n"
+        "2. **再用 1–3 段中文逐项翻译**关键配置：image 是什么 / replicas 几个 / "
+        "networks 接哪个 overlay / placement 约束什么意思 / labels 起的作用 / 健康检查策略。\n"
+        "3. 最后**可选**一句运维建议：「X 字段建议改 Y，避免 Z」。"
     ),
     "list_state": (
-        "🎯 **本次用户意图：列表 / 状态总览（C 类）**\n"
+        "🎯 **本次用户意图：列表 / 状态总览（C 类）—— 表格 + 异常项标注**\n"
+        "**严禁**写成段落式分析报告。\n"
+        "\n"
         "**必须按这个格式输出**：\n"
         "1. 用 markdown 表格列关键字段（名字 / 状态 / 副本 / 重启次数 / 创建时间 / Node）。\n"
-        "2. 异常项行首加 ⚠️ 或 🚨；行末注一句原因。\n"
-        "3. 表格下方给 1–2 句总览结论：「共 N 个，M 个异常」。\n"
-        "4. 有异常时追问：「想详细看哪一个？」\n"
-        "**严禁**写成段落式分析报告。"
+        "2. 异常项行首加 ⚠️ 或 🚨；行末加一句简短原因。\n"
+        "3. 表格下方给 1–2 句**总览结论**：「共 N 个，M 个异常」。\n"
+        "4. 如果有异常项，**主动追问**：「想详细看哪一个？我可以拉它的 describe / 日志」。"
     ),
     "monitor": (
-        "🎯 **本次用户意图：资源 / 性能监控（D 类）**\n"
+        "🎯 **本次用户意图：资源 / 性能监控（D 类）—— 数据卡片 + 解读**\n"
+        "**严禁**只贴一大段文字描述。\n"
+        "\n"
         "**必须按这个格式输出**：\n"
-        "1. markdown 表格展示「指标 / 当前值 / 阈值 / 状态(✅/⚠️/🚨)」。\n"
+        "1. markdown 表格或卡片展示当前值 + 阈值对比：\n"
+        "   ```\n"
+        "   | 指标          | 当前值  | 阈值   | 状态  |\n"
+        "   | CPU           | 78%     | 80%    | ✅    |\n"
+        "   | Memory        | 94%     | 85%    | ⚠️    |\n"
+        "   | /var          | 92%     | 80%    | 🚨    |\n"
+        "   ```\n"
         "2. 1–2 段解读：哪个指标接近/超阈，趋势怎样，可能影响什么。\n"
-        "3. 一句下一步建议。\n"
-        "**严禁**只贴一大段文字描述。"
+        "3. 一句下一步建议（看更细的 skill / 扩容 / 清盘 / 排查应用）。"
     ),
     "write_action": (
-        "🎯 **本次用户意图：执行写操作（E 类）**\n"
+        "🎯 **本次用户意图：执行写操作（E 类）—— needs_confirmation 流程**\n"
         "调用对应写 skill 后会返回 ``status=needs_confirmation``。**禁止再调任何 tool**。\n"
-        "用中文清楚说明四点：(1) 打算做什么 (2) 为什么 (3) 影响范围 (4) 回滚方式，\n"
-        "然后提示「请在下方点击确认/取消」。如果 ``requires_admin_approval=True``，\n"
-        "明确说「需 admin 审批」。"
+        "\n"
+        "**必须按这个格式输出**（不是五段式）：\n"
+        "**我打算执行**：``skill_name(args)``\n"
+        "**原因**：基于刚才取证的 X 证据，做这个操作能 Y。\n"
+        "**影响范围**：会影响 X 服务的 Y 个副本，预计 Z 秒内完成。\n"
+        "**回滚方式**：如果出问题，调用 ``rollback_skill`` 可恢复。\n"
+        "请在**下方点击「确认」或「取消」**。\n"
+        "（如果是 ``requires_admin_approval``，明确说「**需 admin 审批**」）"
     ),
     "async_task": (
-        "🎯 **本次用户意图：异步长任务（F 类）**\n"
+        "🎯 **本次用户意图：异步长任务（F 类）—— 提交回执 + 轮询提示**\n"
         "估计 > 30s 的命令一律用 ``host_run_command_async``。\n"
-        "提交时给「task_id + 节点 + 命令 + 预计时长」的简短回执，结束本轮。\n"
-        "查询任务时调 ``host_check_task``，把 stdout 用代码块贴出来。"
+        "\n"
+        "**提交时**：\n"
+        "```\n"
+        "已提交异步任务：\n"
+        "- task_id: ptk_xxx\n"
+        "- node: bigdata6\n"
+        "- 命令: du -sh /var/log/*\n"
+        "- 最大运行时间: 600s\n"
+        "预计 1–5 分钟跑完，你说「看任务结果」我去 host_check_task 取。\n"
+        "```\n"
+        "**查询任务结果时**：\n"
+        "```\n"
+        "任务 ptk_xxx 已完成（耗时 X 秒），结果如下：\n"
+        "（贴 stdout 代码块）\n"
+        "```"
     ),
     "knowledge": (
-        "🎯 **本次用户意图：知识 / 引导（G 类）**\n"
-        "用结构化清单输出：(1) 一句话引言；(2) 编号的步骤列表（每步对应 skill）；\n"
-        "(3) 关键注意点；(4) 如果有现成 runbook，告诉用户直接调 ``platform_run_runbook``。"
+        "🎯 **本次用户意图：知识 / 引导（G 类）—— 结构化清单**\n"
+        "**必须按这个格式输出**：\n"
+        "1. 简短引言（1 句）：本场景的核心思路是什么。\n"
+        "2. 步骤列表（有序号）：每步对应一个 skill 调用 + 用途说明。\n"
+        "3. 关键注意点（项目符号）：避坑 / 优先级 / 替代方案。\n"
+        "4. 如有现成 runbook，明确告诉用户「直接调 ``platform_run_runbook(user_query=...)`` 一键跑」。"
     ),
     "chat_intro": (
-        "🎯 **本次用户意图：闲聊 / 自介（H 类）**\n"
-        "简短一句自我介绍，列 4–6 个场景化能力（诊断 / 看配置 / 查状态 / 监控 / "
-        "执行操作 / 长任务），邀请用户给具体场景。\n"
-        "**严禁**堆砌 skill 列表 / 长篇大论。"
+        "🎯 **本次用户意图：闲聊 / 自介（H 类）—— 简短自介 + 引导**\n"
+        "**必须按这个格式输出**：\n"
+        "1. 一句话自我介绍。\n"
+        "2. 列 4–6 个典型能力分类（诊断 / 看配置 / 查状态 / 监控 / 执行操作 / 长任务）。\n"
+        "3. 邀请用户给出具体场景：「你想从哪个集群/服务/节点开始？」\n"
+        "**禁止**：堆 skill 列表、长篇大论、客套话。"
     ),
     "diagnose": (
-        "🎯 **本次用户意图：诊断 / 排障（A 类）**\n"
-        "按五段式中文报告输出：**当前状态** / **检测过程** / **关键证据**（用代码块引用原文）"
-        " / **判断结论**（不确定就写「高度疑似 + 备选」）/ **建议操作**（具体可执行）。"
+        "🎯 **本次用户意图：诊断 / 排障（A 类）—— 五段式中文报告**\n"
+        "**必须按这个格式输出**：\n"
+        "**当前状态**：服务/Pod/主机现在是健康还是异常，关键数字（副本数/重启次数/磁盘 %）。\n"
+        "**检测过程**：你按什么顺序查了哪些 skill，原因是什么。\n"
+        "**关键证据**：1–3 条原始信息（错误码、日志片段、metric 数字），用 ``` 代码块引用原文。\n"
+        "**判断结论**：根因是什么；没法 100% 确认就写「高度疑似 X + 备选可能性 Y」。\n"
+        "**建议操作**：具体可执行——扩 N 副本 / 重启 X / 清 /var/log。"
+        "如果建议是写操作，明确告诉用户「我可以帮你执行 ``skill_name``，请下方点击确认」。"
     ),
 }
 
@@ -680,7 +803,19 @@ class UnifiedOpsAgent:
             selected_connections=selected_connections or {},
         )
         visibility = "user" if user and user.get("role") != "admin" else None
-        tools = self.registry.openai_tools(visibility=visibility)
+        full_tools = self.registry.openai_tools(visibility=visibility)
+
+        # ---- 意图分类（提前到 tools 过滤之前）----
+        intent = _classify_intent(user_message)
+
+        # ---- tools 按意图动态裁剪（省 ~3.5K tokens / 次）----
+        # 失败回退：若 LLM 第一轮空手回（既没调 tool 也没给文本），下一轮自动用 full set 重试。
+        tools, was_filtered = _filter_tools_by_intent(full_tools, intent)
+        if was_filtered:
+            logger.debug(
+                "intent=%s, tools filtered: %d → %d",
+                intent, len(full_tools), len(tools),
+            )
 
         # ---- 会话记忆：把历史对话拼进 messages（同会话多轮上下文）----
         # 设计：
@@ -712,12 +847,9 @@ class UnifiedOpsAgent:
         # 历史原文（user / assistant 交替）
         messages.extend(history_msgs)
 
-        # ---- 意图分类 + 输出模式动态注入（临门一脚）----
-        # 纯靠 system prompt 描述模式，模型遵循度受 prompt 长度衰减影响。
-        # 这里基于用户当前消息的关键词识别意图（B/C/D/F/G/H），用一条独立 system
-        # 消息**重申**对应输出模式——这条紧贴当前 user message，比开头的 system 长篇
-        # 更显眼，模型遵循率显著提升。
-        intent_hint = _classify_intent_hint(user_message)
+        # ---- 输出模式动态注入（intent 已在上面识别）----
+        # 这条紧贴当前 user message，比开头的 system 长篇更显眼，遵循率高。
+        intent_hint = _INTENT_HINTS.get(intent) if intent else None
         if intent_hint:
             messages.append({"role": "system", "content": intent_hint})
 
@@ -738,6 +870,23 @@ class UnifiedOpsAgent:
                 messages=messages, tools=tools, tool_choice="auto",
             )
             tool_calls = message.get("tool_calls") or []
+            content = (message.get("content") or "").strip()
+
+            # 空手回退：第一轮 LLM 既没调 tool 也没给文本——可能是 tools 被过滤掉
+            # 了它想要的那个。重新跑一次给它 full set。
+            if step == 0 and was_filtered and not tool_calls and not content:
+                logger.info(
+                    "intent=%s 过滤后 LLM 空手回，回退到 full tool set",
+                    intent,
+                )
+                tools = full_tools
+                was_filtered = False
+                message = self.model.create_completion(
+                    messages=messages, tools=tools, tool_choice="auto",
+                )
+                tool_calls = message.get("tool_calls") or []
+                content = (message.get("content") or "").strip()
+
             if not tool_calls:
                 fallback = self._pick_fallback(
                     user_message=user_message,

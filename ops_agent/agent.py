@@ -59,16 +59,10 @@ _SUMMARY_PROMPT = (
 # 优先匹配；闲聊类专属性弱，最后兜底。
 
 # 触发词字典：意图 → 关键词列表（OR 关系）
+# 注意：``config_view`` 用 verb + noun **双命中**机制（见 _classify_intent），
+# 不能放在这里走单关键词逻辑——用户经常说"配置可以展示一下"（noun 在前 verb 在后），
+# 单关键词"展示配置"按字面顺序匹配会漏。
 _INTENT_KEYWORDS: dict[str, list[str]] = {
-    # B 类：查看 / 配置原文 (强专属)
-    "config_view": [
-        "yaml", "json", "原始", "原文", "完整配置", "完整 yaml", "完整 json",
-        "配置文件", "配置内容", "配置详情", "raw", "spec",
-        "看一下配置", "看看配置", "展示配置",
-        "ConfigMap", "configmap", "Secret",
-        # 镜像/env 类
-        "环境变量", "挂载配置", "镜像配置",
-    ],
     # F 类：异步长任务
     "async_task": [
         "异步", "长命令", "跑一会", "后台跑",
@@ -111,6 +105,24 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
         "排查", "诊断", "分析下", "看看怎么回事",
     ],
 }
+
+
+# B 类（查看/配置）专用：verb + noun 双命中（任意 verb 任意 noun 同时出现就命中）
+#
+# 因为中文里用户经常分开说："配置可以展示一下" / "展示一下配置" / "把配置给我看看" /
+# "k8s 的 coredns ConfigMap 看下"——单关键词"展示配置"按字面顺序匹配只能覆盖一种。
+# 拆成动词组 + 名词组，**只要句中同时有一个动词和一个名词就命中**，覆盖率高得多。
+_CONFIG_VIEW_VERBS = (
+    "展示", "看一下", "看下", "看看", "瞧一下", "给我看", "拿出来",
+    "贴一下", "贴出来", "出示", "显示", "查看", "查一下", "show", "查询配置",
+    # 单字"看" 与单字"贴"太宽，不放——靠"看一下/看下/看看"已覆盖
+)
+_CONFIG_VIEW_NOUNS = (
+    "配置", "config", "yaml", "json", "原文", "原始", "raw", "spec",
+    "configmap", "Secret", "secret",
+    "环境变量", "挂载", "镜像", "Corefile", "manifest",
+    "stack", "compose", "Deployment yaml", "deploy yaml",
+)
 
 
 _INTENT_HINTS: dict[str, str] = {
@@ -176,13 +188,21 @@ _INTENT_HINTS: dict[str, str] = {
 def _classify_intent(user_message: str) -> str | None:
     """识别用户当前消息的意图标签（8 类之一）。
 
-    匹配优先级：config_view（强专属）> async_task > write_action > monitor >
-    list_state > knowledge > chat_intro > diagnose。
+    匹配优先级：config_view（强专属，verb+noun 双命中）> async_task > write_action >
+    monitor > list_state > knowledge > chat_intro > diagnose。
     """
     if not user_message:
         return None
     text = user_message.lower()
-    priority = ["config_view", "async_task", "write_action", "monitor",
+
+    # config_view 用 verb+noun 双命中（最高优先级）
+    has_verb = any(v.lower() in text for v in _CONFIG_VIEW_VERBS)
+    has_noun = any(n.lower() in text for n in _CONFIG_VIEW_NOUNS)
+    if has_verb and has_noun:
+        return "config_view"
+
+    # 其余意图用单关键词 OR 匹配
+    priority = ["async_task", "write_action", "monitor",
                 "list_state", "knowledge", "chat_intro", "diagnose"]
     for intent in priority:
         for kw in _INTENT_KEYWORDS.get(intent, []):
@@ -197,40 +217,93 @@ def _classify_intent_hint(user_message: str) -> str | None:
     return _INTENT_HINTS.get(intent) if intent else None
 
 
+def _is_config_query_trace_item(item: dict) -> bool:
+    """trace 里这一条是不是「查看配置类」的调用？
+
+    用作 _augment_message_for_intent 的 trace 兜底——即使意图分类没识别到
+    config_view（关键词漏匹配），只要 trace 里有"明显的配置查询调用"，平台
+    也应该兜底贴原文。
+
+    判定标准：
+    - kube_query verb=get/describe，resource 是 configmap/secret/deploy/...
+    - swarm_query verb=inspect（service/stack/network/...）
+    - host_query 调 cat 类命令读 /etc/... 配置文件
+    """
+    if item.get("status") != "ok":
+        return False
+    tool = item.get("tool_name", "")
+    args = item.get("tool_args") or {}
+    if tool == "kube_query":
+        verb = (args.get("verb") or "").lower()
+        resource = (args.get("resource") or "").lower()
+        if verb in ("get", "describe") and resource in (
+            "configmap", "configmaps", "cm",
+            "secret", "secrets",
+            "deploy", "deployment", "deployments",
+            "service", "services", "svc",
+            "ingress", "ingresses", "ing",
+            "statefulset", "statefulsets", "sts",
+            "daemonset", "daemonsets", "ds",
+            "pv", "pvc", "pod", "pods",
+        ):
+            return True
+    if tool == "swarm_query":
+        verb = (args.get("verb") or "").lower()
+        if verb == "inspect":
+            return True
+    if tool == "host_query":
+        cmd = (args.get("command") or "").strip()
+        # cat / head / tail 读配置文件
+        if cmd.startswith(("cat ", "head ", "tail ")) and ("/etc/" in cmd or "/conf" in cmd):
+            return True
+    return False
+
+
 def _augment_message_for_intent(message: str, trace: list[dict], user_message: str) -> str:
     """**平台保证机制**：模型偷懒不照输出模式办的时候，平台兜底补全。
 
-    现在覆盖最关键的一个：
-    - 用户问"查看 / 配置 / yaml"类问题，但模型回答里**没有 ``` 代码块**
-    - 平台自动从 trace 抽 stdout / parsed 字段拼一段"## 📋 完整原始配置"附在末尾
+    触发条件（任一即可）：
+    1. 意图分类识别为 config_view
+    2. trace 里有"明显的配置查询"调用（_is_config_query_trace_item）
 
-    其他意图（list/monitor/...）模型遵循率高，先不强补，留观察。
+    满足触发但回答里没有 ``` 代码块 → 自动从 trace 抽 stdout/parsed 拼末尾。
+
+    第 2 条是兜底中的兜底——关键词识别永远有漏（用户表达千变万化），
+    但 trace 里的真实调用是确定性证据。
     """
     if not message:
         return message
     intent = _classify_intent(user_message)
-    if intent != "config_view":
+    # 触发条件 1：意图命中 config_view
+    triggered = (intent == "config_view")
+    # 触发条件 2：trace 里有明显的配置查询调用
+    config_query_item = None
+    for item in reversed(trace or []):
+        if _is_config_query_trace_item(item):
+            config_query_item = item
+            triggered = True
+            break
+    if not triggered:
         return message
     # 已有代码块 → 模型自己贴了，不动
     if "```" in message:
         return message
 
-    # 从 trace 里抽最后一次 ok 的 kube_query / swarm_query / host_query 结果
+    # 从 trace 里抽 raw 内容——优先用 _is_config_query_trace_item 命中的那条
     raw_text = ""
     raw_lang = "yaml"
-    for item in reversed(trace):
-        if item.get("status") != "ok":
+    candidates = ([config_query_item] if config_query_item else []) + list(reversed(trace or []))
+    for item in candidates:
+        if not item or item.get("status") != "ok":
             continue
         tool = item.get("tool_name", "")
         if tool not in ("kube_query", "swarm_query", "host_query"):
             continue
         result = item.get("tool_result") or {}
-        # 优先取 stdout / parsed 字段
         stdout = result.get("stdout") or ""
         parsed = result.get("parsed")
         if parsed:
             try:
-                # parsed 是 dict/list，序列化成漂亮 JSON
                 raw_text = json.dumps(parsed, ensure_ascii=False, indent=2, default=str)
                 raw_lang = "json"
                 break
@@ -242,9 +315,9 @@ def _augment_message_for_intent(message: str, trace: list[dict], user_message: s
             break
     if not raw_text:
         return message
-    # 太长截到 12K 字符（用户能 scroll 看完）
+    # 太长截到 12K 字符（用户 UI 上能 scroll 看完；超长还可以让用户去 admin UI 查 trace）
     if len(raw_text) > 12_000:
-        raw_text = raw_text[:12_000] + "\n# ...（更多内容已截断，完整原文在 trace 里）"
+        raw_text = raw_text[:12_000] + "\n# ...（更多内容已截断，完整原文在 admin UI → 调用审计中可看）"
     return (
         message.rstrip()
         + "\n\n---\n\n"
@@ -684,7 +757,9 @@ class UnifiedOpsAgent:
                             }],
                         )
                         return AgentOutcome(
-                            message=summary.get("content") or "操作待用户确认。",
+                            message=_augment_message_for_intent(
+                                summary.get("content") or "操作待用户确认。",
+                                trace, user_message),
                             trace=trace,
                             pending_actions=pending_actions,
                         )
@@ -732,7 +807,9 @@ class UnifiedOpsAgent:
                         ],
                     )
                     return AgentOutcome(
-                        message=summary.get("content") or "已完成排查，但模型没有输出总结。",
+                        message=_augment_message_for_intent(
+                            summary.get("content") or "已完成排查，但模型没有输出总结。",
+                            trace, user_message),
                         trace=trace,
                         pending_actions=pending_actions,
                     )
@@ -803,7 +880,9 @@ class UnifiedOpsAgent:
                     }],
                 )
                 return AgentOutcome(
-                    message=summary.get("content") or "操作待用户确认。",
+                    message=_augment_message_for_intent(
+                        summary.get("content") or "操作待用户确认。",
+                        trace, user_message),
                     trace=trace,
                     pending_actions=pending_actions,
                 )

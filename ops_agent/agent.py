@@ -433,6 +433,13 @@ def _augment_message_for_intent(message: str, trace: list[dict], user_message: s
         result = item.get("tool_result") or {}
         stdout = result.get("stdout") or ""
         parsed = result.get("parsed")
+        # 优先级 1：swarm_query 反推的 compose.yml 风格 YAML（用户最熟悉的格式）
+        compose_yaml = result.get("compose_yaml")
+        if compose_yaml and isinstance(compose_yaml, str):
+            raw_text = compose_yaml
+            raw_lang = "yaml"
+            break
+        # 优先级 2：parsed JSON（kubectl get -o json / docker inspect 等）
         if parsed:
             try:
                 raw_text = json.dumps(parsed, ensure_ascii=False, indent=2, default=str)
@@ -440,6 +447,7 @@ def _augment_message_for_intent(message: str, trace: list[dict], user_message: s
                 break
             except Exception:
                 pass
+        # 优先级 3：raw stdout
         if stdout and isinstance(stdout, str) and stdout.strip():
             raw_text = stdout
             raw_lang = "yaml" if any(c in stdout[:200] for c in (":", "-")) else "text"

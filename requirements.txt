@@ -5,6 +5,9 @@ requests==2.32.3
 python-dotenv==1.0.0
 pytest==8.3.3
 chainlit==2.5.5
+# swarm_query 把 service inspect 反推成 compose.yml 风格 YAML 时用——
+# Docker Swarm 不存 compose.yml 原始文件，反推出来的等价 YAML 给用户读最友好。
+PyYAML>=6.0
 
 # chainlit/asyncer 的传递依赖在某些 pip resolver 路径下可能漏装，显式锁住。
 # 现象：``ModuleNotFoundError: No module named 'sniffio'`` 容器起不来。

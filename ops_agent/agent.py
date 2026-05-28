@@ -93,6 +93,14 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
         "重启服务", "扩容", "缩容", "扩到", "缩到", "扩成", "改成",
         "回滚", "删除服务", "下线服务", "强制更新", "改镜像",
         "替换镜像", "重新部署", "升级版本",
+        # 高频"执行某条具体命令"变体——之前漏掉导致用户说"docker prune -f 请用这条
+        # 命令清理一下"时模型不知道这是写意图,只输出描述不调 tool:
+        "请使用", "请执行", "请运行", "请帮我执行", "请帮我运行",
+        "使用这条", "执行这条", "运行这条", "跑这条", "用这条",
+        "帮我清理", "清理一下", "清一下", "执行下", "运行下", "跑下",
+        "立刻执行", "马上执行", "现在执行",
+        # 写操作的中性动词(单独不一定是写意图,组合后更高频)
+        "kill", "rm -rf", "prune", "drop ",
     ],
     # D 类：资源 / 监控
     "monitor": [
@@ -341,15 +349,36 @@ _INTENT_HINTS: dict[str, str] = {
     ),
     "write_action": (
         "🎯 **本次用户意图：执行写操作（E 类）—— needs_confirmation 流程**\n"
-        "调用对应写 skill 后会返回 ``status=needs_confirmation``。**禁止再调任何 tool**。\n"
         "\n"
-        "**必须按这个格式输出**（不是五段式）：\n"
-        "**我打算执行**：``skill_name(args)``\n"
-        "**原因**：基于刚才取证的 X 证据，做这个操作能 Y。\n"
-        "**影响范围**：会影响 X 服务的 Y 个副本，预计 Z 秒内完成。\n"
-        "**回滚方式**：如果出问题，调用 ``rollback_skill`` 可恢复。\n"
-        "请在**下方点击「确认」或「取消」**。\n"
-        "（如果是 ``requires_admin_approval``，明确说「**需 admin 审批**」）"
+        "**⚠️ 第一步是「调用对应的写 skill」,不是「写一段描述」!**\n"
+        "用户说『请使用 / 请执行 / 清理一下 / 运行这条 ...』时,**意思是真的要你执行**,\n"
+        "不是让你解释「如果执行的话会发生什么」。**直接调 tool**——写操作 skill\n"
+        "会自动返回 ``status=needs_confirmation``,平台**自己**会在 UI 下方弹\n"
+        "确认卡片(带 ✅/❌ 按钮)。**没调 tool 就只有干巴巴的文字,用户没按钮可点**!\n"
+        "\n"
+        "## 正确流程(必须按这个顺序)\n"
+        "\n"
+        "1. **第一轮:调对应写 skill**(``swarm_scale_service`` / ``k8s_restart_deployment`` /\n"
+        "   ``host_run_command`` 等)。具体选哪个看用户提到的对象:\n"
+        "   - 提到 docker 命令 / shell 命令(``docker prune`` / ``rm -rf`` 等)→ ``host_run_command``\n"
+        "   - 提到 swarm service 扩缩容 / 更新镜像 → 对应 ``swarm_*`` skill\n"
+        "   - 提到 k8s deployment 重启 / 扩缩 / 回滚 → 对应 ``k8s_*`` skill\n"
+        "2. **第二轮:平台拿到 needs_confirmation,你只写 2-3 句简短描述**:\n"
+        "   - 为什么要做(1 句,引用之前的取证证据)\n"
+        "   - 主要风险或回滚方式(1 句,可选)\n"
+        "   - 结尾**必须**写:``请在下方点击 ✅ 确认 或 ❌ 取消``\n"
+        "3. **禁止重写卡片**:skill / 参数 / 有效期由 chainlit 自动呈现,你别重复\n"
+        "   (重写会把按钮挤出屏幕,用户找不到!)\n"
+        "\n"
+        "## 反例(严禁!)\n"
+        "\n"
+        "❌ 用户:「docker container prune -f 请执行一下」\n"
+        "❌ 你:「本次将在 X 节点执行 docker container prune -f 命令...请确认」**(没调 tool!)**\n"
+        "→ 用户看到文字但没按钮,挫败感拉满。\n"
+        "\n"
+        "✅ 用户:「docker container prune -f 请执行一下」\n"
+        "✅ 你:**直接调** ``host_run_command(node=X, command='docker container prune -f')``\n"
+        "→ 平台返回 needs_confirmation → UI 弹确认卡片 → 你写一句简短解释 + 按钮提示。"
     ),
     "async_task": (
         "🎯 **本次用户意图：异步长任务（F 类）—— 提交回执 + 轮询提示**\n"
@@ -1087,12 +1116,22 @@ class UnifiedOpsAgent:
         # ask() 结束时塞到 AgentOutcome.usage 给入口层（chainlit_app / API）持久化。
         total_usage: dict[str, Any] = {}
 
+        # ---- tool_choice 策略：写操作意图首轮强制调 tool ----
+        # 国产模型(豆包 seed-2 / qwen3 等)对 "tool_choice=auto" 下的写操作意图常常
+        # 产生"我打算执行 X..."的纯文本描述,**没有真正调 tool**——结果用户看到说明
+        # 文字但下方没有确认卡片可点。强制 ``required`` 让模型必须先选一个 tool 调用,
+        # 配合 ``_INTENT_TOOLS["write_action"]`` 的白名单(只暴露写 skill + 必要的 read),
+        # 模型只能选写 skill,自然走到 needs_confirmation 流程。
+        # 仅首轮(step==0)强制;后续轮次还原 ``auto``,让模型基于 tool 结果自主决策。
+        first_round_tool_choice = "required" if intent == "write_action" else "auto"
+
         for step in range(self.max_steps):
             # ⏬ 调用 LLM 前先压缩 messages，防止 8 步循环里上下文越积越多撑爆窗口
             messages = _maybe_compress(messages)
 
+            tc = first_round_tool_choice if step == 0 else "auto"
             message = self.model.create_completion(
-                messages=messages, tools=tools, tool_choice="auto",
+                messages=messages, tools=tools, tool_choice=tc,
             )
             _accumulate_usage(total_usage, message.pop("_usage", {}))
             tool_calls = message.get("tool_calls") or []

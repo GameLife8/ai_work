@@ -12,6 +12,7 @@ from ops_platform.drivers.swarm import SwarmDriver
 from ops_platform.drivers.k8s import K8sDriver
 from ops_platform.drivers.host_agent import HostAgentDriver
 from ops_platform.drivers.http_api import HttpApiDriver
+from ops_platform.drivers.jenkins import JenkinsDriver
 from ops_platform.drivers.alert_analysis import AlertAnalysisDriver
 from ops_platform.drivers.mcp_client import MCPClientDriver
 
@@ -39,6 +40,7 @@ def bootstrap_default_drivers() -> None:
     register(K8sDriver())
     register(HostAgentDriver())
     register(HttpApiDriver())
+    register(JenkinsDriver())
     register(AlertAnalysisDriver())
     # 反向 MCP 接入：把第三方 MCP server 的工具注册成本地 skill
     register(MCPClientDriver())

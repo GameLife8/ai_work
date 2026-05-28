@@ -188,6 +188,12 @@ const TYPE_HELP = [
     when: '想把工单/CMDB/堡垒机这类系统的 API 接进来给 LLM 调时。',
   },
   {
+    code: 'jenkins', name: 'Jenkins CI/CD',
+    color: '#16a34a',
+    desc: '对接 Jenkins REST API，看 job/build 状态、最近构建结果、控制台输出、排队任务、节点健康。',
+    when: '需要查 CI 失败原因（"为啥昨晚的部署挂了"）、看构建队列堆积、巡检 agent offline 时。',
+  },
+  {
     code: 'mcp_client', name: '外部 MCP Server',
     color: '#64748b',
     desc: '反向接入符合 Anthropic MCP 协议的外部工具服务，启动时拉远端 tools 列表注册成本地 skill。',

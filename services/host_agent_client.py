@@ -118,6 +118,24 @@ class _HttpExec:
         self.port = int(port or 9100)
         self.token = token
         self.timeout_seconds = max(5, int(timeout_seconds or 60))
+        # 复用 requests.Session 维持 TCP 连接池 + 头部缓存。同一台 node 上 8 步循环
+        # 里可能打 4-5 次,每次新建连接浪费 50-200ms 的 TCP/TLS 握手。
+        # 线程安全说明:requests.Session 在 GET/POST 上是线程安全的（urllib3
+        # 的 PoolManager 是 thread-safe）;不要在多线程间共享 cookies/adapters mutate。
+        # 默认连接池 10 → 调大到 20,容纳跨节点并发查询。
+        self._session = requests.Session()
+        adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+        self._session.mount("http://", adapter)
+        self._session.mount("https://", adapter)
+        self._session.headers.update({"Authorization": f"Bearer {self.token}"})
+
+    def close(self) -> None:
+        """显式释放连接池——通常 host_agent_client 跟 platform 同寿命,不需要主动调。
+        给 hot-reload / 单测 cleanup 用。"""
+        try:
+            self._session.close()
+        except Exception:  # pragma: no cover
+            pass
 
     def exec(
         self,
@@ -139,10 +157,10 @@ class _HttpExec:
             "timeout_sec": int(timeout or self.timeout_seconds),
         }
         try:
-            resp = requests.post(
+            # 用 self._session 复用 TCP 连接 + 已注入的 Bearer header
+            resp = self._session.post(
                 url,
                 json=body,
-                headers={"Authorization": f"Bearer {self.token}"},
                 # +5s 给 agent 端 timeout 加缓冲；agent 自己也会超时切断子进程
                 timeout=int(timeout or self.timeout_seconds) + 5,
             )
@@ -185,11 +203,11 @@ class _HttpExec:
         """通用请求方法。失败时 status_code=-1 + ``{"error": "..."}``，不抛。"""
         url = f"http://{node_ip}:{self.port}{path}"
         try:
-            resp = requests.request(
+            # session.request 同样复用连接池 + session 已注入的 Authorization
+            resp = self._session.request(
                 method,
                 url,
                 json=json_body,
-                headers={"Authorization": f"Bearer {self.token}"},
                 timeout=timeout_seconds or self.timeout_seconds,
             )
         except requests.RequestException as exc:

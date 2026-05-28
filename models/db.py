@@ -236,6 +236,38 @@ class InMemoryStore:
             "last_message_at": now,
         }
 
+    def list_chat_sessions_by_user(
+        self, username: str, *, limit: int = 50,
+    ) -> list[dict]:
+        """列某个用户的会话,按 last_message_at 倒序(最近的在前)。
+
+        用 ``metadata_json.user`` 字段做关联——chainlit_app 落库时已把
+        ``user.username`` 写到这个字段。
+        """
+        rows = [
+            s for s in self.chat_sessions.values()
+            if (s.get("metadata_json") or {}).get("user") == username
+        ]
+        rows.sort(key=lambda s: s.get("last_message_at") or "", reverse=True)
+        return [deepcopy(s) for s in rows[:max(1, int(limit))]]
+
+    def get_chat_session(self, session_id: str) -> dict | None:
+        s = self.chat_sessions.get(session_id)
+        return deepcopy(s) if s else None
+
+    def delete_chat_session(self, session_id: str) -> int:
+        """删除会话及其所有消息(级联)。返回删了多少条 message。"""
+        removed = 0
+        new_msgs = []
+        for m in self.chat_messages:
+            if m.get("session_id") == session_id:
+                removed += 1
+            else:
+                new_msgs.append(m)
+        self.chat_messages = new_msgs
+        self.chat_sessions.pop(session_id, None)
+        return removed
+
     def save_chat_message(
         self,
         session_id: str,
@@ -1090,6 +1122,70 @@ class SQLStore:
                     ),
                     payload,
                 )
+
+    def list_chat_sessions_by_user(
+        self, username: str, *, limit: int = 50,
+    ) -> list[dict]:
+        """按 ``metadata_json.user`` 过滤会话,按 last_message_at desc。
+
+        用 ``JSON_UNQUOTE(JSON_EXTRACT(...))`` 而不是 ``->>`` —— MySQL 5.7 / TiDB 都支持。
+        """
+        from sqlalchemy import text
+        with self.engine.connect() as conn:
+            rows = conn.execute(
+                text(
+                    """
+                    SELECT * FROM chat_session
+                    WHERE JSON_UNQUOTE(JSON_EXTRACT(metadata_json, '$.user')) = :user
+                    ORDER BY last_message_at DESC
+                    LIMIT :limit
+                    """
+                ),
+                {"user": username, "limit": max(1, int(limit))},
+            ).mappings().all()
+        out: list[dict] = []
+        for r in rows:
+            d = dict(r)
+            md = d.get("metadata_json")
+            if isinstance(md, str):
+                try:
+                    d["metadata_json"] = json.loads(md)
+                except (TypeError, ValueError):
+                    d["metadata_json"] = {}
+            out.append(d)
+        return out
+
+    def get_chat_session(self, session_id: str) -> dict | None:
+        from sqlalchemy import text
+        with self.engine.connect() as conn:
+            row = conn.execute(
+                text("SELECT * FROM chat_session WHERE session_id = :sid"),
+                {"sid": session_id},
+            ).mappings().first()
+        if not row:
+            return None
+        d = dict(row)
+        md = d.get("metadata_json")
+        if isinstance(md, str):
+            try:
+                d["metadata_json"] = json.loads(md)
+            except (TypeError, ValueError):
+                d["metadata_json"] = {}
+        return d
+
+    def delete_chat_session(self, session_id: str) -> int:
+        """级联删除会话 + 消息;返回删了多少条 message(供前端反馈)。"""
+        from sqlalchemy import text
+        with self.engine.begin() as conn:
+            removed = conn.execute(
+                text("DELETE FROM chat_message WHERE session_id = :sid"),
+                {"sid": session_id},
+            ).rowcount or 0
+            conn.execute(
+                text("DELETE FROM chat_session WHERE session_id = :sid"),
+                {"sid": session_id},
+            )
+        return int(removed)
 
     def save_chat_message(
         self,

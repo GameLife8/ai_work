@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import time
 from datetime import UTC, datetime, timedelta
@@ -12,6 +13,97 @@ from ops_platform.registry import SkillRegistry, SkillSpec
 
 
 logger = logging.getLogger(__name__)
+
+
+# ---------- 审计日志脱敏 ---------- #
+#
+# 设计原因
+# --------
+# admin 在 host_run_command 里跑 ``mysql -uroot -p<password>`` /
+# ``curl -H 'Authorization: Bearer xxx'`` 时,凭证会原样进入 skill 的 params,
+# 进而被 _execute() 落到 ``platform_skill_call.args_json`` 明文存储。
+# 后续日志导出 / DB 备份 / admin 后台查历史都会暴露——典型的"审计日志反成
+# 数据泄露源"反模式。
+#
+# 这里做两层脱敏:
+# 1. **键名匹配**:params 顶层及一层嵌套的 key 名命中敏感词 → 值替换成 ``***``
+# 2. **command 字符串内的模式**:host_run_command / host_run_command_async 等
+#    skill 的 ``command`` 参数是 shell 字符串,要单独 regex 替换密码/token 段
+
+_SENSITIVE_KEY_PATTERNS = (
+    "password", "passwd", "api_key", "apikey", "secret", "token",
+    "authorization", "auth_token", "private_key", "credential",
+)
+
+# command 字符串里的常见凭证模式
+_COMMAND_REDACT_PATTERNS = [
+    # mysql -uroot -p<password> / mysql -p<password>
+    (re.compile(r"(-p)(\S+)"), r"\1***"),
+    # curl -H 'Authorization: Bearer xxx' / -H "X-Api-Key: xxx"
+    # 注意：替换 header 名后**所有**剩余值（包括 "Bearer xxx"、可能含空格的多 token）
+    # 直到结束引号或行尾——而不是只截到第一个空格。
+    (re.compile(r"(-H\s+['\"]?(?:Authorization|X-Api-Key|X-Auth-Token)\s*:\s*)[^'\"\n]+",
+                re.IGNORECASE), r"\1***"),
+    # URL 里的 user:password@host
+    (re.compile(r"(://[^:/\s]+:)([^@/\s]+)(@)"), r"\1***\3"),
+    # KEY=VALUE 形式的环境变量（在命令里）。注意 KEY 可能有前缀（DATABASE_PASSWORD），
+    # 所以前面允许任意 \w 前缀，而不是用 \b 做严格边界。
+    (re.compile(r"(\w*(?:PASSWORD|PASSWD|TOKEN|API_KEY|APIKEY|SECRET)\w*\s*=)(\S+)",
+                re.IGNORECASE), r"\1***"),
+]
+
+
+def _is_sensitive_key(key: str) -> bool:
+    """命中 _SENSITIVE_KEY_PATTERNS 任一子串即视为敏感。
+
+    把 ``-`` 也归一成 ``_``，让 ``X-API-KEY`` / ``X-Api-Key`` 这种 HTTP header 命名
+    也能被识别（不然 ``api-key`` 不包含 ``api_key`` 子串就会漏过）。
+    """
+    k = key.lower().replace("-", "_")
+    return any(s in k for s in _SENSITIVE_KEY_PATTERNS)
+
+
+def _redact_command_string(cmd: str) -> str:
+    """对 shell command 字符串做凭证模式替换。已 redact 字段返回新字符串。"""
+    if not isinstance(cmd, str):
+        return cmd
+    out = cmd
+    for pattern, repl in _COMMAND_REDACT_PATTERNS:
+        out = pattern.sub(repl, out)
+    return out
+
+
+def _redact_audit_args(args: dict, _depth: int = 0) -> dict:
+    """对将要落审计表的 params 做脱敏,**不修改原 dict**。
+
+    递归处理 dict / list,深度上限 4 层(skill 参数嵌套通常 1-2 层,留余量)。
+
+    脱敏规则:
+    1. key 命中 ``_SENSITIVE_KEY_PATTERNS`` → 值替换 ``***``
+    2. key 是 ``command`` 且值是字符串 → 跑 ``_redact_command_string``
+       (host_run_command / host_run_command_async 等的核心字段)
+    3. 其他 dict/list 递归;原始类型原样
+    """
+    if _depth > 4 or not isinstance(args, dict):
+        return args
+    out: dict = {}
+    for k, v in args.items():
+        if _is_sensitive_key(k):
+            out[k] = "***"
+        elif k == "command" and isinstance(v, str):
+            out[k] = _redact_command_string(v)
+        elif isinstance(v, dict):
+            out[k] = _redact_audit_args(v, _depth + 1)
+        elif isinstance(v, list):
+            out[k] = [
+                _redact_audit_args(item, _depth + 1) if isinstance(item, dict)
+                else (_redact_command_string(item) if isinstance(item, str) and "command" in k.lower()
+                      else item)
+                for item in v
+            ]
+        else:
+            out[k] = v
+    return out
 
 
 def _contains_stub_data(obj: Any, depth: int = 0) -> bool:
@@ -56,7 +148,25 @@ class SkillInvoker:
         params: dict[str, Any],
         ctx: SkillContext,
     ) -> dict[str, Any]:
-        spec = self.registry.get(code)
+        try:
+            spec = self.registry.get(code)
+        except KeyError:
+            return self._error_envelope(
+                f"skill {code!r} 未注册",
+                code="unknown_skill",
+            )
+
+        # RBAC 收口：visibility=admin 的 skill 只允许 role=admin 调用。
+        # 之前依赖 SkillRegistry.list(visibility="user") 在 tool schema 层过滤——
+        # LLM 路径下 user 看不到 admin-only 工具,但 HTTP API / runbook 引用 / 内部
+        # 调用都能直接绕过这层"看不见"。本层是真正的执行门禁。
+        user_role = (ctx.user or {}).get("role") or "user"
+        if spec.visibility == "admin" and user_role != "admin":
+            return self._error_envelope(
+                f"skill {code!r} 仅限 admin 角色调用（当前角色:{user_role}）",
+                code="forbidden",
+            )
+
         if spec.read_only:
             return self._execute(spec, params, ctx)
         # 写操作：进入两步流程，先生成 pending action
@@ -123,6 +233,18 @@ class SkillInvoker:
             self.store.update_pending_action_status(token, status="expired")
             return self._error_envelope("待确认操作已超时", code="expired")
 
+        # 防止 token 跨会话窃用：admin 后台 trace / DB 备份 / 调试日志都可能露出
+        # token 字符串，若不绑定 session，任意会话拿到 token 都能 confirm 写操作。
+        # 例外：如果 pending 记录没有 session_id（极少见，比如外部脚本注入），
+        # 退化为只看 token 本身 —— 但仍要求 ctx 必须有 session_id（不然就是来路不明）。
+        recorded_session = record.get("session_id")
+        current_session = ctx.session_id
+        if recorded_session and recorded_session != current_session:
+            return self._error_envelope(
+                "token 与当前会话不匹配，可能被跨会话重放",
+                code="session_mismatch",
+            )
+
         if record.get("requires_admin_approval") and (ctx.user or {}).get("role") != "admin":
             return self._error_envelope("该操作需管理员确认", code="forbidden")
 
@@ -150,6 +272,13 @@ class SkillInvoker:
             return self._error_envelope("未知的待确认 token", code="invalid_token")
         if record["status"] != "pending":
             return self._error_envelope(f"该操作已 {record['status']}", code="bad_state")
+        # 同 confirm()：防止跨会话拒绝（即便危害小，也是 DoS 路径）
+        recorded_session = record.get("session_id")
+        if recorded_session and recorded_session != ctx.session_id:
+            return self._error_envelope(
+                "token 与当前会话不匹配，可能被跨会话重放",
+                code="session_mismatch",
+            )
         updated = self.store.update_pending_action_status(
             token,
             status="rejected",
@@ -203,9 +332,11 @@ class SkillInvoker:
             )])
 
         try:
-            audit_args = dict(params)
+            # 审计前脱敏：详见模块顶部 _redact_audit_args 的设计说明。
+            # 原 params 不变（spec.handler 已经基于原 params 跑过），脱敏只影响审计落库。
+            audit_args = _redact_audit_args(params)
             if extra_audit:
-                audit_args = {**audit_args, "_extra": extra_audit}
+                audit_args = {**audit_args, "_extra": _redact_audit_args(extra_audit)}
             self.store.save_skill_call(
                 skill_code=spec.code,
                 connection_id=params.get("connection_id"),

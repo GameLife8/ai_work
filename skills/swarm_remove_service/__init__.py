@@ -10,12 +10,14 @@ MANIFEST = {
     "name": "删除 Swarm 服务",
     "description": (
         "删除某个 Swarm 服务（``docker service rm``），所有副本会被立即下线。"
-        "属于高危写操作，必须 admin 二次确认。"
+        "属于高危写操作,当前会话用户(admin)审批后执行。"
     ),
     "category": "swarm",
     "required_connection_type": "swarm",
     "read_only": False,
-    "requires_admin_approval": True,
+    # ``visibility=admin`` 已经把访问限制在 admin 角色——审批人就是 admin 自己,
+    # 不再需要 ``requires_admin_approval=True`` 自己审自己(语义冗余)。当前会话用户点确认即执行。
+    "requires_admin_approval": False,
     "visibility": "admin",
     "confirmation_ttl_seconds": 600,
     "params_schema": {

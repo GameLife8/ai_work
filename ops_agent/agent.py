@@ -57,6 +57,25 @@ _SUMMARY_PROMPT = (
 #
 # 关键词按"专属程度"匹配——查看类（"看一下"+"配置/YAML/原文"组合）专属性强，
 # 优先匹配；闲聊类专属性弱，最后兜底。
+#
+# 已知局限 / 未来升级路径
+# -----------------------
+# 关键词匹配天然脆——用户表达千变万化:
+#   - "看下都有啥" 不命中 list_state（漏 "列" / "有哪些"）
+#   - "瞧瞧 CPU 飙到哪了" 不命中 monitor 也不命中 diagnose
+#   - 表达 "为啥服务 X 跑不起来" vs "为什么 X 跑不起来" 全靠 "为什么 / 起不来" 撞中
+#
+# **当前缓解措施**:
+#   1. 关键词尽量覆盖常见变体（见下面的 list_state / monitor 里"显示/打印/瞧"类）
+#   2. 兜底走 ``None`` 意图 → full tool set,不会因为分类错失能力（只损失输出模式提示）
+#   3. ``_filter_tools_by_intent`` 过滤后 < 2 个 tool 时自动回退 full set
+#
+# **未来升级**（需要单独 1-2 天专项,不在本期 Medium 范围）:
+#   - 用小型 embedding 模型（如 BGE-small-zh / m3e-small）算用户消息和各意图
+#     canonical phrase 的相似度,top-1 作为意图
+#   - 或者用主模型自己做一轮短分类（额外 100-200 token,但准确率显著提升）
+#   - 落地时建议在 ModelManager 里允许配 "auxiliary_model_id" 跑分类任务,主模型
+#     专心干 tool calling
 
 # 触发词字典：意图 → 关键词列表（OR 关系）
 # 注意：``config_view`` 用 verb + noun **双命中**机制（见 _classify_intent），
@@ -79,12 +98,18 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
     "monitor": [
         "CPU", "cpu", "内存", "memory", "磁盘", "disk", "IO", "io",
         "负载", "load", "趋势", "峰值", "近 1 小时", "近 N 小时", "网络流量",
+        # 高频变体:
+        "飙到", "打满", "占用率", "使用率", "吃满", "爆了", "高吗",
+        "性能怎么样", "压力大不大",
     ],
     # C 类：列表 / 状态总览
     "list_state": [
         "列一下", "列出", "都有哪些", "有哪些", "多少个",
         "全部服务", "全部 pod", "全部 deployment", "所有",
         "状态总览", "概况", "概览",
+        # 用户高频变体（audit 漏掉的）：
+        "显示一下", "显示下", "打印一下", "打印下", "看下都有啥", "都有啥",
+        "都跑着啥", "跑了什么", "跑了哪些", "在跑啥",
     ],
     # G 类：知识 / 引导
     "knowledge": [
@@ -99,10 +124,12 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
     ],
     # A 类（诊断）兜底，靠关键词识别强信号
     "diagnose": [
-        "为什么", "起不来", "启动失败", "失败", "异常", "报错", "出错",
+        "为什么", "为啥", "起不来", "启动失败", "失败", "异常", "报错", "出错",
         "crashloop", "CrashLoop", "OOM", "oomkilled", "evicted",
         "连不上", "不通", "丢包", "502", "504", "卡顿", "慢",
         "排查", "诊断", "分析下", "看看怎么回事",
+        # 高频变体:
+        "怎么回事", "啥情况", "什么情况", "咋回事", "为何", "查一查",
     ],
 }
 
@@ -140,45 +167,94 @@ _CONFIG_VIEW_NOUNS = (
 # 按意图过滤后能省 ~3.5K tokens / 次（−14%）。失败回退：如果模型空手回了（既没
 # 调 tool 也没给文本），自动重试一次 full tool set。
 #
-# 设计原则：
-#   - 写操作意图也带 read query（写之前模型常常先查一下状态）
-#   - 诊断 / unknown 走全集——出错风险最高
-#   - chat_intro 不给 tool，纯文本即可
+# 设计原则（很重要，改这里前先读一遍）：
+#   1. **审批是平台正交关注点，不是意图的过滤维度**。
+#      ``host_run_command`` / ``host_run_command_async`` 这些走 admin 审批的逃生口
+#      该出现在哪个意图里就出现在哪个意图里——平台的 ``needs_confirmation`` 机制
+#      会接管确认流程；admin/user 权限由 ``SkillRegistry.list(visibility=...)``
+#      在上一层处理。意图层**不要**为了"审批麻烦"而剔除这些 skill，否则模型遇到
+#      ``host_query`` binary 白名单覆盖不到的命令（``docker ps`` / ``virsh list``
+#      等）就只能写"请联系 admin"的死信，体验非常差。
+#   2. **每个意图都应该是该类工作的完整工具箱**：典型只读 +（必要时）逃生口 +
+#      上下文相关的辅助 skill + runbook 入口。让模型选最合适的，不要让模型因为
+#      意图过滤"无米下锅"。
+#   3. **写操作意图天然带 read query**——写之前要先看状态确认目标。
+#   4. **chat_intro / knowledge** 是纯路由/引导意图，不真正取证，给 runbook 入口
+#      就够。
+#   5. **diagnose / 未知意图** 走全集 —— 跨层追根因的场景过滤掉任何 skill 都可能误伤。
 _INTENT_TOOLS: dict[str | None, list[str] | None] = {
     "config_view": [
-        # 通用查询三把口 + 日志（带 previous 引导，看配置时也常需要看 logs 验证）
+        # 通用查询三把口
         "kube_query", "swarm_query", "host_query",
+        # 集群一把口概览（看配置时常需要先定位节点 / 服务）
+        "swarm_cluster_overview",
+        # 日志也是"看原文"的一种
         "k8s_get_pod_logs",
-        # 配置 + 引导
+        # 容器网络 namespace 排障（看路由/iptables 配置）
+        "host_inspect_container_netns",
+        # 逃生口：``docker inspect`` / ``cat`` 大配置 / ``virsh dumpxml`` 等
+        # host_query binary 白名单覆盖不到的"看原文"场景。需 admin 审批，但
+        # 这是审批的职责不是意图过滤的职责。
+        "host_run_command", "host_run_command_async",
+        # 引导
         "platform_get_runbooks", "platform_run_runbook",
     ],
     "list_state": [
+        # 通用查询三把口（覆盖大多数列表场景：kube get / swarm service ls / df / ps）
         "kube_query", "swarm_query", "host_query",
-        "host_list_nodes", "host_list_tasks",
-        "platform_get_runbooks",
+        # 集群级一把口（节点 + 服务 + 监控）
+        "swarm_cluster_overview",
+        # 异步任务列表
+        "host_list_nodes", "host_list_tasks", "host_check_task",
+        # 逃生口：``docker ps`` / ``docker stats`` / ``virsh list`` 等
+        # 这是用户"我这台主机跑了哪些容器"最常踩的坑——
+        # host_query 的 binary 白名单故意不放 docker（隔离到 admin 审批），
+        # 没有这两把口模型就只能放弃取证。
+        "host_run_command", "host_run_command_async",
+        # 引导
+        "platform_get_runbooks", "platform_run_runbook",
     ],
     "monitor": [
-        # 监控指标系列
+        # Zabbix / 指标主线
         "zabbix_get_host_overview", "zabbix_get_host_storage_overview",
         "metric_query_peak", "metric_query_window_around",
-        # 补一手宿主机命令（vmstat / iostat 等）
+        # 一把口拉全集群监控（巡检场景必备）
+        "swarm_cluster_overview",
+        # 快速宿主机指标（vmstat / iostat / free / uptime / ps top）
         "host_query",
+        # 跨层定位："这台 node 上跑了什么服务/pod"
+        "swarm_query", "kube_query",
+        # 长采样（``sar -A 1 60`` / ``iostat -x 1 30``）+ 抓包
+        "host_run_command_async", "host_capture_packets",
+        # 内核 events——OOM / softlockup / call trace 等性能事件
+        "host_kernel_events",
+        # 引导
+        "platform_get_runbooks", "platform_run_runbook",
     ],
     "write_action": [
         # 全部写操作 skill
         "k8s_scale_deployment", "k8s_restart_deployment", "k8s_rollout_undo",
         "swarm_scale_service", "swarm_update_service_image",
         "swarm_rollback_service", "swarm_remove_service", "swarm_force_update_service",
+        # 逃生口（写）+ 抓包
         "host_run_command", "host_run_command_async", "host_capture_packets",
         # 写之前要先查状态确认目标
-        "kube_query", "swarm_query", "host_query",
+        "kube_query", "swarm_query", "host_query", "swarm_cluster_overview",
+        # 写完验证：日志
+        "k8s_get_pod_logs",
         # 也允许直接走 runbook（含写动作的 runbook）
         "platform_get_runbooks", "platform_run_runbook",
     ],
     "async_task": [
+        # 核心异步循环
         "host_run_command_async", "host_check_task", "host_list_tasks",
-        # 顺手查一下要在哪个 node 跑
-        "host_query", "kube_query", "swarm_query", "host_list_nodes",
+        # 长抓包本身就是异步任务
+        "host_capture_packets",
+        # 提交前查一下在哪台 node 跑
+        "host_query", "kube_query", "swarm_query",
+        "host_list_nodes", "swarm_cluster_overview",
+        # 引导（部分 runbook 含长任务步骤）
+        "platform_get_runbooks", "platform_run_runbook",
     ],
     "knowledge": [
         # 知识 / 引导类——只需要 runbook 入口
@@ -232,14 +308,21 @@ _INTENT_HINTS: dict[str, str] = {
         "3. 最后**可选**一句运维建议：「X 字段建议改 Y，避免 Z」。"
     ),
     "list_state": (
-        "🎯 **本次用户意图：列表 / 状态总览（C 类）—— 表格 + 异常项标注**\n"
-        "**严禁**写成段落式分析报告。\n"
+        "🎯 **本次用户意图:列表 / 状态总览(C 类)—— 先 raw 后解读**\n"
         "\n"
-        "**必须按这个格式输出**：\n"
-        "1. 用 markdown 表格列关键字段（名字 / 状态 / 副本 / 重启次数 / 创建时间 / Node）。\n"
-        "2. 异常项行首加 ⚠️ 或 🚨；行末加一句简短原因。\n"
-        "3. 表格下方给 1–2 句**总览结论**：「共 N 个，M 个异常」。\n"
-        "4. 如果有异常项，**主动追问**：「想详细看哪一个？我可以拉它的 describe / 日志」。"
+        "**铁律:能贴的原始输出先贴,再做简短解读。严禁把 raw 数据「加工」成中文段落丢失原文。**\n"
+        "\n"
+        "**必须按这个顺序输出**:\n"
+        "1. **第一段**:原样贴 skill 返回的 raw 输出\n"
+        "   - 命令输出(``docker ps`` / ``ss -ltnp`` / ``ps -ef`` 等)→ ``` 代码块包裹原文\n"
+        "   - JSON / 结构化数据(``kubectl get -o json`` 的 items)→ 转 markdown 表格\n"
+        "   - 字段挑关键的(名字 / 状态 / 镜像 / 副本 / 重启次数 / 创建时间 / Node / 端口)\n"
+        "2. **第二段**(1-3 句解读):有多少个,几个异常,哪些值得关注\n"
+        "3. 异常项行首加 ⚠️ 或 🚨;行末一句简短原因\n"
+        "4. 异常存在时**主动追问**:「想详细看哪一个? 我可以拉它的 describe / 日志」\n"
+        "\n"
+        "**反例**(严禁):用户问「跑了哪些容器」,你只写「共 28 个容器,1 个 ai-ops-agent...」 \n"
+        "—— 你**丢了** ``docker ps`` 的 NAMES/IMAGE/STATUS/PORTS 表格,用户没法看到具体每个容器。"
     ),
     "monitor": (
         "🎯 **本次用户意图：资源 / 性能监控（D 类）—— 数据卡片 + 解读**\n"
@@ -348,121 +431,134 @@ def _classify_intent_hint(user_message: str) -> str | None:
     return _INTENT_HINTS.get(intent) if intent else None
 
 
-def _is_config_query_trace_item(item: dict) -> bool:
-    """trace 里这一条是不是「查看配置类」的调用？
+def _is_data_query_trace_item(item: dict) -> bool:
+    """trace 里这一条是不是「拉数据」型只读调用?
 
-    用作 _augment_message_for_intent 的 trace 兜底——即使意图分类没识别到
-    config_view（关键词漏匹配），只要 trace 里有"明显的配置查询调用"，平台
-    也应该兜底贴原文。
-
-    判定标准：
-    - kube_query verb=get/describe，resource 是 configmap/secret/deploy/...
-    - swarm_query verb=inspect（service/stack/network/...）
-    - host_query 调 cat 类命令读 /etc/... 配置文件
+    通用化:任何 host/swarm/kube/swarm_cluster_overview 的成功只读调用都算。
     """
     if item.get("status") != "ok":
         return False
     tool = item.get("tool_name", "")
-    args = item.get("tool_args") or {}
-    if tool == "kube_query":
-        verb = (args.get("verb") or "").lower()
-        resource = (args.get("resource") or "").lower()
-        if verb in ("get", "describe") and resource in (
-            "configmap", "configmaps", "cm",
-            "secret", "secrets",
-            "deploy", "deployment", "deployments",
-            "service", "services", "svc",
-            "ingress", "ingresses", "ing",
-            "statefulset", "statefulsets", "sts",
-            "daemonset", "daemonsets", "ds",
-            "pv", "pvc", "pod", "pods",
-        ):
-            return True
-    if tool == "swarm_query":
-        verb = (args.get("verb") or "").lower()
-        if verb == "inspect":
-            return True
-    if tool == "host_query":
-        cmd = (args.get("command") or "").strip()
-        # cat / head / tail 读配置文件
-        if cmd.startswith(("cat ", "head ", "tail ")) and ("/etc/" in cmd or "/conf" in cmd):
-            return True
+    if tool in ("kube_query", "swarm_query", "host_query",
+                "swarm_cluster_overview",
+                "zabbix_get_host_overview", "zabbix_get_host_storage_overview"):
+        return True
     return False
 
 
+def _message_already_has_raw(message: str) -> bool:
+    """模型自己已经贴了原文(code block 或 markdown 表格) → 平台不重复贴。
+
+    markdown 表格判定:有 ``| --- |`` 这种分隔行(table separator),
+    必须严格,避免把 ``|`` 当 OR 用的普通文本误判成表格。
+    """
+    if not message:
+        return True
+    if "```" in message:
+        return True
+    # markdown table separator 行:开头是 `|`,主体是 `-` 和 `|`
+    import re
+    if re.search(r"^\s*\|[\s\-:|]+\|\s*$", message, re.M):
+        return True
+    return False
+
+
+def _extract_raw_for_display(item: dict) -> tuple[str, str]:
+    """从 trace item 抽可直接展示的 raw 文本,返回 (text, lang)。空 raw 返回 ("","" )。
+
+    优先级:
+      1. swarm_query 反推的 ``compose_yaml`` —— 用户最熟悉的格式
+      2. ``items`` / ``nodes`` / 其它简单 list 字段 —— 转 JSON
+      3. ``stdout`` —— 命令原文
+      4. ``parsed`` —— JSON
+    """
+    result = item.get("tool_result") or {}
+    if not isinstance(result, dict):
+        return "", ""
+
+    compose_yaml = result.get("compose_yaml")
+    if compose_yaml and isinstance(compose_yaml, str) and compose_yaml.strip():
+        return compose_yaml, "yaml"
+
+    stdout = result.get("stdout") or ""
+    if stdout and isinstance(stdout, str) and stdout.strip():
+        # 推语言:看头部有没有 YAML 风格冒号
+        head = stdout[:200]
+        if ":" in head and "\n" in head and any(c in head for c in ("-", " ")):
+            return stdout, "yaml"
+        return stdout, ""    # 留空让 chainlit 按默认渲染(更像 ``docker ps`` 表格)
+
+    parsed = result.get("parsed")
+    if parsed not in (None, [], {}):
+        try:
+            return json.dumps(parsed, ensure_ascii=False, indent=2, default=str), "json"
+        except Exception:
+            pass
+
+    return "", ""
+
+
 def _augment_message_for_intent(message: str, trace: list[dict], user_message: str) -> str:
-    """**平台保证机制**：模型偷懒不照输出模式办的时候，平台兜底补全。
+    """**平台保证机制**:能展示 raw 数据就先展示,不能展示的才让模型出报告。
 
-    触发条件（任一即可）：
-    1. 意图分类识别为 config_view
-    2. trace 里有"明显的配置查询"调用（_is_config_query_trace_item）
+    设计哲学(对应用户反馈"能展示的优先展示输出结果"):
+      不再依赖意图分类(关键词太脆弱——"iiot" 撞 "io"、"在跑"漏 list_state...
+      用户也明确说不要再扩词典污染 prompt)。改用 **trace 事实判定**:
 
-    满足触发但回答里没有 ``` 代码块 → 自动从 trace 抽 stdout/parsed 拼末尾。
+    触发条件(全部满足):
+      1. trace 里至少有一个"拉数据"型成功调用(host/swarm/kube/zabbix 等)
+      2. trace 里没有 ``needs_confirmation`` 状态的写操作(那是审批说明场景,
+         raw 不该冲走模型写的"我打算执行...请确认"那段话)
+      3. 模型生成的 message **还没**自己贴 raw(没 ``` code block 也没 markdown
+         表格分隔行 ``| --- |``)
 
-    第 2 条是兜底中的兜底——关键词识别永远有漏（用户表达千变万化），
-    但 trace 里的真实调用是确定性证据。
+    满足 → 从 trace 抽最近一条 raw 输出拼到 message 末尾,用 ``` 包裹。
+
+    用户原话:
+      > "匹配用户的关键词感觉还是太差了,关键词扩展我感觉就不要了"
+      → 所以不能再靠 _classify_intent 做判定
     """
     if not message:
         return message
-    intent = _classify_intent(user_message)
-    # 触发条件 1：意图命中 config_view
-    triggered = (intent == "config_view")
-    # 触发条件 2：trace 里有明显的配置查询调用
-    config_query_item = None
-    for item in reversed(trace or []):
-        if _is_config_query_trace_item(item):
-            config_query_item = item
-            triggered = True
-            break
-    if not triggered:
-        return message
-    # 已有代码块 → 模型自己贴了，不动
-    if "```" in message:
+
+    # 模型自己贴 raw 了 → 不重复
+    if _message_already_has_raw(message):
         return message
 
-    # 从 trace 里抽 raw 内容——优先用 _is_config_query_trace_item 命中的那条
-    raw_text = ""
-    raw_lang = "yaml"
-    candidates = ([config_query_item] if config_query_item else []) + list(reversed(trace or []))
-    for item in candidates:
-        if not item or item.get("status") != "ok":
-            continue
-        tool = item.get("tool_name", "")
-        if tool not in ("kube_query", "swarm_query", "host_query"):
-            continue
-        result = item.get("tool_result") or {}
-        stdout = result.get("stdout") or ""
-        parsed = result.get("parsed")
-        # 优先级 1：swarm_query 反推的 compose.yml 风格 YAML（用户最熟悉的格式）
-        compose_yaml = result.get("compose_yaml")
-        if compose_yaml and isinstance(compose_yaml, str):
-            raw_text = compose_yaml
-            raw_lang = "yaml"
+    # 写操作 needs_confirmation 场景 → 模型在写"我打算执行...请确认"那段
+    # 应该被原样呈现,raw 拼上来会喧宾夺主。同时确认卡片在下方独立显示。
+    for item in (trace or []):
+        if item.get("status") == "needs_confirmation":
+            return message
+        if item.get("pending_token"):
+            return message
+
+    # 找最近一条"拉数据"成功调用
+    data_item = None
+    for item in reversed(trace or []):
+        if _is_data_query_trace_item(item):
+            data_item = item
             break
-        # 优先级 2：parsed JSON（kubectl get -o json / docker inspect 等）
-        if parsed:
-            try:
-                raw_text = json.dumps(parsed, ensure_ascii=False, indent=2, default=str)
-                raw_lang = "json"
-                break
-            except Exception:
-                pass
-        # 优先级 3：raw stdout
-        if stdout and isinstance(stdout, str) and stdout.strip():
-            raw_text = stdout
-            raw_lang = "yaml" if any(c in stdout[:200] for c in (":", "-")) else "text"
-            break
+    if data_item is None:
+        return message
+
+    raw_text, raw_lang = _extract_raw_for_display(data_item)
     if not raw_text:
         return message
-    # 太长截到 12K 字符（用户 UI 上能 scroll 看完；超长还可以让用户去 admin UI 查 trace）
+
+    # 截 12K 字符防 UI 撑爆;完整原文在 admin UI → 调用审计可查
     if len(raw_text) > 12_000:
-        raw_text = raw_text[:12_000] + "\n# ...（更多内容已截断，完整原文在 admin UI → 调用审计中可看）"
-    # 友好标题——不带"模型未贴"这种像在追责的话；用户看不出来是模型还是平台贴的
+        raw_text = (
+            raw_text[:12_000]
+            + "\n# …(更多内容已截断,完整原文在 admin UI → 调用审计可查)"
+        )
+
+    fence_lang = raw_lang if raw_lang else ""
     return (
         message.rstrip()
         + "\n\n---\n\n"
-        + "### 📋 完整原始配置\n\n"
-        + f"```{raw_lang}\n{raw_text}\n```"
+        + "### 📋 原始数据\n\n"
+        + f"```{fence_lang}\n{raw_text}\n```"
     )
 
 
@@ -622,11 +718,78 @@ _LEGACY_SYSTEM_PROMPT = """
 """.strip()
 
 
+def _parse_tool_call_args(tool_call: dict) -> tuple[dict | None, dict | None]:
+    """解析 ``tool_call.function.arguments``，把 JSON 失败转成 error envelope。
+
+    国产模型偶发会输出截断的 JSON / 带中文引号的 JSON / 顶层不是 object 的合法 JSON
+    （传成 list 或 string）。这些情况下直接 ``json.loads`` 会抛 JSONDecodeError 把
+    整个 ``ask()`` 中断，用户看不到任何反馈、已消耗的 token 全浪费。
+
+    本函数把"硬抛错"转成"软错误"——返回 error envelope 让 agent 回灌给模型，模型
+    下一轮能基于这个错误自纠正。
+
+    Returns:
+        ``(args, None)`` 解析成功；
+        ``(None, error_envelope)`` 解析失败，error_envelope 应当回灌给模型。
+    """
+    fn = tool_call.get("function", {})
+    name = fn.get("name")
+    raw_args = fn.get("arguments") or "{}"
+    try:
+        args = json.loads(raw_args)
+    except json.JSONDecodeError as exc:
+        return None, {
+            "skill": name,
+            "status": "error",
+            "error": f"参数 JSON 解析失败：{exc}",
+            "result": {
+                "_hint": "请重新调用该工具，确保 arguments 是合法的 JSON object。"
+                         "如果含中文，注意必须用 ASCII 双引号包裹键值。",
+                "raw_arguments_preview": str(raw_args)[:200],
+            },
+        }
+    if not isinstance(args, dict):
+        return None, {
+            "skill": name,
+            "status": "error",
+            "error": f"arguments 顶层必须是 JSON object，实际是 {type(args).__name__}",
+            "result": {
+                "_hint": "请重新调用该工具，arguments 必须是 {\"key\": \"value\"} 形式的 object。",
+                "raw_arguments_preview": str(raw_args)[:200],
+            },
+        }
+    return args, None
+
+
 @dataclass
 class AgentOutcome:
     message: str
     trace: list[dict[str, Any]]
     pending_actions: list[dict[str, Any]] = field(default_factory=list)
+    # Token usage：本次 ask() 内所有 LLM 调用的累计消耗。
+    # 结构：{"prompt_tokens": int, "completion_tokens": int, "total_tokens": int,
+    #        "calls": int, "model": str（首个 model 名）}
+    # 由 chainlit_app / API 入口持久化（写入 chat_message.metadata.usage 或
+    # 单独的 platform_token_usage 表）。空 dict 表示模型未返回 usage 字段（部分
+    # 国产模型早期版本可能漏返）。
+    usage: dict[str, Any] = field(default_factory=dict)
+
+
+def _accumulate_usage(total: dict[str, Any], step_usage: dict[str, Any]) -> None:
+    """把单步 usage 累加到 total。原位修改 total。
+
+    Args:
+        total: ``AgentOutcome.usage`` 的累加 dict
+        step_usage: ``message["_usage"]`` 取出来的单步消耗
+    """
+    if not step_usage:
+        return
+    total["prompt_tokens"] = total.get("prompt_tokens", 0) + step_usage.get("prompt_tokens", 0)
+    total["completion_tokens"] = total.get("completion_tokens", 0) + step_usage.get("completion_tokens", 0)
+    total["total_tokens"] = total.get("total_tokens", 0) + step_usage.get("total_tokens", 0)
+    total["calls"] = total.get("calls", 0) + 1
+    # model 取首次出现的（同会话中途切模型场景极少）
+    total.setdefault("model", step_usage.get("model", "unknown"))
 
 
 class UnifiedOpsAgent:
@@ -642,14 +805,24 @@ class UnifiedOpsAgent:
     def _load_system_prompt(self) -> str:
         """从 store 加载 prompt 段落，缺失/未启用的段用出厂默认兜底。
 
-        每次 ask() 都重新组装一次——admin 改完 prompt 立即对下一次会话生效，
-        不需要重启进程。这是平台从"硬编码"变"运营资产"的关键。
+        每次 ask() 都重新组装一次——admin 改完 prompt 通常在 ≤5s 内对下一次
+        会话生效（受 ``runtime.prompt_segments_cache`` TTL 影响）。
+
+        历史 perf 槽点：25 个并发 session 每秒打 25 次 ``list_prompt_segments``,
+        DB 没必要扛。runtime 上挂了 TTL 缓存（默认 5s）,hit 率高且不损失运营体验。
         """
         store = self.runtime.store
-        try:
-            records = store.list_prompt_segments() if hasattr(store, "list_prompt_segments") else []
-        except Exception:
-            records = []
+        cache = getattr(self.runtime, "prompt_segments_cache", None)
+
+        def _load() -> list:
+            try:
+                if not hasattr(store, "list_prompt_segments"):
+                    return []
+                return store.list_prompt_segments() or []
+            except Exception:
+                return []
+
+        records = cache.get(_load) if cache is not None else _load()
         if not records:
             return assemble_default()
         return assemble_from_records(records)
@@ -671,8 +844,14 @@ class UnifiedOpsAgent:
         说明：这段也参与 prompt cache（如果模型 SDK 支持）。每次都重算所以
         admin 在管理后台改 alias 立即对下一句对话生效。
         """
+        # 走 runtime 的 TTL cache 避免每次 ask() 都打 DB（25 并发 ×/秒）。
+        # ``list()`` 内部已经 enabled 过滤,这里再二次过滤主要为兼容 cache 返回。
+        cache = getattr(self.runtime, "connections_list_cache", None)
         try:
-            conns = self.runtime.connection_manager.list()
+            if cache is not None:
+                conns = cache.get(lambda: self.runtime.connection_manager.list())
+            else:
+                conns = self.runtime.connection_manager.list()
         except Exception:
             return "## 当前可用集群\n\n（无法列出 connection——可能 store 未就绪）"
 
@@ -804,12 +983,47 @@ class UnifiedOpsAgent:
         session_id: str | None = None,
         selected_connections: dict[str, str] | None = None,
     ) -> AgentOutcome:
+        # ⭐ 集群关键字自动路由 —— 按 connection.tags 子串匹配 user_message
+        # ====================================================================
+        # 解决:用户说"bigdata-swarm 巡检"时,平台不能傻乎乎走默认 connection。
+        # 把 user_message 跟每个 enabled connection 的 ``tags`` 做子串匹配,
+        # 每个 type 选命中 tag 数最多的胜出,塞进 ``selected_connections``。
+        # SkillContext.connection_for(type, None) 会优先用 selected,无命中再走 default。
+        #
+        # 设计要点:
+        # - 完全基于 admin 给 connection 打的 ``tags`` —— 这是 single source of truth,
+        #   不在代码里写死任何集群别名/IP。新增集群只要在后台打 tag,平台自动路由。
+        # - 用户在 chainlit ChatSettings 里**显式选过的 connection 优先级最高**,
+        #   不被自动路由覆盖(``setdefault`` 语义)。
+        # - 与现有的 ``_build_cluster_registry_prompt`` 互补:那个是给 LLM 看的指引
+        #   (走 tool loop 时让模型自己挑 connection_id);自动路由是给"模型不参与
+        #   决策"的路径(预路由 runbook / signal-driven fallback)兜底。
+        # ====================================================================
+        sel = dict(selected_connections or {})
+        for type_code, cid in self._resolve_clusters_from_query(user_message).items():
+            sel.setdefault(type_code, cid)
+
         ctx = SkillContext(
             runtime=self.runtime,
             user=user,
             session_id=session_id,
-            selected_connections=selected_connections or {},
+            selected_connections=sel,
         )
+
+        # ⭐ Runbook 强路由 —— 标准化流程绕开模型 tool loop
+        # ====================================================================
+        # 国产模型对"看到巡检/体检关键词主动调 platform_run_runbook"的指令遵循
+        # 率很低,常常自己拆 swarm_query + zabbix 拼来拼去,踩 hostname/IP 不匹配
+        # 等老坑。
+        #
+        # 解决方案:平台层做关键词预匹配,用户消息命中某个 enabled runbook 的
+        # triggers 时,**直接绕过模型决策**,强制走 platform_run_runbook。
+        # 模型只参与最终报告生成(在 runbook 内部),不参与"走不走 runbook"。
+        # ====================================================================
+        pre = self._maybe_runbook_preroute(user_message, ctx)
+        if pre is not None:
+            return pre
+
         visibility = "user" if user and user.get("role") != "admin" else None
         full_tools = self.registry.openai_tools(visibility=visibility)
 
@@ -869,6 +1083,9 @@ class UnifiedOpsAgent:
         all_signals: list[dict[str, Any]] = []
         # 已经被"signal 强制 pivot"路径用过的 (skill, args_json) —— 避免同信号无限循环
         force_routed_keys: set[tuple[str, str]] = set()
+        # Token usage 累计：每次 create_completion 后从 message["_usage"] 累加；
+        # ask() 结束时塞到 AgentOutcome.usage 给入口层（chainlit_app / API）持久化。
+        total_usage: dict[str, Any] = {}
 
         for step in range(self.max_steps):
             # ⏬ 调用 LLM 前先压缩 messages，防止 8 步循环里上下文越积越多撑爆窗口
@@ -877,6 +1094,7 @@ class UnifiedOpsAgent:
             message = self.model.create_completion(
                 messages=messages, tools=tools, tool_choice="auto",
             )
+            _accumulate_usage(total_usage, message.pop("_usage", {}))
             tool_calls = message.get("tool_calls") or []
             content = (message.get("content") or "").strip()
 
@@ -892,6 +1110,7 @@ class UnifiedOpsAgent:
                 message = self.model.create_completion(
                     messages=messages, tools=tools, tool_choice="auto",
                 )
+                _accumulate_usage(total_usage, message.pop("_usage", {}))
                 tool_calls = message.get("tool_calls") or []
                 content = (message.get("content") or "").strip()
 
@@ -911,23 +1130,27 @@ class UnifiedOpsAgent:
                     )
                     if envelope.get("status") == "needs_confirmation":
                         pending_actions.append(envelope)
-                        # 进入"待确认"路径：让模型给一段提议+风险说明就结束
+                        # 进入"待确认"路径——同主流程,只写 2-3 句精炼提议,
+                        # 不重写卡片内容,确保按钮始终在屏幕内可见
                         summary = self.model.create_completion(
                             messages=messages + [{
                                 "role": "system",
                                 "content": (
-                                    f"平台已根据 {reason} 自动调用 {name}({args})，"
-                                    "结果是写操作 needs_confirmation。请用中文向用户说明："
-                                    "你打算执行什么、为什么、影响范围、回滚方式。**禁止再调用任何工具**。"
+                                    f"平台已根据 {reason} 自动调用 ``{name}``,返回 needs_confirmation。\n"
+                                    "**chainlit 下方会自动弹确认卡片(✅/❌ 按钮)——你不要重写 skill/参数/有效期等卡片已有信息**。\n"
+                                    "请用中文 2-3 句话:为什么平台触发了这个调用 / 主要风险点 / "
+                                    "**结尾写**:`请在下方点击 ✅ 确认 或 ❌ 取消`。**禁止再调任何工具**。"
                                 ),
                             }],
                         )
+                        _accumulate_usage(total_usage, summary.pop("_usage", {}))
                         return AgentOutcome(
                             message=_augment_message_for_intent(
-                                summary.get("content") or "操作待用户确认。",
+                                summary.get("content") or "请在下方点击 ✅ 确认 或 ❌ 取消。",
                                 trace, user_message),
                             trace=trace,
                             pending_actions=pending_actions,
+                            usage=total_usage,
                         )
                     # 只读 fallback：把"合成的工具调用"塞进 messages，让下一轮 LLM 看到结果，
                     # 自己决定是给最终报告还是再调其它 skill。
@@ -972,12 +1195,14 @@ class UnifiedOpsAgent:
                             )},
                         ],
                     )
+                    _accumulate_usage(total_usage, summary.pop("_usage", {}))
                     return AgentOutcome(
                         message=_augment_message_for_intent(
                             summary.get("content") or "已完成排查，但模型没有输出总结。",
                             trace, user_message),
                         trace=trace,
                         pending_actions=pending_actions,
+                        usage=total_usage,
                     )
                 return AgentOutcome(
                     message=_augment_message_for_intent(
@@ -985,6 +1210,7 @@ class UnifiedOpsAgent:
                         trace, user_message),
                     trace=trace,
                     pending_actions=pending_actions,
+                    usage=total_usage,
                 )
 
             messages.append({"role": "assistant", "content": message.get("content") or "",
@@ -999,7 +1225,21 @@ class UnifiedOpsAgent:
             for tool_call in tool_calls:
                 fn = tool_call.get("function", {})
                 name = fn.get("name")
-                args = json.loads(fn.get("arguments") or "{}")
+                # JSON 解析交给 _parse_tool_call_args（含截断 JSON / 顶层非 object 等
+                # 国产模型偶发输出的容错）；失败时回灌 error envelope 让模型自纠正。
+                args, err_envelope = _parse_tool_call_args(tool_call)
+                if err_envelope is not None:
+                    logger.warning(
+                        "model %s 返回非法 tool_call arguments；已回灌 error 让模型重试",
+                        name,
+                    )
+                    trace.append(self._to_trace_item(name, {}, err_envelope))
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": self.invoker.serialize_for_model(err_envelope),
+                    })
+                    continue   # 跳过这次 tool_call，继续处理同轮的其他 tool_calls
                 dedup_key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str))
                 cached = turn_call_cache.get(dedup_key)
                 if cached is not None:
@@ -1034,23 +1274,42 @@ class UnifiedOpsAgent:
                     messages.append({"role": "system", "content": hint})
 
             if had_pending:
-                # 写操作已挂起：让模型给用户出"提议+风险说明"，并停止 tool 循环。
+                # 写操作已挂起:让模型给一段**精炼**的「为什么 + 风险」,**不要重写卡片内容**
+                # ----------------------------------------------------------------
+                # 平台 chainlit 已经会在下方独立卡片里把 skill / 参数 / 接入 / 有效期
+                # 全部展示。如果让模型再写一遍"执行内容 / 影响范围 / 回滚方式",会:
+                #   1. 拖长消息把卡片按钮挤到屏幕外,用户找不到按钮就超时(实测踩坑)
+                #   2. token 浪费
+                #   3. 信息冗余,用户反而看花眼
+                #
+                # 改成只让模型写"基于我刚才的取证,为什么要做这个操作 / 主要风险点",
+                # 卡片内容由 chainlit 自己呈现。
                 summary = self.model.create_completion(
                     messages=messages + [{
                         "role": "system",
                         "content": (
-                            "上面工具结果中有 ``_pending=True`` 的写操作待确认。"
-                            "请用中文向用户说明：你打算执行什么、为什么、影响范围、回滚方式。"
-                            "**禁止再次调用任何工具**，让平台等待用户在 UI 上点击确认/取消。"
+                            "上面工具结果中有 ``_pending=True`` 的写操作待确认。\n"
+                            "**chainlit 下方会自动弹一张包含 skill / 参数 / 有效期的确认卡片,带 ✅ / ❌ 按钮——"
+                            "你不要重写这些信息**。\n"
+                            "\n"
+                            "你只需要用**中文 2-3 句话**给出:\n"
+                            "  - 基于刚才取证发现了什么(1 句)\n"
+                            "  - 主要风险或注意事项(1 句,可选)\n"
+                            "\n"
+                            "结尾**必须**写一句:`请在下方点击 ✅ 确认 或 ❌ 取消`(让用户立刻意识到按钮在下方)。\n"
+                            "\n"
+                            "**禁止再次调用任何工具**。"
                         ),
                     }],
                 )
+                _accumulate_usage(total_usage, summary.pop("_usage", {}))
                 return AgentOutcome(
                     message=_augment_message_for_intent(
-                        summary.get("content") or "操作待用户确认。",
+                        summary.get("content") or "请在下方点击 ✅ 确认 或 ❌ 取消。",
                         trace, user_message),
                     trace=trace,
                     pending_actions=pending_actions,
+                    usage=total_usage,
                 )
 
         summary = self.model.create_completion(
@@ -1063,12 +1322,14 @@ class UnifiedOpsAgent:
                 )},
             ],
         )
+        _accumulate_usage(total_usage, summary.pop("_usage", {}))
         return AgentOutcome(
             message=_augment_message_for_intent(
                 summary.get("content") or "已完成排查，但模型没有输出总结。",
                 trace, user_message),
             trace=trace,
             pending_actions=pending_actions,
+            usage=total_usage,
         )
 
     def follow_up_after_action(
@@ -1091,6 +1352,137 @@ class UnifiedOpsAgent:
             ],
         )
         return summary.get("content") or "（模型未输出总结）"
+
+    def _resolve_clusters_from_query(
+        self,
+        user_message: str,
+    ) -> dict[str, str]:
+        """按 ``connection.tags`` 子串匹配 user_message,推断每种 type 走哪条 connection。
+
+        Returns:
+            ``{type_code: connection_id}`` —— 只包含**真有匹配**的 type。
+            没匹配的 type 不写入,让调用方走平台 default。
+
+        匹配规则
+        --------
+        对每个 enabled connection,把它所有 ``tags`` 小写化,做 substring 命中
+        user_message(也小写化)。每个 type 选**命中 tag 数最多**的 connection;
+        平票时按 ``name`` 字典序选,保证 deterministic。
+
+        无任何 tag 命中的 type 直接不写入返回。
+
+        为什么用 tags
+        ------------
+        ``connection.tags`` 是 admin 在后台显式设的**集群识别关键词**,是 single
+        source of truth。**完全不在代码里写死任何集群别名 / IP / 节点名**——新增集群
+        只要在 admin UI 给 connection 打 tag,平台立刻能识别。
+
+        Args:
+            user_message: 用户原话(任意长度);空字符串/None 时返回空 dict。
+
+        Examples:
+            tags=['bigdata', 'bigdata-swarm', '169.24.2.193'] + user="bigdata-swarm 巡检"
+                → 命中 2 个 tag(bigdata + bigdata-swarm),作为该 type 的胜者
+        """
+        if not user_message:
+            return {}
+        text = user_message.lower()
+
+        try:
+            conns = self.runtime.connection_manager.list()
+        except Exception as exc:  # pragma: no cover(防御性)
+            logger.warning("自动集群路由:列 connection 失败,跳过:%s", exc)
+            return {}
+
+        # 按 type 分组候选 ——【connection, hit_tag_list】
+        by_type: dict[str, list[tuple[dict, list[str]]]] = {}
+        for c in conns:
+            if not c.get("enabled", True):
+                continue
+            type_code = c.get("type_code")
+            if not type_code:
+                continue
+            tags = [str(t).lower().strip() for t in (c.get("tags") or []) if str(t).strip()]
+            hits = [t for t in tags if t and t in text]
+            if not hits:
+                continue
+            by_type.setdefault(type_code, []).append((c, hits))
+
+        selected: dict[str, str] = {}
+        for type_code, candidates in by_type.items():
+            # 命中 tag 数多者胜;平票按 name 字典序(deterministic 复测)
+            candidates.sort(key=lambda x: (-len(x[1]), x[0].get("name", "")))
+            winner_conn, winner_hits = candidates[0]
+            selected[type_code] = winner_conn["id"]
+            logger.info(
+                "auto-route [%s]: → %s (alias=%r, hit_tags=%s, candidates=%d)",
+                type_code, winner_conn["id"], winner_conn.get("alias"),
+                winner_hits, len(candidates),
+            )
+        return selected
+
+    def _maybe_runbook_preroute(
+        self,
+        user_message: str,
+        ctx: SkillContext,
+    ) -> AgentOutcome | None:
+        """Runbook 强路由:用户消息命中 trigger 关键词 → 强制执行 runbook。
+
+        返回值语义:
+          - ``AgentOutcome`` —— 命中并执行成功,直接当作最终回复,调用方应原样返回
+          - ``None``         —— 未命中或不可用,调用方应继续走原 tool loop
+
+        为什么不依赖模型自己识别"复合场景"调 platform_run_runbook
+        =========================================================
+        实测国产模型对这条 prompt 的遵循度低——同样的"巡检"问题,7b/13b 模型常常
+        漏掉 platform_run_runbook,自己拆 N 个 swarm_query 拼,结果跑偏。
+
+        在 agent 循环最前面做一次确定性的 trigger 匹配,可以保证:
+          1. 标准化流程一定走 runbook(SOP 保证)
+          2. tool loop 步数从 N 步 → 1 步,token 消耗骤降
+          3. 任何新增 runbook 都自动享受路由,**无需改 prompt 也无需改 agent**
+        """
+        registry = getattr(self.runtime, "runbook_registry", None)
+        if registry is None:
+            return None
+
+        try:
+            rb = registry.match_by_query(user_message or "")
+        except Exception as exc:  # pragma: no cover  (防御性)
+            logger.warning("runbook 预路由匹配抛异常,fallback 到 tool loop:%s", exc)
+            return None
+        if rb is None:
+            return None
+
+        logger.info(
+            "runbook 预路由命中 [%s],强制走 platform_run_runbook(绕过模型 tool 决策)",
+            rb.key,
+        )
+
+        args = {"user_query": user_message, "inputs": {}}
+        envelope = self.invoker.invoke("platform_run_runbook", args, ctx)
+        trace = [self._to_trace_item("platform_run_runbook", args, envelope)]
+
+        result = envelope.get("result") or {}
+        final_report = (result.get("final_report") or "").strip()
+        if not final_report:
+            # runbook 跑完但没生成最终报告(报告模型挂掉 / global_status != done):
+            # 给个简要兜底,让用户知道发生了什么,可以去 admin UI 看完整 trace。
+            final_report = (
+                f"⚠️ 已经按剧本 ``{rb.key}`` 自动执行,但模型未生成最终报告。\n"
+                f"\n"
+                f"- global_status: ``{result.get('global_status')}``\n"
+                f"- abort_reason: ``{result.get('abort_reason')}``\n"
+                f"- total_ms: {result.get('total_ms')}\n"
+                f"\n"
+                f"原始 ``node_states`` 已落审计,可在管理后台 → Runbook 执行历史查看。"
+            )
+
+        return AgentOutcome(
+            message=final_report,
+            trace=trace,
+            pending_actions=[],
+        )
 
     @staticmethod
     def _to_trace_item(name: str, args: dict, envelope: dict) -> dict:

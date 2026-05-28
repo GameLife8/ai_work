@@ -14,12 +14,14 @@ MANIFEST = {
         "在指定节点的宿主机 namespace 中执行任意命令——**这是平台唯一的'逃生口'**，"
         "白名单 skill 覆盖不到的临时排障才用。"
         "默认通过 nsenter 进入 PID/MNT/NET/UTS/IPC namespace，等价于在宿主机上跑命令。"
-        "**强制 admin 二次确认**，所有调用全审计；不要用本 skill 替代正常诊断 skill。"
+        "**当前会话用户(admin)审批后执行**,所有调用全审计;不要用本 skill 替代正常诊断 skill。"
     ),
     "category": "host",
     "required_connection_type": "host_agent",
     "read_only": False,
-    "requires_admin_approval": True,
+    # ``visibility=admin`` 已经把访问限制在 admin 角色——审批人就是 admin 自己,
+    # 不再需要 ``requires_admin_approval=True`` 自己审自己(语义冗余)。当前会话用户点确认即执行。
+    "requires_admin_approval": False,
     "visibility": "admin",
     "confirmation_ttl_seconds": 600,
     "params_schema": {

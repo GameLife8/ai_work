@@ -18,6 +18,7 @@ const routes = [
       { path: 'prompts', component: () => import('./views/Prompts.vue'), meta: { adminOnly: true } },
       { path: 'pending', component: () => import('./views/PendingActions.vue') },
       { path: 'async-tasks', component: () => import('./views/AsyncTasks.vue') },
+      { path: 'maintenance', component: () => import('./views/Maintenance.vue'), meta: { adminOnly: true } },
       { path: 'users', component: () => import('./views/Users.vue'), meta: { adminOnly: true } },
       { path: 'audit', component: () => import('./views/Audit.vue'), meta: { adminOnly: true } },
     ],

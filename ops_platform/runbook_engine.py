@@ -347,11 +347,19 @@ def validate_runbook(
         errors.append(f"图存在环：{' → '.join(cycle)}")
 
     # 引用语法的轻量校验（只看一层 $）
+    # 注意：resolve_ref 支持 ``$a||$b||literal`` fallback 语法（见函数文档），
+    # validator 必须跟上——把 ref 按 ``||`` 拆开，逐段校验 $-开头的 token，
+    # 字面值 token 跳过。否则带 ``||`` 的 runbook 会被误判为非法引用。
     for nid, n in rb.nodes.items():
         for k, v in n.args.items():
             for ref in _iter_refs(v):
-                if not REF_PATTERN.match(ref):
-                    errors.append(f"node {nid} 参数 {k}={ref!r} 格式不合法")
+                tokens = [t.strip() for t in ref.split("||")] if "||" in ref else [ref]
+                for tok in tokens:
+                    if not tok or not tok.startswith("$"):
+                        continue   # 空段或字面值兜底,不需要按引用语法校验
+                    if not REF_PATTERN.match(tok):
+                        errors.append(f"node {nid} 参数 {k}={tok!r} 格式不合法")
+                        break
 
     return errors
 
@@ -433,6 +441,41 @@ def _jsonpath_get(obj: Any, path: str) -> Any:
     return cur
 
 
+def _coerce_literal(token: str) -> Any:
+    """对 fallback 链尾部的字面值 token 智能转型。
+
+    背景:runbook YAML 里 ``$user.X||1`` 整个 value 是字符串,Python 解析出来 ``"1"``
+    是字符串。直接传给下游 skill 会让 ``compute_window("1")`` / ``int < "1"`` 之类
+    爆 ``TypeError: '<=' not supported between instances of 'str' and 'int'``。
+
+    转型规则:
+        - ``"123"`` → int
+        - ``"1.5"`` / ``"1e3"`` → float
+        - ``"true"`` / ``"false"`` (大小写不敏感) → bool
+        - ``"null"`` / ``"none"`` → None
+        - 其它 → 原字符串
+    """
+    s = token.strip()
+    if not s:
+        return s
+    low = s.lower()
+    if low == "true":  return True
+    if low == "false": return False
+    if low in ("null", "none"): return None
+    # int 先于 float 试 — "10" 走 int 而不是 float(10.0)
+    try:
+        # 拒绝 "10.0" 当 int(避免吃掉用户故意写的浮点)
+        if "." not in s and "e" not in low:
+            return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
+
+
 def resolve_ref(value: Any, ctx: "ExecutionContext") -> Any:
     """把单个值（可能含 $-引用）解析成实际值。
 
@@ -445,6 +488,9 @@ def resolve_ref(value: Any, ctx: "ExecutionContext") -> Any:
                                 —— 用户不传 pod_name 时回退到 list skill 的第一个 pod，
                                 避免 runbook 因为 ``field_ne ... != None`` 的 if_when
                                 guard 把所有诊断节点都 skip 掉。
+                                **字面值自动转型**：``||1`` → ``int(1)``,``||1.5`` →
+                                ``float(1.5)``,``||true`` → ``bool(True)``。否则下游
+                                skill 收到字符串 ``"1"`` 做数值比较会爆 TypeError。
 
     非引用字符串原样返回；不识别的 $-串当作字面值返回（防止误删用户字符串）。
     """
@@ -457,7 +503,11 @@ def resolve_ref(value: Any, ctx: "ExecutionContext") -> Any:
             token = token.strip()
             if not token:
                 continue
-            sub = resolve_ref(token, ctx)
+            if token.startswith("$"):
+                sub = resolve_ref(token, ctx)
+            else:
+                # 字面值兜底——做类型推断,避免下游收到字符串爆 TypeError
+                sub = _coerce_literal(token)
             if sub not in (None, "", [], {}):
                 return sub
         return None

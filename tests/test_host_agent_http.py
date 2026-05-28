@@ -43,11 +43,13 @@ class _FakeResp:
 def test_http_exec_happy_path(monkeypatch):
     captured = {}
 
-    def fake_post(url, json=None, headers=None, timeout=None):
+    # 现在 _HttpExec 内部用 requests.Session 复用连接,headers（Authorization Bearer）
+    # 通过 session.headers 默认注入,**不再**作为 per-call kwarg 传给 post。
+    # 所以测试不再断言 headers kwarg,改为在断言段直接看 session.headers。
+    def fake_post(url, json=None, **kw):
         captured["url"] = url
         captured["json"] = json
-        captured["headers"] = headers
-        captured["timeout"] = timeout
+        captured["timeout"] = kw.get("timeout")
         return _FakeResp(200, {
             "exit_code": 0,
             "stdout": "PID 1 systemd\n",
@@ -57,10 +59,9 @@ def test_http_exec_happy_path(monkeypatch):
             "timeout": False,
         })
 
-    import services.host_agent_client as mod
-    monkeypatch.setattr(mod.requests, "post", fake_post)
-
     http = _HttpExec(port=9100, token="t-1", timeout_seconds=30)
+    monkeypatch.setattr(http._session, "post", fake_post)
+
     stdout, stderr, rc = http.exec("10.0.0.5", ["ps", "1"], nsenter="muinp", timeout=20)
 
     assert stdout == "PID 1 systemd\n"
@@ -68,16 +69,16 @@ def test_http_exec_happy_path(monkeypatch):
     assert rc == 0
     assert captured["url"] == "http://10.0.0.5:9100/v1/exec"
     assert captured["json"] == {"cmd": ["ps", "1"], "nsenter": "muinp", "timeout_sec": 20}
-    assert captured["headers"] == {"Authorization": "Bearer t-1"}
+    # Authorization 走 session-default header,不在 per-call kwargs
+    assert http._session.headers["Authorization"] == "Bearer t-1"
     # 平台侧的 HTTP 超时 = agent 端 timeout_sec + 5 缓冲
     assert captured["timeout"] == 25
 
 
 def test_http_exec_4xx_returns_negative_rc(monkeypatch):
-    import services.host_agent_client as mod
-    monkeypatch.setattr(mod.requests, "post",
-                        lambda *a, **kw: _FakeResp(403, {"error": "command not in whitelist"}))
     http = _HttpExec(port=9100, token="t", timeout_seconds=10)
+    monkeypatch.setattr(http._session, "post",
+                        lambda *a, **kw: _FakeResp(403, {"error": "command not in whitelist"}))
     stdout, stderr, rc = http.exec("1.1.1.1", ["bad_cmd"])
     assert stdout == ""
     assert rc == -1
@@ -91,8 +92,8 @@ def test_http_exec_network_error(monkeypatch):
     def boom(*a, **kw):
         raise mod.requests.ConnectionError("nope")
 
-    monkeypatch.setattr(mod.requests, "post", boom)
     http = _HttpExec(port=9100, token="t", timeout_seconds=10)
+    monkeypatch.setattr(http._session, "post", boom)
     stdout, stderr, rc = http.exec("1.1.1.1", ["true"])
     assert rc == -1
     assert "network error" in stderr.lower()
@@ -142,10 +143,9 @@ def test_swarm_http_exec_uses_node_inspect_addr(monkeypatch):
         captured["json"] = json
         return _FakeResp(200, {"exit_code": 0, "stdout": "ok\n", "stderr": ""})
 
-    import services.host_agent_client as mod
-    monkeypatch.setattr(mod.requests, "post", fake_post)
-
     http = _HttpExec(port=9100, token="t", timeout_seconds=10)
+    monkeypatch.setattr(http._session, "post", fake_post)
+
     agent = SwarmHostAgent(sw, transport="http", http=http)
     result = agent.exec_on_node("worker2", ["echo", "hi"])
 
@@ -168,10 +168,9 @@ def test_swarm_http_nsenter_passes_flags_to_agent(monkeypatch):
         captured["json"] = json
         return _FakeResp(200, {"exit_code": 0, "stdout": "systemd\n", "stderr": ""})
 
-    import services.host_agent_client as mod
-    monkeypatch.setattr(mod.requests, "post", fake_post)
-
     http = _HttpExec(port=9100, token="t", timeout_seconds=10)
+    monkeypatch.setattr(http._session, "post", fake_post)
+
     agent = SwarmHostAgent(sw, transport="http", http=http)
     result = agent.nsenter_on_node("worker2", ["cat", "/proc/1/comm"])
 
@@ -194,8 +193,7 @@ def test_swarm_http_nsenter_fallback_when_target_pid_not_1(monkeypatch):
         captured["json"] = json
         return _FakeResp(200, {"exit_code": 0, "stdout": "", "stderr": ""})
 
-    import services.host_agent_client as mod
-    monkeypatch.setattr(mod.requests, "post", fake_post)
+    monkeypatch.setattr(http._session, "post", fake_post)
 
     agent.nsenter_on_node("worker2", ["ss", "-ltn"], target_pid=12345)
     # 应该在客户端拼 nsenter -t 12345 ... -- ss -ltn
@@ -256,8 +254,7 @@ def test_k8s_http_path_uses_internal_ip(monkeypatch):
     agent = K8sHostAgent(kube, transport="http", http=http)
 
     captured: dict = {}
-    import services.host_agent_client as mod
-    monkeypatch.setattr(mod.requests, "post",
+    monkeypatch.setattr(http._session, "post",
                         lambda url, json=None, **kw: (
                             captured.update(url=url, json=json),
                             _FakeResp(200, {"exit_code": 0, "stdout": "ok", "stderr": ""}),

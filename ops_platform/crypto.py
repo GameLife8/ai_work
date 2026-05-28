@@ -133,3 +133,42 @@ def reset_for_test() -> None:
     with _lock:
         _fernet = None
         _warned_missing = False
+
+
+class EncryptionNotConfigured(RuntimeError):
+    """STRICT_ENCRYPTION=true 但 PLATFORM_ENCRYPTION_KEY 未配置时抛出。"""
+
+
+def ensure_strict_encryption(strict: bool) -> None:
+    """启动期 fail-fast 检查。
+
+    ``strict=True`` 时,若 ``PLATFORM_ENCRYPTION_KEY`` 未配置 / 解析失败,直接抛
+    ``EncryptionNotConfigured``,**阻止进程启动**——避免明文数据悄悄落库后
+    才发现漏掉了加密配置（事后补救代价极大,需要把所有历史 row 解密 + 重加密）。
+
+    生产环境 Docker compose / k8s manifest 务必设 ``STRICT_ENCRYPTION=true``;
+    本地开发 / CI 不设,降级走原来的 warning + 明文路径。
+
+    Args:
+        strict: 通常传 ``Config.STRICT_ENCRYPTION``。
+
+    Raises:
+        EncryptionNotConfigured: strict 且密钥未配置 / 不可用。
+    """
+    if not strict:
+        return
+    if is_active():
+        return
+    raw = os.getenv(_KEY_ENV, "").strip()
+    if not raw:
+        raise EncryptionNotConfigured(
+            f"STRICT_ENCRYPTION=true 但 {_KEY_ENV} 未配置。"
+            f"生产环境必须设置加密密钥,否则敏感字段（api_key / 凭证）会明文落库。"
+            f"\n生成密钥：python scripts/generate_encryption_key.py"
+            f"\n或临时关闭 strict 模式：STRICT_ENCRYPTION=false（仅限开发/测试）。"
+        )
+    # 配置了但 build_fernet 返回 None —— 说明 cryptography 包没装或 key 解析挂了
+    raise EncryptionNotConfigured(
+        f"STRICT_ENCRYPTION=true 但 {_KEY_ENV} 解析失败 / cryptography 包不可用。"
+        f"请检查 key 格式（44 字符 Fernet key 或任意 passphrase）并确认依赖已安装。"
+    )

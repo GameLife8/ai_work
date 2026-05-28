@@ -40,6 +40,10 @@ class Config:
     # STORE_STRICT=true 时，DB 连接失败直接 raise（生产建议打开），
     # 不会悄悄走内存 store 让用户以为数据落库了
     STORE_STRICT = os.getenv("STORE_STRICT", "false").lower() == "true"
+    # STRICT_ENCRYPTION=true 时，PLATFORM_ENCRYPTION_KEY 未配置直接 raise
+    # 启动失败（生产强制要求）。否则只 warning + 降级明文（开发友好）。
+    # 推荐：生产 Docker compose / k8s 部署强制设 true，本地开发不设。
+    STRICT_ENCRYPTION = os.getenv("STRICT_ENCRYPTION", "false").lower() == "true"
 
     AI_PROVIDER = os.getenv("AI_PROVIDER", "volcengine_coding")
     AI_BASE_URL = os.getenv("AI_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")

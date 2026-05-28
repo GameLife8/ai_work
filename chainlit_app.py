@@ -352,22 +352,38 @@ def _generate_concrete_examples(inventory: dict[str, list[dict]]) -> list[str]:
     return examples
 
 
-@cl.on_chat_start
-async def on_chat_start() -> None:
-    user = _current_user()
-    cl.user_session.set("platform_user", user)
-    cl.user_session.set("runtime", _runtime)
-    cl.user_session.set("agent", UnifiedOpsAgent(_runtime, max_steps=Config.AGENT_MAX_REASONING_STEPS))
+def _short_session_title(session: dict, runtime) -> str:
+    """从会话取一个可读标题:首条 user 消息前 30 字。"""
+    sid = session["session_id"]
+    try:
+        msgs = runtime.store.list_chat_messages(sid, limit=1, exclude_summary=True)
+        for m in msgs:
+            if m.get("role") == "user" and (m.get("content") or "").strip():
+                first = m["content"].strip().replace("\n", " ")
+                return (first[:30] + "…") if len(first) > 30 else first
+    except Exception:
+        pass
+    return "(空会话)"
 
-    session_id = str(uuid.uuid4())
-    cl.user_session.set("session_id", session_id)
-    cl.user_session.set("selected_connections", {})
 
-    # 持久化 session 元数据到平台 store —— 跟 chainlit 内部的内存会话区分开，
-    # 平台这边的 chat_sessions / chat_messages 表是真正的持久审计层。
+def _format_session_label(s: dict, runtime) -> str:
+    """单行可读 label,用在 ChatSettings 下拉里。
+
+    格式:``2026-05-21 03:01 · bigdata-swarm 巡检… · 1cfe6f48``
+    """
+    title = _short_session_title(s, runtime)
+    last = (s.get("last_message_at") or s.get("created_at") or "")[:16].replace("T", " ")
+    sid = s["session_id"]
+    return f"{last} · {title} · {sid[:8]}"
+
+
+async def _start_new_session(user: dict) -> str:
+    """生成新 uuid + 写 chat_session,返回 session_id。"""
+    sid = str(uuid.uuid4())
+    cl.user_session.set("session_id", sid)
     try:
         _runtime.store.save_chat_session(
-            session_id,
+            sid,
             metadata={
                 "channel": "chainlit",
                 "entrypoint": "chainlit_app.py",
@@ -376,16 +392,55 @@ async def on_chat_start() -> None:
                 "started_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
             },
         )
-    except Exception as exc:
-        # 不挂掉 chat —— 用户能继续聊天，只是会话元数据没存
+    except Exception as exc:    # noqa: BLE001
         print(f"[chainlit] save_chat_session failed: {exc}")
+    return sid
 
-    # 当前 inventory（重新枚举，反映 admin 后台最新接入）
+
+async def _resume_session(sid: str, user: dict) -> None:
+    """绑定到已有 session_id + 在 UI 上重放最近 N 条消息让用户看到上下文。"""
+    cl.user_session.set("session_id", sid)
+    try:
+        msgs = _runtime.store.list_chat_messages(sid, limit=40, exclude_summary=True)
+    except Exception as exc:
+        await cl.Message(content=f"⚠️ 无法读取会话历史:{exc}").send()
+        return
+    await cl.Message(
+        content=f"♻️ 已恢复会话 `{sid[:8]}…`,下面是最近 {len(msgs)} 条上下文:",
+    ).send()
+    for m in msgs:
+        role = m.get("role", "")
+        content = (m.get("content") or "").strip()
+        if not content or role not in ("user", "assistant"):
+            continue
+        # chainlit 的 cl.Message 默认就是 assistant 视觉;user 消息没法完美还原,
+        # 用 author + 前缀让用户看出是谁说的。
+        prefix = "👤 你:" if role == "user" else ""
+        await cl.Message(
+            content=(prefix + "\n\n" + content) if prefix else content,
+            author=("user" if role == "user" else "assistant"),
+        ).send()
+    await cl.Message(content="── 历史结束,你可以继续提问 ──").send()
+
+
+_RESUME_NEW = "➕ 开始新会话"
+_RESUME_KEEP = "<继续当前会话>"
+_DELETE_NONE = "<不删除>"
+
+
+async def _setup_chat_settings_for_clusters(user: dict) -> None:
+    """ChatSettings 顶栏齿轮:
+       1. 切 host_agent / swarm / k8s / zabbix 默认集群
+       2. **会话历史**——切到任意历史会话 / 删除会话
+
+    设计选择:用顶栏齿轮里的 Select 而不是在消息流堆几十个按钮——
+    后者实测视觉混乱(用户反馈过)。chainlit 没原生侧边栏组件,这是
+    最接近"可伸缩控制面板"的 native 做法。
+    """
     inventory = _build_resource_inventory()
     cl.user_session.set("inventory", inventory)
 
-    # ChatSettings 下拉：支持手动切 host_agent / swarm / k8s / zabbix 默认集群
-    settings_inputs = []
+    settings_inputs: list = []
     for t, label in [
         ("host_agent", "🖥️ 当前节点 Agent (host_*)"),
         ("swarm",      "🐝 当前 Swarm 集群"),
@@ -398,7 +453,6 @@ async def on_chat_start() -> None:
         ]
         if not opts:
             continue
-        # 加一个 "<自动按 LLM 路由>" 选项作为默认（用户不主动切就让 LLM 自己挑）
         all_labels = ["<自动按对话内容路由>"] + [o["label"] for o in opts]
         settings_inputs.append(cl.input_widget.Select(
             id=f"{t}_connection_id",
@@ -408,18 +462,93 @@ async def on_chat_start() -> None:
         ))
         cl.user_session.set(f"{t}_opts", opts)
 
+    # ---- 会话历史下拉 ---- #
+    username = (user or {}).get("username") or ""
+    sessions: list[dict] = []
+    if username:
+        try:
+            sessions = _runtime.store.list_chat_sessions_by_user(username, limit=20)
+        except Exception as exc:    # noqa: BLE001
+            print(f"[chainlit] list_chat_sessions_by_user failed: {exc}")
+
+    # 即使没历史也加这两个 select,让 UI 永远一致 + 给"新会话"按钮的位置
+    history_labels = [_format_session_label(s, _runtime) for s in sessions]
+    label_to_sid = {lbl: s["session_id"] for lbl, s in zip(history_labels, sessions)}
+    cl.user_session.set("history_label_to_sid", label_to_sid)
+
+    resume_values = [_RESUME_KEEP, _RESUME_NEW] + history_labels
+    settings_inputs.append(cl.input_widget.Select(
+        id="resume_session",
+        label=f"📜 会话历史 (共 {len(sessions)} 条) — 切换或新建",
+        values=resume_values,
+        initial_index=0,
+    ))
+    cl.user_session.set("last_resume_choice", _RESUME_KEEP)
+
+    if history_labels:
+        delete_values = [_DELETE_NONE] + history_labels
+        settings_inputs.append(cl.input_widget.Select(
+            id="delete_session",
+            label="🗑️ 删除会话(立即生效,不可恢复)",
+            values=delete_values,
+            initial_index=0,
+        ))
+        cl.user_session.set("last_delete_choice", _DELETE_NONE)
+
     if settings_inputs:
         await cl.ChatSettings(settings_inputs).send()
 
-    # 动态欢迎页：列真集群 + 真示例
+
+@cl.on_chat_start
+async def on_chat_start() -> None:
+    user = _current_user()
+    cl.user_session.set("platform_user", user)
+    cl.user_session.set("runtime", _runtime)
+    cl.user_session.set("agent", UnifiedOpsAgent(_runtime, max_steps=Config.AGENT_MAX_REASONING_STEPS))
+    cl.user_session.set("selected_connections", {})
+
+    # 装 ChatSettings(切集群 + 会话历史下拉)
+    # —— 不再用消息流堆按钮(实测丑且按钮太多),改成顶栏齿轮里的紧凑控制面板
+    await _setup_chat_settings_for_clusters(user)
+
+    # 默认开新会话,不打扰 — 想管理历史请点右上角齿轮 ⚙️
+    await _start_new_session(user)
+
+    # 短欢迎语 + 提示历史会话在哪
+    username = (user or {}).get("username") or ""
+    history_count = 0
+    if username:
+        try:
+            history_count = len(_runtime.store.list_chat_sessions_by_user(username, limit=20))
+        except Exception:
+            history_count = 0
+
+    inventory = cl.user_session.get("inventory") or {}
     welcome = _format_welcome_message(user, inventory)
+    if history_count > 0:
+        # ⚠️ chainlit 2.x 的 ChatSettings 入口在**底部输入框左侧**的 ⚙️ 图标
+        # (跟 📎 附件图标在一行),不是浏览器右上角。指引措辞必须精确,
+        # 否则用户找不到。
+        welcome = (
+            f"> 💡 你有 **{history_count}** 个历史会话。\n"
+            f"> 在**底部输入框左下**找到 ⚙️ 图标(跟 📎 附件并排)→ "
+            f"打开后会看到「📜 会话历史」「🗑️ 删除会话」两个下拉,选了立刻生效。\n"
+            f"\n"
+            + welcome
+        )
     await cl.Message(content=welcome).send()
 
 
 @cl.on_settings_update
 async def on_settings_update(settings: dict) -> None:
-    """通用 settings 处理：支持任意 type 的手动覆盖。``<自动按对话内容路由>``
-    选项不写进 selected_connections，让 LLM 走名录自动匹配。"""
+    """通用 settings 处理:
+       1. 集群手动覆盖(host_agent / swarm / k8s / zabbix)
+       2. 会话历史:切换 / 删除
+
+    会话切换 / 删除靠"值跟上次比对",变了就触发。这是 ChatSettings 没有按钮
+    类型组件的折中——Select 改了 → on_settings_update 触发 → 检测差异。
+    """
+    # ---- 1. 集群覆盖 ---- #
     selected: dict[str, str] = {}
     for t in ("host_agent", "swarm", "k8s", "zabbix"):
         label = settings.get(f"{t}_connection_id")
@@ -430,6 +559,47 @@ async def on_settings_update(settings: dict) -> None:
         if match:
             selected[t] = match["value"]
     cl.user_session.set("selected_connections", selected)
+
+    user = cl.user_session.get("platform_user") or {}
+    label_to_sid = cl.user_session.get("history_label_to_sid") or {}
+
+    # ---- 2. 会话切换 / 新建 ---- #
+    resume_choice = settings.get("resume_session")
+    last_resume = cl.user_session.get("last_resume_choice") or _RESUME_KEEP
+    if resume_choice and resume_choice != last_resume:
+        cl.user_session.set("last_resume_choice", resume_choice)
+        if resume_choice == _RESUME_NEW:
+            await _start_new_session(user)
+            await cl.Message(content="✨ 已开始新会话,可以接着提问。").send()
+        elif resume_choice in label_to_sid:
+            sid = label_to_sid[resume_choice]
+            await _resume_session(sid, user)
+        # _RESUME_KEEP 不动
+
+    # ---- 3. 会话删除 ---- #
+    delete_choice = settings.get("delete_session")
+    last_delete = cl.user_session.get("last_delete_choice") or _DELETE_NONE
+    if delete_choice and delete_choice != last_delete and delete_choice != _DELETE_NONE:
+        cl.user_session.set("last_delete_choice", delete_choice)
+        sid = label_to_sid.get(delete_choice)
+        if sid:
+            try:
+                removed = _runtime.store.delete_chat_session(sid)
+            except Exception as exc:    # noqa: BLE001
+                await cl.Message(content=f"⚠️ 删除失败:{exc}").send()
+                return
+            # 如果删的是当前会话,自动开新会话避免后续消息写到已删的 sid
+            current_sid = cl.user_session.get("session_id")
+            if current_sid == sid:
+                await _start_new_session(user)
+                await cl.Message(
+                    content=f"🗑️ 已删除当前会话 `{sid[:8]}`(连同 {removed} 条消息),已自动为你开新会话。",
+                ).send()
+            else:
+                await cl.Message(
+                    content=f"🗑️ 已删除会话 `{sid[:8]}`(连同 {removed} 条消息)。"
+                            f"刷新页面可让齿轮里的下拉同步移除该条。",
+                ).send()
 
 
 @cl.on_message
@@ -495,10 +665,15 @@ async def on_message(message: cl.Message) -> None:
 
     # ---- 最终中文报告 ----
     if runtime and session_id:
+        meta: dict = {"trace_count": len(outcome.trace)}
+        # 把本次 ask() 的 LLM token usage 落到 metadata 一并存——后续可走
+        # admin UI 聚合（按 session / user / day）做成本分账 + 异常预警。
+        if outcome.usage:
+            meta["usage"] = outcome.usage
         runtime.store.save_chat_message(
             session_id, "assistant", outcome.message,
             trace=outcome.trace,
-            metadata={"trace_count": len(outcome.trace)},
+            metadata=meta,
         )
     await cl.Message(content=outcome.message).send()
 
@@ -513,20 +688,26 @@ async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, sess
     args_pretty = json.dumps(preview.get("args") or {}, ensure_ascii=False, indent=2)
     needs_admin = preview.get("requires_admin_approval")
 
+    # 顶部加一行**强调按钮**的指引——避免「模型已经写了一大段说明,卡片按钮被挤到屏幕外
+    # 用户没看到就超时」这种历史 UX 坑。
     body = (
+        f"## 👇 点击下方 ✅ 或 ❌ 按钮做出选择\n\n"
         f"⚠️ **写操作待确认**\n\n"
         f"- Skill：`{preview.get('skill_code')}`（{preview.get('skill_name')}）\n"
         f"- 接入：`{preview.get('connection_id') or '默认'}`\n"
         f"- 参数：\n```json\n{args_pretty}\n```\n"
         + ("- ⚙️ 此操作需 **管理员** 确认\n" if needs_admin else "")
-        + f"- 有效期至：{pending.get('expires_at')}"
+        + f"- 有效期至：{pending.get('expires_at')}\n\n"
+        + f"_未在 30 分钟内选择将默认放弃_"
     )
 
     actions = [
         cl.Action(name="confirm_action", payload={"token": token}, label="✅ 确认执行"),
         cl.Action(name="reject_action", payload={"token": token}, label="❌ 拒绝"),
     ]
-    res = await cl.AskActionMessage(content=body, actions=actions, timeout=300).send()
+    # timeout 1800s = 30 分钟。300s(5 分钟)实测太短——模型生成的说明往往拖一段,
+    # 等到用户看完往下滚到按钮可能已超过 5 分钟。
+    res = await cl.AskActionMessage(content=body, actions=actions, timeout=1800).send()
     if not res:
         await cl.Message(content="（已超时未操作，本次写操作不会执行）").send()
         return

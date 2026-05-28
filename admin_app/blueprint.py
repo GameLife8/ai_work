@@ -320,20 +320,17 @@ def update_model(model_id):
     body = request.get_json(silent=True) or {}
     fields = {k: v for k, v in body.items()
               if k in {"provider", "name", "base_url", "api_key", "model",
-                       "timeout_seconds", "is_default", "enabled"}}
+                       "timeout_seconds", "is_default", "enabled",
+                       "tool_choice_preference"}}
     if "api_key" in fields:
         existing = _store().get_model_config(model_id) or {}
         fields["api_key"] = _unmask_value(fields["api_key"], existing.get("api_key", ""))
         if not fields["api_key"]:
             fields.pop("api_key")
+    # model_manager.update 会自动失效 _client_cache 并触发 on_change 回调
+    # （已在 runtime._attach_refresh_method 里注册了 refresh_legacy_clients），
+    # 这里不用再手动调任何 refresh——见 ops_platform/model_manager.py 顶部 docstring。
     record = _runtime().model_manager.update(model_id, **fields)
-
-    # 改的是默认模型 → 刷 alert pipeline 老链路用的 AIClient
-    if record and (record.get("is_default") or fields.get("is_default")):
-        refresh = getattr(_runtime(), "refresh_legacy_clients", None)
-        if callable(refresh):
-            refresh()
-
     return jsonify(_strip_secrets(record, ("api_key",)))
 
 
@@ -885,6 +882,215 @@ def chat_sessions():
     if hasattr(store, "chat_sessions") and isinstance(store.chat_sessions, dict):
         return jsonify(list(store.chat_sessions.values()))
     return jsonify([])
+
+
+# ============================================================================
+# Maintenance: 清理 host_agent 残留 sibling 容器
+# ============================================================================
+#
+# 设计动机
+# --------
+# ``AGENT_MODE=docker_proxy`` 下 agent 用 ``docker run --rm`` 起一次性 sibling
+# 容器跑 nsenter。正常情况 sibling 退出 docker 自动 ``--rm`` 销毁。但极端情况
+# (docker daemon 卡死 / agent 被 OOM kill / docker run 自身没正常退出)可能
+# 留下 stopped 容器占节点磁盘空间。
+#
+# 本接口给运维一个"应急按钮"——扫所有 host_agent 集群里所有节点上的残留 stopped
+# sibling,在 UI 上勾选清掉。直接走 ``client.exec_on_node`` 跑 ``docker ps``/
+# ``docker rm``,不需要改 agent 镜像(agent allowed.yml 已经允许 sh/bash,
+# 通过 ``sh -c "docker ..."`` 在 host ns 跑 docker 命令)。
+
+import shlex as _shlex
+
+
+def _ps_stopped_containers_cmd() -> list[str]:
+    """构造列 host 上 stopped 容器的命令(sh -c)。
+
+    输出 tab 分隔 5 列:ID / Image / Names / Status / CreatedAt
+    """
+    fmt = r"{{.ID}}\t{{.Image}}\t{{.Names}}\t{{.Status}}\t{{.CreatedAt}}"
+    return ["sh", "-c",
+            f"docker ps -a --filter status=exited --format '{fmt}'"]
+
+
+def _parse_ps_output(stdout: str, image_filter: str | None) -> list[dict]:
+    """解析 docker ps tab 分隔输出;按 image_filter 子串过滤。
+
+    image_filter 为空 / None 时返回全量。
+    """
+    rows: list[dict] = []
+    for line in (stdout or "").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        parts = line.split("\t")
+        if len(parts) < 4:
+            continue
+        cid, image, name, status, *rest = parts
+        if image_filter and image_filter.lower() not in image.lower():
+            continue
+        created_at = rest[0] if rest else ""
+        rows.append({
+            "container_id": cid,
+            "image": image,
+            "name": name,
+            "status": status,
+            "created_at": created_at,
+        })
+    return rows
+
+
+@admin_bp.get("/maintenance/sibling-containers")
+@_login_required(role="admin")
+def maintenance_scan_sibling_containers():
+    """扫所有 enabled host_agent 集群里每个节点的 stopped 残留容器。
+
+    Query params:
+        image_filter: 镜像名子串过滤,默认 ``ai-ops-agent``。传空表示不过滤(看全部 stopped)。
+
+    Returns:
+        ``{"image_filter", "connections": [...], "errors": [...]}``
+    """
+    raw_filter = request.args.get("image_filter")
+    image_filter = ("ai-ops-agent" if raw_filter is None else raw_filter).strip()
+    runtime = _runtime()
+    conn_mgr = runtime.connection_manager
+
+    out_per_conn: list[dict] = []
+    errors: list[dict] = []
+
+    for conn in conn_mgr.list(type_code="host_agent"):
+        if not conn.get("enabled", True):
+            continue
+        try:
+            client = conn_mgr.get_client(conn["id"])
+            nodes = client.list_nodes()
+        except Exception as exc:    # noqa: BLE001
+            errors.append({
+                "connection_id": conn["id"],
+                "alias": conn.get("alias") or conn["name"],
+                "phase": "list_nodes",
+                "error": str(exc),
+            })
+            continue
+
+        conn_block: dict = {
+            "connection_id": conn["id"],
+            "alias": conn.get("alias") or conn["name"],
+            "kind": (conn.get("config") or {}).get("kind", ""),
+            "nodes": [],
+        }
+        for node in nodes:
+            try:
+                result = client.exec_on_node(node, _ps_stopped_containers_cmd(), timeout=20)
+                if result.returncode != 0:
+                    conn_block["nodes"].append({
+                        "node": node,
+                        "error": result.stderr or result.stdout or "exec failed",
+                    })
+                    continue
+                conn_block["nodes"].append({
+                    "node": node,
+                    "leftovers": _parse_ps_output(result.stdout, image_filter or None),
+                })
+            except Exception as exc:    # noqa: BLE001
+                conn_block["nodes"].append({"node": node, "error": str(exc)})
+        out_per_conn.append(conn_block)
+
+    return jsonify({
+        "image_filter": image_filter,
+        "connections": out_per_conn,
+        "errors": errors,
+    })
+
+
+@admin_bp.post("/maintenance/sibling-containers/cleanup")
+@_login_required(role="admin")
+def maintenance_cleanup_sibling_containers():
+    """按 ``(connection_id, node, container_ids)`` 批量 ``docker rm`` 残留容器。
+
+    Body:
+        ``{"items": [{"connection_id": "...", "node": "...", "container_ids": [...]}, ...]}``
+
+    Returns:
+        ``{"results": [{"connection_id", "node", "requested", "ok", "stdout"/"error", ...}]}``
+    """
+    body = request.get_json(silent=True) or {}
+    items = body.get("items") or []
+    if not isinstance(items, list) or not items:
+        return jsonify({"error": "items must be a non-empty array"}), 400
+
+    runtime = _runtime()
+    conn_mgr = runtime.connection_manager
+    results: list[dict] = []
+
+    for item in items:
+        if not isinstance(item, dict):
+            results.append({"error": "item must be dict", "item": item})
+            continue
+        conn_id = item.get("connection_id")
+        node = item.get("node")
+        container_ids = item.get("container_ids") or []
+        if not conn_id or not node or not container_ids:
+            results.append({
+                "error": "missing connection_id / node / container_ids",
+                "item": item,
+            })
+            continue
+        if not isinstance(container_ids, list) or not all(
+            isinstance(c, str) and c.strip() for c in container_ids
+        ):
+            results.append({
+                "error": "container_ids must be non-empty list of strings",
+                "item": item,
+            })
+            continue
+
+        try:
+            client = conn_mgr.get_client(conn_id)
+        except Exception as exc:    # noqa: BLE001
+            results.append({
+                "connection_id": conn_id, "node": node,
+                "requested": container_ids, "ok": False,
+                "error": f"get_client failed: {exc}",
+            })
+            continue
+
+        ids_str = " ".join(_shlex.quote(str(cid)) for cid in container_ids)
+        cmd = ["sh", "-c", f"docker rm {ids_str}"]
+        try:
+            result = client.exec_on_node(node, cmd, timeout=30)
+            results.append({
+                "connection_id": conn_id, "node": node,
+                "requested": container_ids,
+                "ok": result.returncode == 0,
+                "stdout": result.stdout, "stderr": result.stderr,
+                "returncode": result.returncode,
+            })
+        except Exception as exc:    # noqa: BLE001
+            results.append({
+                "connection_id": conn_id, "node": node,
+                "requested": container_ids, "ok": False,
+                "error": str(exc),
+            })
+
+    # 写操作必须落审计 —— admin maintenance 跟 skill 写操作一视同仁
+    try:
+        runtime.store.save_skill_call(
+            skill_code="admin.maintenance.cleanup_sibling_containers",
+            connection_id=None,
+            session_id=None,
+            user=(getattr(g, "current_user", None) or {}).get("username"),
+            args={"items": items},
+            result={"results": results},
+            status="ok",
+            error=None,
+            latency_ms=0,
+        )
+    except Exception:   # pragma: no cover
+        logger.exception("写 admin maintenance 审计失败(不阻塞)")
+
+    return jsonify({"results": results})
 
 
 # ---------- bootstrap ----------

@@ -296,6 +296,16 @@ def _build_argv(payload: dict) -> tuple[list[str], float, int]:
             argv = list(cmd)
     else:
         # docker_proxy 路径：把整个执行包到 sibling 容器里
+        #
+        # 关键挂载（必须，对称于 K8s direct 模式 agent 容器本身就挂着的那批）：
+        #   1. /:/host (ro) —— sibling 内 ``cat /host/etc/...`` 等
+        #   2. /var/run/docker.sock —— sibling 内的 ``docker ps`` / ``docker rm``
+        #      默认走 unix socket；它自己的 mount ns 是空的，不挂就报 "Cannot connect
+        #      to the Docker daemon at unix:///var/run/docker.sock"。
+        #      ns_str=="" (admin maintenance 扫 sibling 容器走这条) 时尤其关键——
+        #      没 nsenter 切到 host mount ns，全靠这个 bind mount 才能让 docker CLI
+        #      看到 socket。带 nsenter 时这个 bind 会被 mount-ns 切换"盖掉"，但
+        #      host 自己的 /var/run/docker.sock 就在同一路径，所以不冲突。
         docker_argv = [
             DOCKER_BIN, "run", "--rm",
             "--privileged",
@@ -303,6 +313,8 @@ def _build_argv(payload: dict) -> tuple[list[str], float, int]:
             "--network", "host",
             # 宿主机文件系统挂到 sibling 内 /host，方便 cat /host/etc/...
             "--mount", "type=bind,src=/,dst=/host,readonly,bind-propagation=rshared",
+            # 宿主机 docker socket —— 让 sibling 里的 docker CLI 能连上 host daemon
+            "--mount", "type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock",
         ]
         if ns_str:
             # entrypoint = nsenter，把 nsenter flags + 业务 cmd 当 ARGS 喂进去

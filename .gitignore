@@ -25,6 +25,8 @@ admin_ui/.chainlit/
 
 # 临时凭证 / 部署期产生的敏感文件——绝对不要提交
 .agent_token.tmp
+# 多集群部署期产生的 per-cluster token,绝不能提交（gitignore 不支持行内 # 注释）
+.agent_token_*.tmp
 .daemon.json.tmp
 .http-proxy.conf.tmp
 *.token.txt

@@ -67,6 +67,12 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     admin 在后台修改默认 connection / model 之后调用 ``runtime.refresh_legacy_clients()``
     可让 alert pipeline 立即拿到新凭证，无需重启进程。
     """
+    # 启动前 fail-fast 校验加密配置：生产环境（STRICT_ENCRYPTION=true）若
+    # PLATFORM_ENCRYPTION_KEY 未配置直接 raise，阻止明文敏感数据落库。
+    # 开发环境（默认 false）继续走 warning + 明文降级路径。
+    from ops_platform.crypto import ensure_strict_encryption
+    ensure_strict_encryption(getattr(config_cls, "STRICT_ENCRYPTION", False))
+
     store = create_store(config_cls)
     attach_platform_store(store)
 
@@ -137,9 +143,126 @@ def create_runtime(config_cls=Config) -> AppRuntime:
         logging.getLogger(__name__).exception("AsyncTaskService 初始化失败（不阻塞启动）")
 
     _attach_refresh_method(runtime, config_cls)
+    _attach_hot_read_caches(runtime, config_cls)
+    _attach_shutdown_hook(runtime)
     _log_data_source_state(runtime, config_cls)
     _kick_off_async_health_check(runtime)
     return runtime
+
+
+def _attach_shutdown_hook(runtime) -> None:
+    """挂 ``runtime.shutdown(timeout=30)`` —— SIGTERM / atexit / 显式调用都能用。
+
+    解决的问题
+    ----------
+    AsyncTaskService.poller 是 daemon thread,进程 SIGTERM 会**直接砍掉**正在
+    跑的 ``_poll_running_once()`` —— agent 端任务继续跑（agent 进程没死）,但
+    平台侧 DB 记录卡在 running,下次启动靠 reconcile 阶段才能修复,中间窗口
+    用户看不到结果。
+
+    本函数提供一个明确的 shutdown 入口:
+    1. 停 AsyncTaskService.poller（停 dispatch,等当前 iteration 结束）
+    2. 关 host_agent_client 的 requests.Session 连接池
+    3. 关 store engine（如果用的是 SQL）—— SQLAlchemy 连接池 dispose
+
+    托管层（app.py / chainlit_app.py）负责:
+    - 注册 ``atexit.register(runtime.shutdown)`` —— 正常退出
+    - 注册 ``signal.signal(SIGTERM, ...)`` —— k8s / docker stop
+    """
+    import logging as _logging
+    log = _logging.getLogger(__name__)
+    _shutdown_done = {"flag": False}
+
+    def _shutdown(timeout: float = 30.0) -> None:
+        # 幂等:多次调（atexit + signal handler 可能都触发）只跑一次
+        if _shutdown_done["flag"]:
+            return
+        _shutdown_done["flag"] = True
+
+        # atexit 触发时 pytest / stdlib 可能已经关掉了 stdout/stderr——
+        # 这种情况下 logger.info 会抛 "I/O operation on closed file"。
+        # 注意:logging 库默认**不会**把 handler 异常抛回给调用方,而是 dump 到
+        # stderr;所以这里既要 catch 调用本身的异常,还要临时关 ``raiseExceptions``
+        # 防止 handler 内部把错打到已关闭的 stderr。
+        import logging as _logmod
+        def _safe_log(level: str, fmt: str, *args) -> None:
+            saved = _logmod.raiseExceptions
+            _logmod.raiseExceptions = False
+            try:
+                getattr(log, level)(fmt, *args)
+            except Exception:    # noqa: BLE001
+                pass
+            finally:
+                _logmod.raiseExceptions = saved
+
+        _safe_log("info", "runtime.shutdown 开始(timeout=%.1fs)...", timeout)
+
+        # 1. 停 AsyncTaskService poller —— 给当前 iteration 一个有限时间收尾
+        ats = getattr(runtime, "async_task_service", None)
+        if ats is not None:
+            try:
+                ats.stop_poller()
+                t = getattr(ats, "_poller_thread", None)
+                if t is not None and t.is_alive():
+                    t.join(timeout=timeout)
+                    if t.is_alive():
+                        _safe_log("warning",
+                            "async-task-poller 在 %.1fs 内未停止;在跑的任务靠下次启动 reconcile 修复",
+                            timeout,
+                        )
+                    else:
+                        _safe_log("info","async-task-poller 已停")
+            except Exception:
+                _safe_log("exception","停 AsyncTaskService.poller 时出错")
+
+        # 2. 关 host_agent_client 的 requests.Session —— 释放 TCP 连接
+        # host_agent_client 是 per-connection 的(在 ConnectionManager 里缓存),
+        # 这里通过 manager 拿所有客户端逐个关。
+        try:
+            cm = getattr(runtime, "connection_manager", None)
+            if cm is not None and hasattr(cm, "iter_clients_for_shutdown"):
+                for client in cm.iter_clients_for_shutdown():
+                    close_fn = getattr(client, "close", None)
+                    if callable(close_fn):
+                        try:
+                            close_fn()
+                        except Exception:    # pragma: no cover
+                            pass
+        except Exception:
+            _safe_log("exception","关 host_agent_client sessions 时出错")
+
+        # 3. 关 store engine —— SQLAlchemy 连接池 dispose
+        try:
+            engine = getattr(getattr(runtime, "store", None), "engine", None)
+            if engine is not None:
+                engine.dispose()
+                _safe_log("info","store engine 已 dispose")
+        except Exception:
+            _safe_log("exception","关 store engine 时出错")
+
+        _safe_log("info","runtime.shutdown 完成")
+
+    runtime.shutdown = _shutdown
+
+
+def _attach_hot_read_caches(runtime, config_cls) -> None:
+    """挂 TTL 缓存给 hot read 路径（每次 ask() 都打 DB 的查询）。
+
+    覆盖的查询：
+    - ``store.list_prompt_segments()`` — agent.py:_load_system_prompt
+    - ``connection_manager.list()``     — agent.py:_build_cluster_registry_prompt
+
+    TTL 取默认 5s（``PROMPT_CACHE_TTL`` env 可调）——admin 改完最多等 5s 生效,
+    高并发期 hit 率 >90%,DB 压力线性下降。
+    """
+    from ops_platform.ttl_cache import TTLCache
+    import os as _os
+
+    ttl = float(_os.getenv("PROMPT_CACHE_TTL", "5.0"))
+    runtime.prompt_segments_cache = TTLCache(ttl_seconds=ttl)
+    runtime.connections_list_cache = TTLCache(ttl_seconds=ttl)
+    # 当前靠 TTL 自然过期（≤5s）兜底；admin 修改后立即生效需求
+    # 可以未来扩展 connection_manager 的 on_change hook 来主动 invalidate。
 
 
 def _build_legacy_clients(runtime, config_cls) -> None:
@@ -229,7 +352,12 @@ def _build_legacy_clients(runtime, config_cls) -> None:
 
 
 def _attach_refresh_method(runtime, config_cls) -> None:
-    """挂一个 refresh_legacy_clients 方法到 runtime，admin 改连接后调用即可。"""
+    """挂一个 refresh_legacy_clients 方法到 runtime，admin 改连接后调用即可。
+
+    同时把它注册成 ``model_manager`` 的 on_change 回调——这样**任何**经过
+    manager 的模型 mutation（admin UI / 脚本 / 内部调用）都会自动触发 legacy
+    pipeline 刷新，调用方不用再记得"改完默认要手动刷"。
+    """
     def _refresh():
         import logging as _logging
         log = _logging.getLogger(__name__)
@@ -248,6 +376,18 @@ def _attach_refresh_method(runtime, config_cls) -> None:
             return False
 
     runtime.refresh_legacy_clients = _refresh
+
+    # 把 legacy refresh 绑成 model_manager 的 on_change 回调。
+    # 只关心 "默认模型" 是否变化——非默认行的增删改不影响 alert pipeline。
+    def _on_model_change(action: str, model_id: str | None, record: dict | None) -> None:
+        # create + is_default=True / update + is_default=True / 任何 delete 都可能换默认
+        is_default_change = (
+            action == "delete"
+            or (record is not None and record.get("is_default"))
+        )
+        if is_default_change:
+            _refresh()
+    runtime.model_manager.register_on_change(_on_model_change)
 
 
 def _kick_off_async_health_check(runtime) -> None:
@@ -339,9 +479,9 @@ def _log_data_source_state(runtime, config_cls) -> None:
             )
         for c in real:
             log.info("✅ Zabbix 接入「%s」：%s（账号 %s）",
-                      c.get("alias") or c["name"],
-                      c["config"].get("base_url", ""),
-                      c["config"].get("username", ""))
+                     c.get("alias") or c["name"],
+                     c["config"].get("base_url", ""),
+                     c["config"].get("username", ""))
 
     # ---------- 模型（看 DB model_config 真实状态，不看 env）----------
     try:
@@ -361,7 +501,7 @@ def _log_data_source_state(runtime, config_cls) -> None:
         if usable:
             default = next((m for m in usable if m.get("is_default")), usable[0])
             log.info("✅ 默认模型：%s（model=%s, base_url=%s）",
-                      default["name"], default.get("model", ""), default.get("base_url", ""))
+                     default["name"], default.get("model", ""), default.get("base_url", ""))
             if len(usable) > 1:
                 log.info("   另有 %d 个备用模型可切换。", len(usable) - 1)
 

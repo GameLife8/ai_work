@@ -300,11 +300,117 @@ def _classify_intent_hint(user_message: str) -> str | None:
     return _INTENT_HINTS.get(intent) if intent else None
 
 
-# NOTE:raw-first 展示的代码兜底(_augment_message_for_intent / _extract_raw_for_display
-# / _is_data_query_trace_item / _message_already_has_raw)已删除。
-# 原因:"能展示原始数据就展示"已升级为 system prompt 铁律 #2(硬约束),不再靠平台代码
-# 替模型贴 raw。留着代码兜底会盖住"模型到底听不听话"的真相,无法验证 prompt 是否生效。
-# 历史实现见 git history。
+# ====================================================================
+# raw-first 展示 —— **产品契约**（不是模型兜底）
+# ====================================================================
+# 背景:system prompt 铁律 #2 已极其明确要求"看配置/列表场景先贴原文再解读",
+# 但实测国产模型(doubao-seed-2-0-pro)**拿着 3496 字符的 Corefile 就是不贴**,
+# 写 5 段散文概括。纯 prompt 在该模型上不可靠。
+#
+# 设计取舍:
+#   - 这是**产品契约**——用户问"展示 X 配置"就必须看到 X 原文,跟模型听不听话无关。
+#   - 跟"删兜底"不矛盾:删的是"平台替模型决策"(关键词路由 / 合成 tool_call);
+#     这个是"平台保证 UX 一致性"。两码事。
+#   - **保留遥测**:每次契约触发都 logger.warning,记录模型未遵循铁律#2 的情况
+#     → 既保证 UX,又能量化模型遵循率(回应"删兜底是为了看模型听不听话"的诉求)。
+#
+# 作用域:只在 config_view / list_state 意图(用户明确"要看数据")触发;诊断/写操作
+# 场景不碰(那里散文/提议才是对的输出)。
+
+# raw-first 契约**不门控在特定意图**(避免关键词分类没命中就失效的脆弱)。
+# 改成"排除法":只跳过这两类"散文输出才对"的场景——
+#   - write_action:模型给的是"我打算执行X 请确认"提议,不该塞 raw
+#   - diagnose:五段式诊断报告是刻意格式,证据已在"关键证据"段的 ``` 里
+# 其余所有意图(config_view / list_state / monitor / knowledge / **unknown**)
+# 只要 trace 里有可展示数据且模型没贴 raw,都补。
+# 关键:**unknown(None) 也覆盖**——"看其他配置"哪怕关键词没命中 config_view、
+# 落到 unknown,照样补 raw。这就是回应"换个说法看配置兜底还生效么"的设计。
+_RAW_FIRST_SKIP_INTENTS = frozenset({"write_action", "diagnose"})
+
+# 输出"可枚举/可展示"原文的只读 skill
+_DISPLAYABLE_READ_SKILLS = frozenset({
+    "kube_query", "swarm_query", "host_query", "swarm_cluster_overview",
+    "zabbix_get_host_overview", "zabbix_get_host_storage_overview", "jenkins_query",
+})
+
+
+def _message_has_raw(message: str) -> bool:
+    """模型自己已经贴了 raw(``` 代码块 或 markdown 表格分隔行)?"""
+    if not message:
+        return False
+    if "```" in message:
+        return True
+    return bool(re.search(r"^\s*\|[\s\-:|]+\|\s*$", message, re.M))
+
+
+def _extract_raw_for_display(item: dict[str, Any]) -> tuple[str, str]:
+    """从 trace item 抽可直接贴的 raw 文本,返回 (text, lang)。空则 ("","")。
+
+    优先级:compose_yaml(用户最熟) > stdout(命令/kubectl 原文) > parsed(转 JSON)。
+    """
+    result = item.get("tool_result")
+    if not isinstance(result, dict):
+        return "", ""
+    cy = result.get("compose_yaml")
+    if isinstance(cy, str) and cy.strip():
+        return cy.strip(), "yaml"
+    stdout = result.get("stdout")
+    if isinstance(stdout, str) and stdout.strip():
+        return stdout.strip(), ""
+    parsed = result.get("parsed")
+    if parsed not in (None, "", [], {}):
+        try:
+            return json.dumps(parsed, ensure_ascii=False, indent=2), "json"
+        except (TypeError, ValueError):
+            pass
+    return "", ""
+
+
+def _ensure_raw_displayed(
+    message: str,
+    trace: list[dict[str, Any]],
+    intent: str | None,
+    *,
+    model_name: str = "",
+    max_chars: int = 8000,
+) -> str:
+    """产品契约:模型给纯散文(没贴 raw)但 trace 里有可展示数据时,平台补贴。
+
+    **不依赖意图分类命中**——只排除 write_action / diagnose(散文输出才对)。
+    "查看任何配置/数据"都生效,包括关键词没命中、落到 unknown 的说法。
+
+    触发条件(全满足):
+      1. intent ∉ _RAW_FIRST_SKIP_INTENTS(即非 write_action/diagnose)
+      2. message 非空且**还没**贴 raw(无 ``` 无表格)
+      3. trace 里有成功的 displayable read-query,且能抽出 raw + 无 pending_token
+    """
+    if intent in _RAW_FIRST_SKIP_INTENTS:
+        return message
+    if not message or _message_has_raw(message):
+        return message
+    for item in reversed(trace):
+        if item.get("status") != "ok":
+            continue
+        if item.get("tool_name") not in _DISPLAYABLE_READ_SKILLS:
+            continue
+        if item.get("pending_token"):          # 写操作待确认场景不补
+            continue
+        raw, lang = _extract_raw_for_display(item)
+        if not raw:
+            continue
+        shown = raw if len(raw) <= max_chars else (
+            raw[:max_chars] + "\n... (原文过长已截断，完整见调用 trace)"
+        )
+        # 遥测:模型在"要看数据"意图下没贴 raw,平台补贴。用来量化模型遵循率。
+        logger.warning(
+            "raw-first 契约触发:model=%s intent=%s 未贴 raw,平台补 skill=%s(%d 字符)",
+            model_name or "?", intent, item.get("tool_name"), len(raw),
+        )
+        return (
+            message
+            + f"\n\n---\n📋 **原始数据**（平台自动展示）：\n```{lang}\n{shown}\n```"
+        )
+    return message
 
 
 def _messages_size_chars(messages: list[dict[str, Any]]) -> int:
@@ -797,13 +903,17 @@ class UnifiedOpsAgent:
                     )
                     _accumulate_usage(total_usage, summary.pop("_usage", {}))
                     return AgentOutcome(
-                        message=summary.get("content") or "已完成排查，但模型没有输出总结。",
+                        message=_ensure_raw_displayed(
+                            summary.get("content") or "已完成排查，但模型没有输出总结。",
+                            trace, intent, model_name=getattr(self.model, "model", "")),
                         trace=trace,
                         pending_actions=pending_actions,
                         usage=total_usage,
                     )
                 return AgentOutcome(
-                    message=message.get("content") or "未获得明确结论。",
+                    message=_ensure_raw_displayed(
+                        message.get("content") or "未获得明确结论。",
+                        trace, intent, model_name=getattr(self.model, "model", "")),
                     trace=trace,
                     pending_actions=pending_actions,
                     usage=total_usage,
@@ -949,7 +1059,9 @@ class UnifiedOpsAgent:
         )
         _accumulate_usage(total_usage, summary.pop("_usage", {}))
         return AgentOutcome(
-            message=summary.get("content") or "已完成排查，但模型没有输出总结。",
+            message=_ensure_raw_displayed(
+                summary.get("content") or "已完成排查，但模型没有输出总结。",
+                trace, intent, model_name=getattr(self.model, "model", "")),
             trace=trace,
             pending_actions=pending_actions,
             usage=total_usage,
@@ -1044,6 +1156,50 @@ class UnifiedOpsAgent:
             )
         return selected
 
+    # 只关心"集群类型"——host_agent/zabbix 是辅助,不参与一致性判定
+    _CLUSTER_TYPES = frozenset({"swarm", "k8s"})
+
+    def _runbook_required_conn_types(self, rb: Any) -> set[str]:
+        """runbook 的各节点 skill 需要哪些 connection type(只取 swarm/k8s 集群类)。"""
+        types: set[str] = set()
+        nodes = getattr(rb, "nodes", {}) or {}
+        for node in nodes.values():
+            skill_code = getattr(node, "skill", None)
+            if not skill_code:
+                continue
+            try:
+                spec = self.registry.get(skill_code)
+            except Exception:
+                continue
+            rct = getattr(spec, "required_connection_type", None)
+            if rct in self._CLUSTER_TYPES:
+                types.add(rct)
+        return types
+
+    def _pick_cluster_compatible_runbook(
+        self, candidates: list[Any], user_message: str,
+    ) -> Any | None:
+        """从命中候选里挑集群类型兼容用户路由的那个;挑不到返回 None。
+
+        规则:
+          - 用户**没点名**具体集群(resolved 无 swarm/k8s)→ 直接用排名最高的候选
+            (通用"集群巡检"走默认集群,行为不变)。
+          - 用户**点名**了某集群类型 → 按候选排名从高到低,挑第一个
+            "需要的集群类型 ∈ 用户路由到的类型"(或不绑定集群类型)的候选。
+            全都不兼容 → None(调用方跳过预路由,走 tool loop)。
+        """
+        resolved = self._resolve_clusters_from_query(user_message)
+        user_cluster_types = set(resolved.keys()) & self._CLUSTER_TYPES
+
+        if not user_cluster_types:
+            return candidates[0] if candidates else None
+
+        for rb in candidates:
+            required = self._runbook_required_conn_types(rb) & self._CLUSTER_TYPES
+            if not required or (required & user_cluster_types):
+                return rb
+        return None
+
     def _maybe_runbook_preroute(
         self,
         user_message: str,
@@ -1070,11 +1226,24 @@ class UnifiedOpsAgent:
             return None
 
         try:
-            rb = registry.match_by_query(user_message or "")
+            candidates = registry.match_all_by_query(user_message or "")
         except Exception as exc:  # pragma: no cover  (防御性)
             logger.warning("runbook 预路由匹配抛异常,fallback 到 tool loop:%s", exc)
             return None
+        if not candidates:
+            return None
+
+        # ---- 按集群类型挑兼容的 runbook ----
+        # 复现 bug:用户"codewave(k8s) 集群巡检",关键词"集群巡检"同时命中 swarm/k8s
+        # 两个巡检 runbook。纯关键词只返回一个(可能是 swarm),swarm_cluster_overview
+        # 需要 swarm 连接 → codewave 没有 → fallback 默认 swarm,巡检了**错误集群**。
+        # 修法:在候选里挑"需要的集群类型 ∈ 用户路由到的集群类型"那个。
+        rb = self._pick_cluster_compatible_runbook(candidates, user_message)
         if rb is None:
+            logger.info(
+                "runbook 预路由跳过:命中的 runbook 集群类型与用户指定的不兼容(候选=%s)",
+                [c.key for c in candidates],
+            )
             return None
 
         logger.info(

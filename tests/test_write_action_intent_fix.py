@@ -86,6 +86,7 @@ def test_ask_first_round_uses_required_when_write_intent(monkeypatch):
     rt.store.list_prompt_segments.return_value = []
     rt.connection_manager.list.return_value = []
     rt.runbook_registry.match_by_query.return_value = None
+    rt.runbook_registry.match_all_by_query.return_value = []
     # 让 registry.openai_tools 返回不为空,避免空集合干扰
     rt.skill_registry.openai_tools.return_value = [
         {"type": "function", "function": {"name": "host_run_command"}},
@@ -135,6 +136,7 @@ def test_ask_first_round_uses_auto_when_not_write_intent(monkeypatch):
     rt.store.list_prompt_segments.return_value = []
     rt.connection_manager.list.return_value = []
     rt.runbook_registry.match_by_query.return_value = None
+    rt.runbook_registry.match_all_by_query.return_value = []
     rt.skill_registry.openai_tools.return_value = [
         {"type": "function", "function": {"name": "host_query"}},
         {"type": "function", "function": {"name": "kube_query"}},

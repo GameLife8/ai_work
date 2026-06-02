@@ -42,6 +42,9 @@ class _Registry:
     def match_by_query(self, q):
         return self._match
 
+    def match_all_by_query(self, q):
+        return [self._match] if self._match else []
+
 
 class _Invoker:
     def __init__(self) -> None:

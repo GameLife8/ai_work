@@ -210,6 +210,7 @@ def _mock_runtime(full_codes: list[str]):
     rt.store.list_prompt_segments.return_value = []
     rt.connection_manager.list.return_value = []
     rt.runbook_registry.match_by_query.return_value = None
+    rt.runbook_registry.match_all_by_query.return_value = []
     rt.skill_registry.openai_tools.return_value = [
         {"type": "function", "function": {"name": c}} for c in full_codes
     ]

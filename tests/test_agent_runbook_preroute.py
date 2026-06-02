@@ -44,6 +44,10 @@ class _Registry:
         self.calls.append(q)
         return self._match
 
+    def match_all_by_query(self, q: str) -> list:
+        self.calls.append(q)
+        return [self._match] if self._match else []
+
 
 class _Invoker:
     """记录所有 invoke 调用,可装 platform_run_runbook 的 envelope 返回。"""
@@ -195,6 +199,9 @@ def test_preroute_handles_registry_exception_gracefully() -> None:
 
     class _FlakyRegistry:
         def match_by_query(self, q):
+            raise RuntimeError("DB 临时挂了")
+
+        def match_all_by_query(self, q):
             raise RuntimeError("DB 临时挂了")
 
     rt = _Runtime(match=None)

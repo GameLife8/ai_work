@@ -158,7 +158,7 @@ docker / shell 命令。这样模型不用记一堆 skill 名，工具集也小�
 |---|---|
 | **通用查询（三把口）** | `kube_query`（k8s get/describe/logs/top/events…，含 verb=logs）· `swarm_query`（docker service/node/task/stack…）· `host_query`（白名单 shell：ss/ip/df/ps/dmesg…）|
 | swarm 写 | **swarm_scale_service** · **swarm_update_service_image** · **swarm_force_update_service** · **swarm_rollback_service** · **swarm_remove_service**(admin) |
-| swarm 聚合 | `swarm_cluster_overview`（集群级巡检：节点 + 服务 + 监控一次拉全）|
+| 集群巡检聚合 | `swarm_cluster_overview`（swarm：节点+服务+监控）· `k8s_cluster_overview`（k8s：节点+异常 pod+副本不匹配 deploy+监控）。配 `cluster_health_audit_swarm` / `cluster_health_audit_k8s` runbook，**agent 按用户点名的集群类型自动选对应 runbook**（说 codewave→k8s，说 sws-swarm→swarm）|
 | k8s 写 | **k8s_scale_deployment** · **k8s_restart_deployment** · **k8s_rollout_undo** |
 | 监控 | `zabbix_get_host_overview` · `zabbix_get_host_storage_overview` · `metric_query`（时序：mode=peak 找峰值 / mode=window 取时刻附近）|
 | 主机执行 | **host_run_command**(admin) · **host_run_command_async**(admin，长命令 hybrid 同步/异步) · **host_capture_packets**(admin) · `host_check_task` · `host_list_tasks` · `host_list_nodes` |
@@ -510,7 +510,7 @@ ai_work/
 
 | 状态 | 项 |
 |---|---|
-| ✅ | 平台 kernel · skill 插件机制 · 8 driver · 27 skill · 5 graph runbook |
+| ✅ | 平台 kernel · skill 插件机制 · 8 driver · 28 skill · 6 graph runbook |
 | ✅ | 三入口（Chainlit / Admin / MCP） |
 | ✅ | 写操作二次确认链 + 入口 RBAC + 会话绑定（admin 可跨会话审批）|
 | ✅ | 火山方舟（Code Plan）+ 国产模型兼容 + 模型级 tool_choice 偏好 |

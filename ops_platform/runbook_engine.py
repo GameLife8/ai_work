@@ -971,18 +971,28 @@ class RunbookRegistry:
 
     def match_by_query(self, user_query: str) -> Runbook | None:
         """根据用户原话 + 每个 runbook 的 triggers 关键词做匹配，命中最多的赢。"""
+        cands = self.match_all_by_query(user_query)
+        return cands[0] if cands else None
+
+    def match_all_by_query(self, user_query: str) -> list[Runbook]:
+        """返回**所有**命中的 runbook,按命中关键词数降序(平票按 key 字典序 deterministic)。
+
+        给预路由按"集群类型兼容性"二次筛选用——同一个"集群巡检"通用词可能同时命中
+        swarm 巡检和 k8s 巡检两个 runbook,调用方据用户路由到的集群类型挑兼容那个。
+        """
         if not user_query:
-            return None
+            return []
         q = user_query.lower()
-        best: tuple[int, Runbook] | None = None
+        scored: list[tuple[int, str, Runbook]] = []
         with self._lock:
             for rb in self._runbooks.values():
                 if not rb.enabled:
                     continue
                 hits = sum(1 for t in rb.triggers if t and t.lower() in q)
-                if hits and (best is None or hits > best[0]):
-                    best = (hits, rb)
-        return best[1] if best else None
+                if hits:
+                    scored.append((hits, rb.key, rb))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        return [rb for _, _, rb in scored]
 
     def find(self, name: str | None, user_query: str = "") -> Runbook | None:
         if name:

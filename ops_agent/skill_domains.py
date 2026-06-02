@@ -61,7 +61,8 @@ SKILL_DOMAINS: dict[str, list[str]] = {
         # zabbix 概览已在 core；这里是监控的"细节"层
         "zabbix_get_host_storage_overview",   # 磁盘各挂载点
         "metric_query",                       # 时序（峰值 / 时刻附近）
-        "swarm_cluster_overview",             # 集群级聚合巡检
+        "swarm_cluster_overview",             # swarm 集群级聚合巡检
+        "k8s_cluster_overview",               # k8s 集群级聚合巡检
     ],
     "network_diag": [
         "host_inspect_container_netns", "host_kernel_events",

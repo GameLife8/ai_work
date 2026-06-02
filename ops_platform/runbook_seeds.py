@@ -441,6 +441,110 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
             "6. **数字保留 2 位小数**,例如 ``52.43%``,别写 ``52.4346728%``"
         ),
     },
+
+    # ------------------------------------------------------------------ #
+    # K8s 集群巡检 / 体检 —— swarm 巡检的 k8s 对应物
+    # ------------------------------------------------------------------ #
+    # 一把口固化进 k8s_cluster_overview:节点(含 InternalIP 反查 Zabbix)+ 异常 pod
+    # + 副本不匹配 deployment。triggers 跟 swarm 共享通用"集群巡检"词——靠 agent
+    # 预路由的"集群类型兼容性"挑选(用户说 codewave→k8s 就选这个,sws-swarm→swarm
+    # 就选 swarm 那个)。
+    {
+        "key": "cluster_health_audit_k8s",
+        "title": "K8s 集群巡检 / 体检",
+        "description": (
+            "一键拉全:所有节点(含 InternalIP 反查的 Zabbix CPU/MEM/磁盘) + 全集群异常 pod "
+            "(CrashLoop/Pending/重启高/拉镜像失败) + 副本不匹配的 deployment。"
+            "解决「直接用 k8s node 名查 Zabbix 查不到」的痛点——从 node status.addresses 提 "
+            "InternalIP 反查。"
+        ),
+        # 跟 swarm 共享通用巡检词 + k8s 限定词。集群类型由预路由 guard 区分。
+        "triggers": [
+            "k8s 巡检", "k8s 体检", "k8s 集群巡检", "kubernetes 巡检",
+            "kube 巡检", "k8s 健康检查",
+            "集群巡检", "集群体检", "集群健康检查",
+            "整体看一下", "整体看下", "整体情况",
+            "集群概况", "集群概览", "cluster audit", "health check",
+        ],
+        "inputs": [],
+        "optional_inputs": ["lookback_hours"],
+        "max_total_seconds": 240,
+        "start_node": "overview",
+        "nodes": {
+            "overview": {
+                "skill": "k8s_cluster_overview",
+                "description": "一把口拉:节点+InternalIP+Zabbix 反查+异常 pod+副本不匹配 deployment",
+                "args": {
+                    "lookback_hours": "$user.lookback_hours||1",
+                },
+                "timeout_seconds": 180,
+                "on_error": "fail",
+            },
+        },
+        "final_report_prompt": (
+            "你是 AI 运维助手。平台已经把 K8s 集群 raw 巡检数据采集回来"
+            "(读 ``node_states[0].result`` 字段:``k8s`` / ``nodes[]`` / ``pods`` / ``deployments``)。\n"
+            "**异常判定由你做**,平台只采集不判定。\n"
+            "\n"
+            "# 输出格式硬约束(必须按此结构,顺序/层级/格式一律不许偏离)\n"
+            "\n"
+            "## 📊 集群概览\n"
+            "2-3 句:节点总数 / Ready 节点数 / 命名空间数 / 异常 pod 数 / 副本不匹配 deployment 数 / "
+            "Zabbix 监控覆盖率(nodes 里 zabbix.found==True 的占比)。\n"
+            "\n"
+            "## 🖥️ 节点资源\n"
+            "\n"
+            "**直接输出 markdown 表格(不要用 ``` 代码块包裹,否则 chainlit 渲染成 raw code)**。表头:\n"
+            "\n"
+            "| 节点 | InternalIP | 角色 | Ready | CPU avg | CPU p95 | 内存% | 最高磁盘% | 备注 |\n"
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |\n"
+            "\n"
+            "**所有节点都要列(N 节点 N 行,不许省略)**。取值:\n"
+            "- **角色 / Ready**:``nodes[i].role`` / ``nodes[i].ready``\n"
+            "- **CPU avg / p95**:``nodes[i].zabbix.overview.metric_summary.cpu_avg`` / ``cpu_p95`` (%)\n"
+            "- **内存%**:``nodes[i].zabbix.overview.memory_summary.memory_used_percent``\n"
+            "- **最高磁盘%**:从 ``nodes[i].zabbix.storage.filesystems[]`` 挑 ``used_percent`` 最大项,"
+            "  写 ``<mount> N%``;``filesystems`` 空 或 ``zabbix.storage`` 不存在 → ``-``\n"
+            "- **备注**:``ready != Ready`` → ``🚨 节点 NotReady``;数字 ≥90% → ``🚨 <字段>危急``;"
+            "  ≥80% → ``⚠️ <字段>偏高``;``zabbix.found==False`` → ``❓ 未纳监控``(CPU/内存/磁盘写 ``-``);"
+            "  全正常 → ``✅``\n"
+            "\n"
+            "## 🔴 异常 Pod\n"
+            "\n"
+            "读 ``pods.abnormal[]``。**只列异常**,直接 markdown 表格(**不要 ``` 包裹**):\n"
+            "\n"
+            "| 命名空间 | Pod | 状态 | 节点 | 重启次数 | 原因 |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            "\n"
+            "- **原因**列取 ``reasons[]``(CrashLoopBackOff / ImagePullBackOff 等),空就写 phase\n"
+            "- 表格下补:``其余 pod 运行正常``\n"
+            "- ``pods.abnormal_count == 0`` → 直接写 ``✅ 全部 N 个 pod 运行正常``,**不输出空表格**\n"
+            "\n"
+            "## ⚙️ 副本不匹配 Deployment\n"
+            "\n"
+            "读 ``deployments.abnormal[]``。**只列 ready<desired**,markdown 表格(**不要 ``` 包裹**):\n"
+            "\n"
+            "| 命名空间 | Deployment | 期望 | 就绪 | 可用 | 问题 |\n"
+            "| --- | --- | --- | --- | --- | --- |\n"
+            "\n"
+            "- **问题**:``ready==0`` → 🚨 全副本未就绪;``0<ready<desired`` → ⚠️ 副本不足\n"
+            "- ``deployments.abnormal_count == 0`` → ``✅ 全部 deployment 副本正常``\n"
+            "\n"
+            "## 💡 总结 & 建议\n"
+            "\n"
+            "1-3 条 bullet:关键问题(NotReady 节点 / 高水位节点 / CrashLoop pod / 副本不足),"
+            "每条配具体下一步(看 describe / 拉 logs / 扩容 / 加监控)。\n"
+            "\n"
+            "# 铁律(违反等于错)\n"
+            "\n"
+            "1. **表格 = 裸 markdown 表格**——前后不许加 ``` 包裹\n"
+            "2. **节点表必须全列**——N 节点 N 行\n"
+            "3. **字段路径要对**:磁盘走 ``zabbix.storage.filesystems``;字段不存在写 ``-``\n"
+            "4. **该警告就警告**——CPU 85% 不许写正常,NotReady 节点不许漏\n"
+            "5. **不许『无害化』概括**——「整体健康」这种没数据支撑的话一律不许出现\n"
+            "6. **数字保留 2 位小数**"
+        ),
+    },
 ]
 
 

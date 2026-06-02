@@ -41,8 +41,6 @@ _LEGACY_NO_EXAMPLE = frozenset({
     # description > 200 字但缺 ``示例`` / `` ``` `` 代码块的:
     "zabbix_get_host_storage_overview",
     "zabbix_get_host_overview",
-    "metric_query_peak",
-    "metric_query_window_around",
     "alerts_analyze_payload",
 })
 
@@ -196,9 +194,6 @@ def test_long_description_mentions_alternatives(code: str) -> None:
         "alerts_analyze_payload",  # 入口职责
         "host_kernel_events",  # 单一职责:dmesg + 老节点兼容
         # ↓ TODO:这几个其实**有**易混淆相关 skill,描述里没说,逐步补:
-        "k8s_get_pod_logs",  # TODO: 应提"看 pod 状态请走 kube_query verb=describe"
-        "metric_query_peak",  # TODO: 应提"实时值请走 zabbix_get_host_overview"
-        "metric_query_window_around",  # TODO: 同上 + 提 metric_query_peak 的区别
         "swarm_cluster_overview",  # TODO: 应提 swarm_query verb=node ls / zabbix_get_host_overview
         "zabbix_get_host_overview",  # TODO: 应提批量看用 swarm_cluster_overview / 趋势用 metric_query_*
     })

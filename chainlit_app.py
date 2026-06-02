@@ -37,6 +37,25 @@ from runtime import create_runtime
 # 关键二次 pop —— config 导入时 load_dotenv 把 DATABASE_URL 加回了 env
 _hide_database_url_from_chainlit()
 
+# ⚠️ 关键修正：config 导入触发的 ``load_dotenv()`` 会读 **.env 文件** 把里面的
+# ``DATABASE_URL`` 填回（因为我们刚 pop 空了），这会**绕过 compose environment 的
+# 覆盖**——本地测试时 compose 把 DATABASE_URL 指向本地 MySQL(db:3306)，却被 .env
+# 里写死的 TiDB 地址盖掉，导致 chat 连错库（连到清空过的 TiDB → ensure_bootstrap
+# 造一堆 env 种子接入，跟后台看到的完全不一致）。
+#
+# 第一次 pop 时保存的 ``PLATFORM_DATABASE_URL`` 才是 compose **真正注入**的值
+# （environment 已经赢过 env_file）。用它强制修正 Config.DATABASE_URL。
+# 生产环境没有 compose 覆盖时,两者本就一致,这步无副作用。
+_compose_db_url = os.environ.get("PLATFORM_DATABASE_URL")
+if _compose_db_url and _compose_db_url != Config.DATABASE_URL:
+    import logging as _logging
+    _logging.getLogger(__name__).warning(
+        "chat: Config.DATABASE_URL 被 .env 的 load_dotenv 覆盖成 %r，"
+        "强制修正回 compose 注入的 %r",
+        Config.DATABASE_URL, _compose_db_url,
+    )
+    Config.DATABASE_URL = _compose_db_url
+
 
 _runtime = create_runtime(Config)
 

@@ -157,28 +157,61 @@ def test_ask_first_round_uses_auto_when_not_write_intent(monkeypatch):
 # ============================================================
 
 
-def test_write_action_hint_emphasizes_tool_call_first():
-    """hint 顶部必须显眼地说"第一步是调用 tool",防止模型只输出描述。"""
+def test_write_action_hint_is_now_short_and_points_to_system_prompt():
+    """write_action hint **故意**精简:完整路由表 + "首轮调 tool" 等规则统一搬到
+    ``_LEGACY_SYSTEM_PROMPT`` 的 「## 写操作」段(常驻 + 受 prompt cache 保护),
+    hint 只剩"提醒第二轮怎么写"的短文本。
+
+    回归契约:
+    - hint < 400 字符(防再次膨胀到 1000+ 的反例段堆栈)
+    - hint **不该**有路由表示例(那已在 system prompt)
+    - hint **不该**有"反例 ❌"(LLM pattern-match 反例会被污染——这是上次踩坑)
+    """
     hint = _INTENT_HINTS["write_action"]
-    # 关键短语必须出现(任一即可,允许后续微调措辞)
-    must_have_any = [
-        "第一步是「调用",
-        "第一步是调用",
-        "直接调 tool",
-        "直接调用",
-        "先调",
-    ]
-    assert any(p in hint for p in must_have_any), \
-        f"write_action hint 未明确『先调 tool』,当前内容:\n{hint[:300]}"
+    assert len(hint) < 400, (
+        f"write_action hint 膨胀到 {len(hint)} 字符——"
+        f"完整路由规则应该在 system prompt,hint 只留'第二轮格式提醒'。"
+    )
+    # 反例段的特征:"❌ 用户:" / "❌ 你:" / "反例" header / 多个 ❌ 集中出现
+    # (注意:单独的 ❌ 是按钮 emoji,不算反例段)
+    assert "❌ 用户" not in hint, "hint 不该再贴反例对话——LLM 会 pattern-match 错误样式"
+    assert "❌ 你" not in hint
+    assert "反例" not in hint, "hint 不该再含反例段标题"
+    # ❌ 出现次数应当 ≤ 1 (按钮 emoji 一次)。多个 ❌ 暗示又夹反例了。
+    assert hint.count("❌") <= 1, "hint 含多个 ❌ 暗示反例段又长出来了"
 
 
-def test_write_action_hint_contains_counter_example():
-    """hint 应给出『用户说请执行 → 你只写文字不调 tool』的反例,让模型有具体警示。"""
+def test_write_action_hint_still_anchors_round2_format():
+    """虽然瘦身了,hint 仍要锁住关键第二轮契约——确认按钮提示语必须保留。"""
     hint = _INTENT_HINTS["write_action"]
-    # 反例段必须包含 docker / prune / 没调 / etc 几个关键词中至少几个
-    assert "反例" in hint or "❌" in hint, "write_action hint 缺反例段"
-    assert "docker" in hint.lower() or "prune" in hint.lower(), \
-        "反例段应贴最常见的 case(docker prune)"
+    # 第二轮的核心契约:必须以这句结尾让用户看到下方按钮
+    assert "确认" in hint and "取消" in hint, \
+        f"hint 缺第二轮的'请下方点击 ✅ 确认 或 ❌ 取消'契约,当前:\n{hint}"
+    # 必须明确点出"第二轮"或"needs_confirmation",让模型知道这条规则适用什么场景
+    assert "第二轮" in hint or "needs_confirmation" in hint
+
+
+def test_system_prompt_owns_routing_table():
+    """完整路由规则统一在**真 system prompt**(``ops_platform.prompts`` 装配的),
+    不是死代码 _LEGACY_SYSTEM_PROMPT(已删)。这是核心契约的 source of truth。"""
+    from ops_platform.prompts import assemble_default
+    sp = assemble_default()
+    # 路由表必须在 system prompt 里
+    assert "host_run_command" in sp, "system prompt 应当列写操作路由表(shell→host_run_command)"
+    assert "swarm_" in sp or "swarm" in sp.lower(), "system prompt 应当提 swarm 类写 skill"
+    assert "k8s_" in sp or "k8s" in sp.lower(), "system prompt 应当提 k8s 类写 skill"
+    # "第一步调 tool 不要写描述" 的核心契约也应当在 system prompt
+    assert "第一轮" in sp or "第一步" in sp or "首轮" in sp, \
+        "system prompt 应明确'写操作首轮必须调 tool'"
+
+
+def test_legacy_system_prompt_is_deleted():
+    """``_LEGACY_SYSTEM_PROMPT`` 是死代码,已删除——防止有人再往里加规则(没人读)。"""
+    import ops_agent.agent as agent_mod
+    assert not hasattr(agent_mod, "_LEGACY_SYSTEM_PROMPT"), (
+        "_LEGACY_SYSTEM_PROMPT 又出现了——它从不被 _load_system_prompt 引用,"
+        "真 prompt 在 ops_platform/prompts.py。别往死代码里加规则。"
+    )
 
 
 def test_write_action_hint_does_not_imply_describe_first():

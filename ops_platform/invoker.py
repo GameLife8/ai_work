@@ -233,19 +233,19 @@ class SkillInvoker:
             self.store.update_pending_action_status(token, status="expired")
             return self._error_envelope("待确认操作已超时", code="expired")
 
-        # 防止 token 跨会话窃用：admin 后台 trace / DB 备份 / 调试日志都可能露出
-        # token 字符串，若不绑定 session，任意会话拿到 token 都能 confirm 写操作。
-        # 例外：如果 pending 记录没有 session_id（极少见，比如外部脚本注入），
-        # 退化为只看 token 本身 —— 但仍要求 ctx 必须有 session_id（不然就是来路不明）。
+        # 防止 token 跨会话窃用：聊天用户的 token 泄露后,攻击者在自己会话里重放。
+        # **例外：admin 可跨会话确认**——admin 在后台 PendingActions 页确认是合法的
+        # 跨会话审批操作（后台 session ≠ 原聊天 session），这是 admin 的职责,不能挡。
+        # 所以只对**非 admin**强制 session 绑定。
         recorded_session = record.get("session_id")
-        current_session = ctx.session_id
-        if recorded_session and recorded_session != current_session:
+        is_admin = (ctx.user or {}).get("role") == "admin"
+        if (not is_admin) and recorded_session and recorded_session != ctx.session_id:
             return self._error_envelope(
                 "token 与当前会话不匹配，可能被跨会话重放",
                 code="session_mismatch",
             )
 
-        if record.get("requires_admin_approval") and (ctx.user or {}).get("role") != "admin":
+        if record.get("requires_admin_approval") and not is_admin:
             return self._error_envelope("该操作需管理员确认", code="forbidden")
 
         spec = self.registry.get(record["skill_code"])
@@ -272,9 +272,10 @@ class SkillInvoker:
             return self._error_envelope("未知的待确认 token", code="invalid_token")
         if record["status"] != "pending":
             return self._error_envelope(f"该操作已 {record['status']}", code="bad_state")
-        # 同 confirm()：防止跨会话拒绝（即便危害小，也是 DoS 路径）
+        # 同 confirm()：非 admin 强制 session 绑定；admin 可跨会话（后台审批职责）。
         recorded_session = record.get("session_id")
-        if recorded_session and recorded_session != ctx.session_id:
+        is_admin = (ctx.user or {}).get("role") == "admin"
+        if (not is_admin) and recorded_session and recorded_session != ctx.session_id:
             return self._error_envelope(
                 "token 与当前会话不匹配，可能被跨会话重放",
                 code="session_mismatch",
@@ -336,7 +337,11 @@ class SkillInvoker:
             # 原 params 不变（spec.handler 已经基于原 params 跑过），脱敏只影响审计落库。
             audit_args = _redact_audit_args(params)
             if extra_audit:
-                audit_args = {**audit_args, "_extra": _redact_audit_args(extra_audit)}
+                # ``_extra`` 是平台生成的审计元数据（如 confirmation_token），**不是用户输入**，
+                # 不能脱敏——审计页靠 ``_extra.confirmation_token`` 反查写操作发起人。
+                # （之前误用 _redact_audit_args 把 confirmation_token 当 "token" 脱成 ***，
+                #   破坏了溯源功能。）
+                audit_args = {**audit_args, "_extra": extra_audit}
             self.store.save_skill_call(
                 skill_code=spec.code,
                 connection_id=params.get("connection_id"),

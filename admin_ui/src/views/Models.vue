@@ -14,6 +14,12 @@
       <el-table-column label="默认" width="80">
         <template #default="{ row }"><el-tag v-if="row.is_default" type="success">默认</el-tag></template>
       </el-table-column>
+      <el-table-column label="工具选择" width="110">
+        <template #default="{ row }">
+          <span v-if="row.tool_choice_preference" class="code-mono">{{ row.tool_choice_preference }}</span>
+          <span v-else class="text-muted">auto</span>
+        </template>
+      </el-table-column>
       <el-table-column label="操作" width="180">
         <template #default="{ row }">
           <el-button size="small" @click="openEdit(row)">编辑</el-button>
@@ -43,6 +49,14 @@
         <el-form-item label="模型 ID"><el-input v-model="dlg.form.model" placeholder="ep-xxx / qwen-plus / glm-4 / deepseek-chat ..." /></el-form-item>
         <el-form-item label="超时(秒)"><el-input-number v-model="dlg.form.timeout_seconds" :min="10" :max="600" /></el-form-item>
         <el-form-item label="设为默认"><el-switch v-model="dlg.form.is_default" /></el-form-item>
+        <el-form-item v-if="dlg.id" label="工具选择">
+          <el-select v-model="dlg.form.tool_choice_preference" clearable placeholder="auto（默认）" style="width: 220px">
+            <el-option label="auto（模型自己决定，默认）" value="auto" />
+            <el-option label="required（每轮强制调工具）" value="required" />
+            <el-option label="none（禁止调工具，纯生成）" value="none" />
+          </el-select>
+          <div class="form-hint">按该模型实测行为调；不同国产模型对 auto 的实现差异较大。仅编辑时可设。</div>
+        </el-form-item>
       </el-form>
       <template #footer><el-button type="primary" @click="onSubmit">保存</el-button></template>
     </el-dialog>
@@ -93,3 +107,12 @@ async function onDelete(row) {
   await api.delete(`/models/${row.id}`); ElMessage.success('已删除'); await load()
 }
 </script>
+
+<style scoped>
+.form-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin-top: 4px;
+}
+</style>

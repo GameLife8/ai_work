@@ -6,6 +6,13 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from ops_agent.skill_domains import (
+    LOAD_SKILLS_NAME,
+    build_core_tools,
+    domain_for_skill,
+    expand_tools,
+    skills_in_domains,
+)
 from ops_platform.context import SkillContext
 from ops_platform.prompts import assemble_default, assemble_from_records
 from ops_platform.signals import collect as collect_signals
@@ -67,8 +74,9 @@ _SUMMARY_PROMPT = (
 #
 # **当前缓解措施**:
 #   1. 关键词尽量覆盖常见变体（见下面的 list_state / monitor 里"显示/打印/瞧"类）
-#   2. 兜底走 ``None`` 意图 → full tool set,不会因为分类错失能力（只损失输出模式提示）
-#   3. ``_filter_tools_by_intent`` 过滤后 < 2 个 tool 时自动回退 full set
+#   2. **分类错不再影响工具能力**——工具加载已换成渐进披露（skill_domains.py），
+#      意图分类现在只影响"输出格式 hint + 写操作 tool_choice"这种软提示，分错最多
+#      格式略偏，不会让模型缺工具。
 #
 # **未来升级**（需要单独 1-2 天专项,不在本期 Medium 范围）:
 #   - 用小型 embedding 模型（如 BGE-small-zh / m3e-small）算用户消息和各意图
@@ -168,169 +176,28 @@ _CONFIG_VIEW_NOUNS = (
 )
 
 
-# ----- 意图 → 相关 skill 子集 -------------------------------------------- #
-# tools schema 是 prompt 最大头（~5K tokens / 56%）。每次 27 个 skill 全传给模型
-# 大多数浪费——用户问"看配置"用不到 scale/rollback；用户问"重启服务"用不到 metric。
-#
-# 按意图过滤后能省 ~3.5K tokens / 次（−14%）。失败回退：如果模型空手回了（既没
-# 调 tool 也没给文本），自动重试一次 full tool set。
-#
-# 设计原则（很重要，改这里前先读一遍）：
-#   1. **审批是平台正交关注点，不是意图的过滤维度**。
-#      ``host_run_command`` / ``host_run_command_async`` 这些走 admin 审批的逃生口
-#      该出现在哪个意图里就出现在哪个意图里——平台的 ``needs_confirmation`` 机制
-#      会接管确认流程；admin/user 权限由 ``SkillRegistry.list(visibility=...)``
-#      在上一层处理。意图层**不要**为了"审批麻烦"而剔除这些 skill，否则模型遇到
-#      ``host_query`` binary 白名单覆盖不到的命令（``docker ps`` / ``virsh list``
-#      等）就只能写"请联系 admin"的死信，体验非常差。
-#   2. **每个意图都应该是该类工作的完整工具箱**：典型只读 +（必要时）逃生口 +
-#      上下文相关的辅助 skill + runbook 入口。让模型选最合适的，不要让模型因为
-#      意图过滤"无米下锅"。
-#   3. **写操作意图天然带 read query**——写之前要先看状态确认目标。
-#   4. **chat_intro / knowledge** 是纯路由/引导意图，不真正取证，给 runbook 入口
-#      就够。
-#   5. **diagnose / 未知意图** 走全集 —— 跨层追根因的场景过滤掉任何 skill 都可能误伤。
-_INTENT_TOOLS: dict[str | None, list[str] | None] = {
-    "config_view": [
-        # 通用查询三把口
-        "kube_query", "swarm_query", "host_query",
-        # 集群一把口概览（看配置时常需要先定位节点 / 服务）
-        "swarm_cluster_overview",
-        # 日志也是"看原文"的一种
-        "k8s_get_pod_logs",
-        # 容器网络 namespace 排障（看路由/iptables 配置）
-        "host_inspect_container_netns",
-        # 逃生口：``docker inspect`` / ``cat`` 大配置 / ``virsh dumpxml`` 等
-        # host_query binary 白名单覆盖不到的"看原文"场景。需 admin 审批，但
-        # 这是审批的职责不是意图过滤的职责。
-        "host_run_command", "host_run_command_async",
-        # 引导
-        "platform_get_runbooks", "platform_run_runbook",
-    ],
-    "list_state": [
-        # 通用查询三把口（覆盖大多数列表场景：kube get / swarm service ls / df / ps）
-        "kube_query", "swarm_query", "host_query",
-        # 集群级一把口（节点 + 服务 + 监控）
-        "swarm_cluster_overview",
-        # 异步任务列表
-        "host_list_nodes", "host_list_tasks", "host_check_task",
-        # 逃生口：``docker ps`` / ``docker stats`` / ``virsh list`` 等
-        # 这是用户"我这台主机跑了哪些容器"最常踩的坑——
-        # host_query 的 binary 白名单故意不放 docker（隔离到 admin 审批），
-        # 没有这两把口模型就只能放弃取证。
-        "host_run_command", "host_run_command_async",
-        # 引导
-        "platform_get_runbooks", "platform_run_runbook",
-    ],
-    "monitor": [
-        # Zabbix / 指标主线
-        "zabbix_get_host_overview", "zabbix_get_host_storage_overview",
-        "metric_query_peak", "metric_query_window_around",
-        # 一把口拉全集群监控（巡检场景必备）
-        "swarm_cluster_overview",
-        # 快速宿主机指标（vmstat / iostat / free / uptime / ps top）
-        "host_query",
-        # 跨层定位："这台 node 上跑了什么服务/pod"
-        "swarm_query", "kube_query",
-        # 长采样（``sar -A 1 60`` / ``iostat -x 1 30``）+ 抓包
-        "host_run_command_async", "host_capture_packets",
-        # 内核 events——OOM / softlockup / call trace 等性能事件
-        "host_kernel_events",
-        # 引导
-        "platform_get_runbooks", "platform_run_runbook",
-    ],
-    "write_action": [
-        # 全部写操作 skill
-        "k8s_scale_deployment", "k8s_restart_deployment", "k8s_rollout_undo",
-        "swarm_scale_service", "swarm_update_service_image",
-        "swarm_rollback_service", "swarm_remove_service", "swarm_force_update_service",
-        # 逃生口（写）+ 抓包
-        "host_run_command", "host_run_command_async", "host_capture_packets",
-        # 写之前要先查状态确认目标
-        "kube_query", "swarm_query", "host_query", "swarm_cluster_overview",
-        # 写完验证：日志
-        "k8s_get_pod_logs",
-        # 也允许直接走 runbook（含写动作的 runbook）
-        "platform_get_runbooks", "platform_run_runbook",
-    ],
-    "async_task": [
-        # 核心异步循环
-        "host_run_command_async", "host_check_task", "host_list_tasks",
-        # 长抓包本身就是异步任务
-        "host_capture_packets",
-        # 提交前查一下在哪台 node 跑
-        "host_query", "kube_query", "swarm_query",
-        "host_list_nodes", "swarm_cluster_overview",
-        # 引导（部分 runbook 含长任务步骤）
-        "platform_get_runbooks", "platform_run_runbook",
-    ],
-    "knowledge": [
-        # 知识 / 引导类——只需要 runbook 入口
-        "platform_get_runbooks", "platform_run_runbook",
-    ],
-    "chat_intro": [
-        # 闲聊 / 自介——模型通常会纯文本回复，给 2 个 runbook 入口意思一下
-        "platform_get_runbooks", "platform_run_runbook",
-    ],
-    "diagnose": [
-        # 诊断意图保守一点——可能跨域追根因，全集（不过滤）
-        # 用 None 标记，调用方知道走 full set
-    ],
-    None: [
-        # 未识别意图：走 full set，避免漏 tool
-    ],
-}
-
-
-def _filter_tools_by_intent(
-    full_tools: list[dict],
-    intent: str | None,
-) -> tuple[list[dict], bool]:
-    """根据意图过滤 tools。返回 (过滤后的 tools, 是否被过滤过)。
-
-    diagnose / unknown / chat_intro 等不过滤的意图：返回 full_tools + False。
-    """
-    whitelist = _INTENT_TOOLS.get(intent)
-    if not whitelist:
-        return full_tools, False
-    allowed = set(whitelist)
-    filtered = [t for t in full_tools if t.get("function", {}).get("name") in allowed]
-    # 如果过滤后 < 2 个工具，安全起见走 full set（防意图识别错导致模型无 tool 用）
-    if len(filtered) < 2:
-        return full_tools, False
-    return filtered, True
+# NOTE:_INTENT_TOOLS + _filter_tools_by_intent（关键词→静态白名单过滤）已删除，
+# 换成 ops_agent/skill_domains.py 的渐进披露（核心常驻 + load_skills 按域懒加载）。
+# 原因:静态白名单会挡掉 signal 想要的 skill，且工具集随 query 变破坏 prompt cache。
+# _classify_intent 保留——仅给输出格式 hint + 写操作 tool_choice 用，不再碰工具加载。
 
 
 _INTENT_HINTS: dict[str, str] = {
     "config_view": (
-        "🎯 **本次用户意图：查看 / 配置 / 看原文（B 类）**\n"
-        "用户要的是真实原始数据，不是你的总结。**严禁**跳过原文直接概括「该服务是 X，运行健康……」。\n"
-        "\n"
-        "**必须按这个格式输出**：\n"
-        "1. **先用 ``` 代码块（``` yaml / ``` json）原样贴 skill 返回的原文**——\n"
-        "   取 ``result.parsed`` 或 ``result.stdout``。完整、不重排、不省字段、不折叠。\n"
-        "   超长（> 200 行）按段贴：先关键段（image/replicas/networks/labels/placement/"
-        "healthcheck/env/mounts），告诉用户「完整原文在 trace 里」。\n"
-        "2. **再用 1–3 段中文逐项翻译**关键配置：image 是什么 / replicas 几个 / "
-        "networks 接哪个 overlay / placement 约束什么意思 / labels 起的作用 / 健康检查策略。\n"
-        "3. 最后**可选**一句运维建议：「X 字段建议改 Y，避免 Z」。"
+        "🎯 **本次意图:查看配置 / 看原文(B 类)**——执行铁律 #2「原始数据展示优先」。\n"
+        "1. **先**用 ``` 代码块原样贴配置原文(yaml/json,取 result.parsed 或 stdout),"
+        "完整不重排不省字段;超长(>200 行)按段贴关键段"
+        "(image/replicas/networks/labels/placement/healthcheck/env/mounts)。\n"
+        "2. **再**用 1-3 段中文逐项翻译关键字段。\n"
+        "3. 可选一句运维建议。"
     ),
     "list_state": (
-        "🎯 **本次用户意图:列表 / 状态总览(C 类)—— 先 raw 后解读**\n"
-        "\n"
-        "**铁律:能贴的原始输出先贴,再做简短解读。严禁把 raw 数据「加工」成中文段落丢失原文。**\n"
-        "\n"
-        "**必须按这个顺序输出**:\n"
-        "1. **第一段**:原样贴 skill 返回的 raw 输出\n"
-        "   - 命令输出(``docker ps`` / ``ss -ltnp`` / ``ps -ef`` 等)→ ``` 代码块包裹原文\n"
-        "   - JSON / 结构化数据(``kubectl get -o json`` 的 items)→ 转 markdown 表格\n"
-        "   - 字段挑关键的(名字 / 状态 / 镜像 / 副本 / 重启次数 / 创建时间 / Node / 端口)\n"
-        "2. **第二段**(1-3 句解读):有多少个,几个异常,哪些值得关注\n"
-        "3. 异常项行首加 ⚠️ 或 🚨;行末一句简短原因\n"
-        "4. 异常存在时**主动追问**:「想详细看哪一个? 我可以拉它的 describe / 日志」\n"
-        "\n"
-        "**反例**(严禁):用户问「跑了哪些容器」,你只写「共 28 个容器,1 个 ai-ops-agent...」 \n"
-        "—— 你**丢了** ``docker ps`` 的 NAMES/IMAGE/STATUS/PORTS 表格,用户没法看到具体每个容器。"
+        "🎯 **本次意图:列表 / 状态总览(C 类)**——执行铁律 #2「原始数据展示优先」。\n"
+        "1. **第一段先贴原始列表**:命令输出(``docker ps``/``ss -ltnp``)→ ``` 代码块;"
+        "JSON/结构化(``kubectl get -o json`` items)→ markdown 表格,挑关键列"
+        "(名字/状态/镜像/副本/重启次数/创建时间/Node/端口)。\n"
+        "2. **第二段**(1-3 句)解读:多少个、几个异常、哪些值得关注;异常项行首加 ⚠️/🚨。\n"
+        "3. 有异常时主动追问:「想看哪个的 describe / 日志?」"
     ),
     "monitor": (
         "🎯 **本次用户意图：资源 / 性能监控（D 类）—— 数据卡片 + 解读**\n"
@@ -348,37 +215,10 @@ _INTENT_HINTS: dict[str, str] = {
         "3. 一句下一步建议（看更细的 skill / 扩容 / 清盘 / 排查应用）。"
     ),
     "write_action": (
-        "🎯 **本次用户意图：执行写操作（E 类）—— needs_confirmation 流程**\n"
-        "\n"
-        "**⚠️ 第一步是「调用对应的写 skill」,不是「写一段描述」!**\n"
-        "用户说『请使用 / 请执行 / 清理一下 / 运行这条 ...』时,**意思是真的要你执行**,\n"
-        "不是让你解释「如果执行的话会发生什么」。**直接调 tool**——写操作 skill\n"
-        "会自动返回 ``status=needs_confirmation``,平台**自己**会在 UI 下方弹\n"
-        "确认卡片(带 ✅/❌ 按钮)。**没调 tool 就只有干巴巴的文字,用户没按钮可点**!\n"
-        "\n"
-        "## 正确流程(必须按这个顺序)\n"
-        "\n"
-        "1. **第一轮:调对应写 skill**(``swarm_scale_service`` / ``k8s_restart_deployment`` /\n"
-        "   ``host_run_command`` 等)。具体选哪个看用户提到的对象:\n"
-        "   - 提到 docker 命令 / shell 命令(``docker prune`` / ``rm -rf`` 等)→ ``host_run_command``\n"
-        "   - 提到 swarm service 扩缩容 / 更新镜像 → 对应 ``swarm_*`` skill\n"
-        "   - 提到 k8s deployment 重启 / 扩缩 / 回滚 → 对应 ``k8s_*`` skill\n"
-        "2. **第二轮:平台拿到 needs_confirmation,你只写 2-3 句简短描述**:\n"
-        "   - 为什么要做(1 句,引用之前的取证证据)\n"
-        "   - 主要风险或回滚方式(1 句,可选)\n"
-        "   - 结尾**必须**写:``请在下方点击 ✅ 确认 或 ❌ 取消``\n"
-        "3. **禁止重写卡片**:skill / 参数 / 有效期由 chainlit 自动呈现,你别重复\n"
-        "   (重写会把按钮挤出屏幕,用户找不到!)\n"
-        "\n"
-        "## 反例(严禁!)\n"
-        "\n"
-        "❌ 用户:「docker container prune -f 请执行一下」\n"
-        "❌ 你:「本次将在 X 节点执行 docker container prune -f 命令...请确认」**(没调 tool!)**\n"
-        "→ 用户看到文字但没按钮,挫败感拉满。\n"
-        "\n"
-        "✅ 用户:「docker container prune -f 请执行一下」\n"
-        "✅ 你:**直接调** ``host_run_command(node=X, command='docker container prune -f')``\n"
-        "→ 平台返回 needs_confirmation → UI 弹确认卡片 → 你写一句简短解释 + 按钮提示。"
+        "🎯 **本次用户意图:写操作(E 类)** —— 完整规则见 system prompt 顶部 "
+        "「## 写操作」段。要点:**首轮调 tool**(平台已开 tool_choice=required 强制),"
+        "第二轮基于 needs_confirmation 写 2-3 句:原因 → 风险/回滚 → "
+        "结尾「请在下方点击 ✅ 确认 或 ❌ 取消」。**不要重写卡片已有的 skill/参数/有效期**。"
     ),
     "async_task": (
         "🎯 **本次用户意图：异步长任务（F 类）—— 提交回执 + 轮询提示**\n"
@@ -460,135 +300,11 @@ def _classify_intent_hint(user_message: str) -> str | None:
     return _INTENT_HINTS.get(intent) if intent else None
 
 
-def _is_data_query_trace_item(item: dict) -> bool:
-    """trace 里这一条是不是「拉数据」型只读调用?
-
-    通用化:任何 host/swarm/kube/swarm_cluster_overview 的成功只读调用都算。
-    """
-    if item.get("status") != "ok":
-        return False
-    tool = item.get("tool_name", "")
-    if tool in ("kube_query", "swarm_query", "host_query",
-                "swarm_cluster_overview",
-                "zabbix_get_host_overview", "zabbix_get_host_storage_overview"):
-        return True
-    return False
-
-
-def _message_already_has_raw(message: str) -> bool:
-    """模型自己已经贴了原文(code block 或 markdown 表格) → 平台不重复贴。
-
-    markdown 表格判定:有 ``| --- |`` 这种分隔行(table separator),
-    必须严格,避免把 ``|`` 当 OR 用的普通文本误判成表格。
-    """
-    if not message:
-        return True
-    if "```" in message:
-        return True
-    # markdown table separator 行:开头是 `|`,主体是 `-` 和 `|`
-    import re
-    if re.search(r"^\s*\|[\s\-:|]+\|\s*$", message, re.M):
-        return True
-    return False
-
-
-def _extract_raw_for_display(item: dict) -> tuple[str, str]:
-    """从 trace item 抽可直接展示的 raw 文本,返回 (text, lang)。空 raw 返回 ("","" )。
-
-    优先级:
-      1. swarm_query 反推的 ``compose_yaml`` —— 用户最熟悉的格式
-      2. ``items`` / ``nodes`` / 其它简单 list 字段 —— 转 JSON
-      3. ``stdout`` —— 命令原文
-      4. ``parsed`` —— JSON
-    """
-    result = item.get("tool_result") or {}
-    if not isinstance(result, dict):
-        return "", ""
-
-    compose_yaml = result.get("compose_yaml")
-    if compose_yaml and isinstance(compose_yaml, str) and compose_yaml.strip():
-        return compose_yaml, "yaml"
-
-    stdout = result.get("stdout") or ""
-    if stdout and isinstance(stdout, str) and stdout.strip():
-        # 推语言:看头部有没有 YAML 风格冒号
-        head = stdout[:200]
-        if ":" in head and "\n" in head and any(c in head for c in ("-", " ")):
-            return stdout, "yaml"
-        return stdout, ""    # 留空让 chainlit 按默认渲染(更像 ``docker ps`` 表格)
-
-    parsed = result.get("parsed")
-    if parsed not in (None, [], {}):
-        try:
-            return json.dumps(parsed, ensure_ascii=False, indent=2, default=str), "json"
-        except Exception:
-            pass
-
-    return "", ""
-
-
-def _augment_message_for_intent(message: str, trace: list[dict], user_message: str) -> str:
-    """**平台保证机制**:能展示 raw 数据就先展示,不能展示的才让模型出报告。
-
-    设计哲学(对应用户反馈"能展示的优先展示输出结果"):
-      不再依赖意图分类(关键词太脆弱——"iiot" 撞 "io"、"在跑"漏 list_state...
-      用户也明确说不要再扩词典污染 prompt)。改用 **trace 事实判定**:
-
-    触发条件(全部满足):
-      1. trace 里至少有一个"拉数据"型成功调用(host/swarm/kube/zabbix 等)
-      2. trace 里没有 ``needs_confirmation`` 状态的写操作(那是审批说明场景,
-         raw 不该冲走模型写的"我打算执行...请确认"那段话)
-      3. 模型生成的 message **还没**自己贴 raw(没 ``` code block 也没 markdown
-         表格分隔行 ``| --- |``)
-
-    满足 → 从 trace 抽最近一条 raw 输出拼到 message 末尾,用 ``` 包裹。
-
-    用户原话:
-      > "匹配用户的关键词感觉还是太差了,关键词扩展我感觉就不要了"
-      → 所以不能再靠 _classify_intent 做判定
-    """
-    if not message:
-        return message
-
-    # 模型自己贴 raw 了 → 不重复
-    if _message_already_has_raw(message):
-        return message
-
-    # 写操作 needs_confirmation 场景 → 模型在写"我打算执行...请确认"那段
-    # 应该被原样呈现,raw 拼上来会喧宾夺主。同时确认卡片在下方独立显示。
-    for item in (trace or []):
-        if item.get("status") == "needs_confirmation":
-            return message
-        if item.get("pending_token"):
-            return message
-
-    # 找最近一条"拉数据"成功调用
-    data_item = None
-    for item in reversed(trace or []):
-        if _is_data_query_trace_item(item):
-            data_item = item
-            break
-    if data_item is None:
-        return message
-
-    raw_text, raw_lang = _extract_raw_for_display(data_item)
-    if not raw_text:
-        return message
-
-    # 截 12K 字符防 UI 撑爆;完整原文在 admin UI → 调用审计可查
-    if len(raw_text) > 12_000:
-        raw_text = (
-            raw_text[:12_000]
-            + "\n# …(更多内容已截断,完整原文在 admin UI → 调用审计可查)"
-        )
-
-    fence_lang = raw_lang if raw_lang else ""
-    return (
-        message.rstrip()
-        + "\n\n---\n\n"
-        + "### 📋 原始数据\n\n"
-        + f"```{fence_lang}\n{raw_text}\n```"
-    )
+# NOTE:raw-first 展示的代码兜底(_augment_message_for_intent / _extract_raw_for_display
+# / _is_data_query_trace_item / _message_already_has_raw)已删除。
+# 原因:"能展示原始数据就展示"已升级为 system prompt 铁律 #2(硬约束),不再靠平台代码
+# 替模型贴 raw。留着代码兜底会盖住"模型到底听不听话"的真相,无法验证 prompt 是否生效。
+# 历史实现见 git history。
 
 
 def _messages_size_chars(messages: list[dict[str, Any]]) -> int:
@@ -672,79 +388,6 @@ def _maybe_compress(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             break    # 没法再压
         current = compressed
     return current
-
-
-_LEGACY_SYSTEM_PROMPT = """
-你是统一运维智能助手，负责接管中国国产模型驱动的私有化运维平台。
-
-## 你能动什么
-
-平台把"接入 × Skill"做成了组合：你可以同时操作多个 Swarm 集群、多个 K8s 集群、
-多个 Zabbix 实例、告警分析。所有 skill 都通过工具调用（function calling）使用，
-**永远不要凭记忆回答主机/服务的真实状态，必须 skill 取证**。
-
-## 多数运维问题不是单点的——这是核心心法
-
-容器/Pod 异常的真实根因常常落在另一层：
-- 服务起不来 → 可能是宿主机磁盘满 / OOM / 镜像拉不下来 / 配置错
-- Pod CrashLoop → 可能是 limits 太低被 OOMKilled / Node DiskPressure 被驱逐
-- 服务变慢 → 可能是宿主机 CPU 飙高 / 邻居噪声 / 外部依赖超时
-
-所以你必须**跨层联动取证**：
-
-1. 容器层信号 → 立刻判断要不要追到主机层。
-   - swarm_query(verb=ps) 的 Node 列 / kube_query(verb=get,resource=pods,output=json) 的 spec.nodeName
-     → 当作 zabbix host_query。
-   - 看到 OOMKilled / exit 137 / Evicted / no space / DiskPressure / connection refused
-     这类关键词时，**必须**追加一次 zabbix_get_host_overview 或 zabbix_get_host_storage_overview。
-2. 主机层信号 → 反向回到容器层。
-   - 主机 CPU/MEM/DISK 告警时，确认这台 Node 上跑的服务是否同步异常
-     （swarm_query(verb=ls) 看服务、kube_query(verb=get,resource=pods,selector=…) 看 pod）。
-3. 告警 payload → 结构化研判后，按结果展开继续查证（用 alerts_analyze_payload）。
-
-## 工作流
-
-复合问题 / 不熟悉的场景：**第一步先调 ``platform_get_runbooks``** 拿对应剧本，
-按里面的 step 顺序选 skill；一边取证一边把发现写进最终报告。
-
-简单问题（直接问"列服务"、"看主机磁盘"）：直接挑对应 skill，不必先查剧本。
-
-## 工作边界
-
-- 必须通过 skill 获取真实信息，绝不编造数字、状态、日志。
-- 可以连续调用多个只读 skill；同一个 skill 在已经拿到结果后**不要重复调用**，除非换了关键参数。
-- 用户可能在会话里指定了「当前 Swarm 集群 / Zabbix 实例 / K8s 集群」；你不必为只读 skill 追问 connection_id，
-  平台会按"参数 → 会话默认 → 平台默认"自动注入。但你想精确指明集群时，可以传 connection_id。
-- 输出必须使用中文。
-
-## 写操作（read_only=False）的 skill
-
-调用后会拿到 ``status="needs_confirmation"`` 的结果。这意味着：
-- 平台**不会**直接执行；正在等待用户在 UI 上点击确认/取消。
-- **禁止再次调用同一个写 skill**，也禁止换个写 skill 强行兜底。
-- 你应当用中文清楚说明：你打算做什么、为什么、影响范围、回滚方式，并提示「请在下方点击确认/取消」。
-- 用户点确认后平台自动执行，再回到你这里给最终总结；不需要你再发起任何 tool 调用。
-
-写操作还可能带 ``requires_admin_approval=True``——只有 admin 用户能确认。提示用户时要明确说"需 admin 审批"。
-
-## 何时停止取证
-
-满足任一即停：
-1. 已经能给出"当前状态 / 检测过程 / 关键证据 / 判断结论 / 建议操作"五段式中文报告。
-2. 同一 skill 已重试 ≥ 2 次仍无新信息。
-3. 进入写操作 needs_confirmation 流程后立即停止。
-
-## 最终报告格式
-
-不论调了多少 skill，最终给用户的回答**必须**包含以下五段，每段 1–3 句即可：
-
-**当前状态**：服务/Pod/主机现在是健康还是异常，关键数字（副本/重启次数/磁盘使用率…）。
-**检测过程**：你按什么顺序查了哪些 skill，原因是什么。
-**关键证据**：最核心的 1–3 条原始信息（错误码、日志片段、metric 数字），用 ``code 块`` 引用原文。
-**判断结论**：根因是什么；如果没法 100% 确认，写"高度疑似 + 备选可能性"。
-**建议操作**：具体到可执行——重启哪个服务、加多少 replica、清哪个目录。如果建议是写操作，
-明确告诉用户"我可以帮你执行 ``swarm_force_update_service``，请下方点击确认"。
-""".strip()
 
 
 def _parse_tool_call_args(tool_call: dict) -> tuple[dict | None, dict | None]:
@@ -1025,8 +668,8 @@ class UnifiedOpsAgent:
         # - 用户在 chainlit ChatSettings 里**显式选过的 connection 优先级最高**,
         #   不被自动路由覆盖(``setdefault`` 语义)。
         # - 与现有的 ``_build_cluster_registry_prompt`` 互补:那个是给 LLM 看的指引
-        #   (走 tool loop 时让模型自己挑 connection_id);自动路由是给"模型不参与
-        #   决策"的路径(预路由 runbook / signal-driven fallback)兜底。
+        #   (走 tool loop 时让模型自己挑 connection_id);自动路由覆盖"模型不参与
+        #   决策"的路径(主要是 runbook 预路由,直接强制走 platform_run_runbook)。
         # ====================================================================
         sel = dict(selected_connections or {})
         for type_code, cid in self._resolve_clusters_from_query(user_message).items():
@@ -1056,17 +699,17 @@ class UnifiedOpsAgent:
         visibility = "user" if user and user.get("role") != "admin" else None
         full_tools = self.registry.openai_tools(visibility=visibility)
 
-        # ---- 意图分类（提前到 tools 过滤之前）----
+        # ---- 意图分类（仅用于输出格式 hint + 写操作 tool_choice，不再做工具过滤）----
         intent = _classify_intent(user_message)
 
-        # ---- tools 按意图动态裁剪（省 ~3.5K tokens / 次）----
-        # 失败回退：若 LLM 第一轮空手回（既没调 tool 也没给文本），下一轮自动用 full set 重试。
-        tools, was_filtered = _filter_tools_by_intent(full_tools, intent)
-        if was_filtered:
-            logger.debug(
-                "intent=%s, tools filtered: %d → %d",
-                intent, len(full_tools), len(tools),
-            )
+        # ---- 渐进披露：Layer 0 常驻核心 + load_skills meta-tool ----
+        # 工具加载从"关键词意图静态过滤"换成"核心常驻 + 按域懒加载"：
+        #   - tools 初始 = 三把口 + zabbix 概览 + runbook 入口 + load_skills（~7K，固定→缓存友好）
+        #   - 模型调 load_skills(domains=[...]) → 平台把该域 skill 加进 tools，下轮可调
+        #   - signal 的 next_skill 在某域里 → 自动加载该域（解决"挡 signal"硬伤）
+        # expand_tools 按 skill 名去重，所以重复 load 同域无害（幂等），不必额外记账。
+        tools = build_core_tools(full_tools)
+        logger.debug("渐进披露：core tools=%d（全集 %d）", len(tools), len(full_tools))
 
         # ---- 会话记忆：把历史对话拼进 messages（同会话多轮上下文）----
         # 设计：
@@ -1109,19 +752,15 @@ class UnifiedOpsAgent:
         trace: list[dict[str, Any]] = []
         pending_actions: list[dict[str, Any]] = []
         seen_signal_keys: set[tuple] = set()
-        all_signals: list[dict[str, Any]] = []
-        # 已经被"signal 强制 pivot"路径用过的 (skill, args_json) —— 避免同信号无限循环
-        force_routed_keys: set[tuple[str, str]] = set()
         # Token usage 累计：每次 create_completion 后从 message["_usage"] 累加；
         # ask() 结束时塞到 AgentOutcome.usage 给入口层（chainlit_app / API）持久化。
         total_usage: dict[str, Any] = {}
 
         # ---- tool_choice 策略：写操作意图首轮强制调 tool ----
         # 国产模型(豆包 seed-2 / qwen3 等)对 "tool_choice=auto" 下的写操作意图常常
-        # 产生"我打算执行 X..."的纯文本描述,**没有真正调 tool**——结果用户看到说明
-        # 文字但下方没有确认卡片可点。强制 ``required`` 让模型必须先选一个 tool 调用,
-        # 配合 ``_INTENT_TOOLS["write_action"]`` 的白名单(只暴露写 skill + 必要的 read),
-        # 模型只能选写 skill,自然走到 needs_confirmation 流程。
+        # 产生"我打算执行 X..."的纯文本描述,**没有真正调 tool**。强制 ``required`` 让模型
+        # 必须先选一个 tool——渐进披露下首轮核心集里写 skill 还没加载,模型会先调
+        # ``load_skills(domains=["swarm_write"...])`` 或先用核心查询口确认状态,都正确。
         # 仅首轮(step==0)强制;后续轮次还原 ``auto``,让模型基于 tool 结果自主决策。
         first_round_tool_choice = "required" if intent == "write_action" else "auto"
 
@@ -1137,91 +776,13 @@ class UnifiedOpsAgent:
             tool_calls = message.get("tool_calls") or []
             content = (message.get("content") or "").strip()
 
-            # 空手回退：第一轮 LLM 既没调 tool 也没给文本——可能是 tools 被过滤掉
-            # 了它想要的那个。重新跑一次给它 full set。
-            if step == 0 and was_filtered and not tool_calls and not content:
-                logger.info(
-                    "intent=%s 过滤后 LLM 空手回，回退到 full tool set",
-                    intent,
-                )
-                tools = full_tools
-                was_filtered = False
-                message = self.model.create_completion(
-                    messages=messages, tools=tools, tool_choice="auto",
-                )
-                _accumulate_usage(total_usage, message.pop("_usage", {}))
-                tool_calls = message.get("tool_calls") or []
-                content = (message.get("content") or "").strip()
-
             if not tool_calls:
-                fallback = self._pick_fallback(
-                    user_message=user_message,
-                    trace=trace,
-                    all_signals=all_signals,
-                    force_routed_keys=force_routed_keys,
-                )
-                if fallback is not None:
-                    name, args, reason = fallback
-                    envelope = self.invoker.invoke(name, args, ctx)
-                    trace.append(self._to_trace_item(name, args, envelope))
-                    force_routed_keys.add(
-                        (name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str))
-                    )
-                    if envelope.get("status") == "needs_confirmation":
-                        pending_actions.append(envelope)
-                        # 进入"待确认"路径——同主流程,只写 2-3 句精炼提议,
-                        # 不重写卡片内容,确保按钮始终在屏幕内可见
-                        summary = self.model.create_completion(
-                            messages=messages + [{
-                                "role": "system",
-                                "content": (
-                                    f"平台已根据 {reason} 自动调用 ``{name}``,返回 needs_confirmation。\n"
-                                    "**chainlit 下方会自动弹确认卡片(✅/❌ 按钮)——你不要重写 skill/参数/有效期等卡片已有信息**。\n"
-                                    "请用中文 2-3 句话:为什么平台触发了这个调用 / 主要风险点 / "
-                                    "**结尾写**:`请在下方点击 ✅ 确认 或 ❌ 取消`。**禁止再调任何工具**。"
-                                ),
-                            }],
-                        )
-                        _accumulate_usage(total_usage, summary.pop("_usage", {}))
-                        return AgentOutcome(
-                            message=_augment_message_for_intent(
-                                summary.get("content") or "请在下方点击 ✅ 确认 或 ❌ 取消。",
-                                trace, user_message),
-                            trace=trace,
-                            pending_actions=pending_actions,
-                            usage=total_usage,
-                        )
-                    # 只读 fallback：把"合成的工具调用"塞进 messages，让下一轮 LLM 看到结果，
-                    # 自己决定是给最终报告还是再调其它 skill。
-                    synthetic_id = f"fallback_{step}"
-                    messages.append({
-                        "role": "assistant", "content": "",
-                        "tool_calls": [{
-                            "id": synthetic_id, "type": "function",
-                            "function": {"name": name,
-                                         "arguments": json.dumps(args, ensure_ascii=False)},
-                        }],
-                    })
-                    messages.append({
-                        "role": "tool", "tool_call_id": synthetic_id,
-                        "content": self.invoker.serialize_for_model(envelope),
-                    })
-                    messages.append({
-                        "role": "system",
-                        "content": (
-                            f"⚙️ 平台已根据 {reason} 自动调用 ``{name}`` 补一次取证。"
-                            "请综合上下文给出最终五段式报告；如还有缺失再调一次 skill 即可。"
-                        ),
-                    })
-                    # 把 fallback 命中的 signal 也吸收一次，避免下一轮再触发
-                    for sig in collect_signals(envelope):
-                        key = signal_dedup(sig)
-                        if key not in seen_signal_keys:
-                            seen_signal_keys.add(key)
-                            all_signals.append(sig)
-                    continue   # 让 for 循环进入下一步，给模型用新上下文重试
-
-                # 真没 fallback：拿模型自己给的回答 / 或拿 trace 让模型再总结一次
+                # 模型不调 tool —— 三种情形,直接走结束分支,**不再做兜底**(关键词
+                # 启发式 / 合成 tool_call / 强制 retry full set 全删了):
+                #   A. 已有 trace → 让模型基于已取证写最终报告
+                #   B. 模型直接给了文字答案(content 非空)→ 返回原话
+                #   C. 模型既没调也没说 → 返回"未获得明确结论"提示用户重问
+                # 这三种都靠 prompt + tool_choice 引导,不再用平台代码救场。
                 if trace:
                     summary = self.model.create_completion(
                         messages=[
@@ -1236,17 +797,13 @@ class UnifiedOpsAgent:
                     )
                     _accumulate_usage(total_usage, summary.pop("_usage", {}))
                     return AgentOutcome(
-                        message=_augment_message_for_intent(
-                            summary.get("content") or "已完成排查，但模型没有输出总结。",
-                            trace, user_message),
+                        message=summary.get("content") or "已完成排查，但模型没有输出总结。",
                         trace=trace,
                         pending_actions=pending_actions,
                         usage=total_usage,
                     )
                 return AgentOutcome(
-                    message=_augment_message_for_intent(
-                        message.get("content") or "未获得明确结论。",
-                        trace, user_message),
+                    message=message.get("content") or "未获得明确结论。",
                     trace=trace,
                     pending_actions=pending_actions,
                     usage=total_usage,
@@ -1279,6 +836,27 @@ class UnifiedOpsAgent:
                         "content": self.invoker.serialize_for_model(err_envelope),
                     })
                     continue   # 跳过这次 tool_call，继续处理同轮的其他 tool_calls
+
+                # ---- load_skills meta-tool：不是真 skill，平台直接处理 ----
+                # 模型按需把某个域的工具加载进 tools，下一轮即可调用。
+                if name == LOAD_SKILLS_NAME:
+                    req_domains = args.get("domains") or []
+                    codes = skills_in_domains(req_domains)
+                    tools, added = expand_tools(full_tools, tools, codes)
+                    result_msg = {
+                        "loaded_domains": req_domains,
+                        "added_skills": added,
+                        "hint": ("这些 skill 现在可以调用了" if added
+                                 else "请求的域已加载或为空，无新增"),
+                    }
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_call["id"],
+                        "content": json.dumps(result_msg, ensure_ascii=False),
+                    })
+                    logger.debug("load_skills(%s) → 新增 %d 个 skill", req_domains, len(added))
+                    continue   # 不进 trace（非业务调用），不走 invoker
+
                 dedup_key = (name, json.dumps(args, sort_keys=True, ensure_ascii=False, default=str))
                 cached = turn_call_cache.get(dedup_key)
                 if cached is not None:
@@ -1299,7 +877,6 @@ class UnifiedOpsAgent:
                         continue
                     seen_signal_keys.add(key)
                     new_signals.append(sig)
-                    all_signals.append(sig)
                 messages.append({
                     "role": "tool",
                     "tool_call_id": tool_call["id"],
@@ -1308,6 +885,17 @@ class UnifiedOpsAgent:
 
             # ⚡ Signals 跨域硬 pivot：把"建议下一步"显式喂给模型
             if new_signals and not had_pending:
+                # signal 驱动自动加载：scanner 建议的 next_skill 若在某个懒加载域里，
+                # 平台**自动**把该域加进 tools——模型下一轮能立刻遵循 signal，
+                # 不用先 load_skills 再调（解决静态过滤"挡 signal"硬伤）。
+                auto_codes = [
+                    s["next_skill"] for s in new_signals
+                    if s.get("next_skill") and domain_for_skill(s["next_skill"])
+                ]
+                if auto_codes:
+                    tools, auto_added = expand_tools(full_tools, tools, auto_codes)
+                    if auto_added:
+                        logger.debug("signal 自动加载：%s", auto_added)
                 hint = render_signal_hint(new_signals)
                 if hint:
                     messages.append({"role": "system", "content": hint})
@@ -1343,9 +931,7 @@ class UnifiedOpsAgent:
                 )
                 _accumulate_usage(total_usage, summary.pop("_usage", {}))
                 return AgentOutcome(
-                    message=_augment_message_for_intent(
-                        summary.get("content") or "请在下方点击 ✅ 确认 或 ❌ 取消。",
-                        trace, user_message),
+                    message=summary.get("content") or "请在下方点击 ✅ 确认 或 ❌ 取消。",
                     trace=trace,
                     pending_actions=pending_actions,
                     usage=total_usage,
@@ -1363,9 +949,7 @@ class UnifiedOpsAgent:
         )
         _accumulate_usage(total_usage, summary.pop("_usage", {}))
         return AgentOutcome(
-            message=_augment_message_for_intent(
-                summary.get("content") or "已完成排查，但模型没有输出总结。",
-                trace, user_message),
+            message=summary.get("content") or "已完成排查，但模型没有输出总结。",
             trace=trace,
             pending_actions=pending_actions,
             usage=total_usage,
@@ -1703,68 +1287,8 @@ class UnifiedOpsAgent:
                               "summarized_count": len(to_summarize)},
         }
 
-    @staticmethod
-    def _heuristic_route(user_message: str) -> tuple[str, dict[str, Any]] | None:
-        host_match = re.search(r"([A-Za-z0-9][A-Za-z0-9_.-]{2,})", user_message)
-        service_match = host_match
-
-        if any(k in user_message for k in ["硬盘", "磁盘", "挂载点"]) and host_match:
-            return "zabbix_get_host_storage_overview", {"host_query": host_match.group(1)}
-        if any(k in user_message for k in ["主机情况", "主机状态", "主机概况", "主机概览"]) and host_match:
-            return "zabbix_get_host_overview", {"host_query": host_match.group(1)}
-        if any(k in user_message for k in ["起不来", "启动失败", "异常", "排查"]) and service_match:
-            # 重构后没有 swarm_check_service_health；改走 swarm_query inspect 作为入口诊断
-            return "swarm_query", {"category": "service", "verb": "inspect",
-                                   "name": service_match.group(1)}
-
-        payload_match = re.search(r"(\{[\s\S]*\})", user_message)
-        if payload_match:
-            return "alerts_analyze_payload", {"raw_payload_json": payload_match.group(1)}
-        return None
-
-    @classmethod
-    def _pick_fallback(
-        cls,
-        *,
-        user_message: str,
-        trace: list[dict[str, Any]],
-        all_signals: list[dict[str, Any]],
-        force_routed_keys: set[tuple[str, str]],
-    ) -> tuple[str, dict[str, Any], str] | None:
-        """模型空手而归时挑一个兜底 skill。返回 ``(name, args, reason)`` 或 None。
-
-        优先级：
-          1. **会话刚开始** (trace 空) — 走关键词启发式 (``_heuristic_route``)，
-             适合用户原话本身就指向某个 skill 的场景。
-          2. **会话中段** (trace 非空) — 优先读未被 force-route 过的 ``critical``
-             signal；若没有 critical 再降级看 warning。**只有带 ``next_skill`` 的
-             signal 才能驱动 pivot**（避免递空 args 让下游 skill 崩）。
-
-        防循环：每次 pivot 后调用方应该把 ``(skill, args_json)`` 写入
-        ``force_routed_keys``，确保同一个 (skill, args) 不会被强制路由两次。
-        """
-        if not trace:
-            heuristic = cls._heuristic_route(user_message)
-            if heuristic:
-                name, args = heuristic
-                return name, args, "user_message 关键词启发式"
-            return None
-
-        # 中段：从最新 signal 往前找未 force-route 过的 critical 推荐
-        for severity_target in ("critical", "warning"):
-            for sig in reversed(all_signals):
-                if (sig.get("severity") or "warning") != severity_target:
-                    continue
-                next_skill = sig.get("next_skill")
-                next_args = sig.get("next_args") or {}
-                if not next_skill:
-                    continue
-                key = (next_skill, json.dumps(next_args, sort_keys=True, ensure_ascii=False, default=str))
-                if key in force_routed_keys:
-                    continue
-                reason = (
-                    f"上一轮信号 ``{sig.get('type')}`` (severity={severity_target}) "
-                    f"建议 next_skill={next_skill}"
-                )
-                return next_skill, next_args, reason
-        return None
+    # NOTE:``_heuristic_route`` 和 ``_pick_fallback`` 两个兜底方法已删除。
+    # 原因:它们用关键词正则替模型决策(磁盘→zabbix_storage / JSON→alerts_analyze
+    # 等),叠加多了让"模型到底好不好用"变成黑盒——分不清是真模型行为还是兜底
+    # 救了。新策略:出问题就改 prompt + tool_choice,不在平台代码里补救场。
+    # 历史代码见 git history (commit b62f008 之前)。

@@ -9,6 +9,40 @@ name: ai-ops-platform
 # 远端运维目标：通过 DOCKER_HOST 指向 Swarm manager；K8s 通过管理后台粘 kubeconfig。
 
 services:
+  # 本地 MySQL —— 替代外部 TiDB，给本地测试用。
+  # 首次启动时把 backups/ 里的备份作为 initdb 脚本自动导入（仅数据卷为空时执行）；
+  # 之后数据持久化在 ai-ops-mysql-data 卷里，docker compose restart 不丢。
+  # 想换一份备份重新导入：``docker compose down -v db`` 清卷后再 up。
+  db:
+    image: mysql:5.7.44
+    container_name: ai-ops-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ai_alert_root
+      MYSQL_DATABASE: ai_alert
+      MYSQL_USER: ai_alert
+      MYSQL_PASSWORD: ai_alert
+      TZ: Asia/Shanghai
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+      - --default-authentication-plugin=mysql_native_password
+    volumes:
+      - ai-ops-mysql-data:/var/lib/mysql
+      # 备份作为 initdb 脚本——MYSQL_DATABASE=ai_alert 已选中库，表直接落进去。
+      # 注意:仅当数据卷为空（首次启动）时运行。换备份要先 down -v 清卷。
+      - ./backups/ai_alert_20260529_090510.sql:/docker-entrypoint-initdb.d/01-restore.sql:ro
+    ports:
+      # 暴露到宿主机 13306，方便本地 mysql 客户端直连排查（容器间走 db:3306）
+      - "13306:3306"
+    networks: [opsnet]
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uroot", "-pai_alert_root"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+
   backend:
     build:
       context: .
@@ -21,6 +55,13 @@ services:
       APP_HOST: 0.0.0.0
       APP_PORT: "5000"
       STORE_BACKEND: ${STORE_BACKEND:-sql}
+      # 指向本地 MySQL（覆盖 .env 里写死的 TiDB 地址）
+      TIDB_HOST: db
+      TIDB_PORT: "3306"
+      TIDB_USERNAME: ai_alert
+      TIDB_PASSWORD: ai_alert
+      TIDB_DATABASE: ai_alert
+      DATABASE_URL: "mysql+pymysql://ai_alert:ai_alert@db:3306/ai_alert?charset=utf8mb4"
       # 关键：BuildKit 通过 ~/.docker/config.json 的 proxies 块把 HTTP_PROXY/
       # HTTPS_PROXY 烧进了镜像 ENV，让 kubectl / requests 跑内网 HTTPS 时被
       # Windows 代理拦截。这里通过 compose 把 NO_PROXY 扩到所有内网网段，让
@@ -29,6 +70,9 @@ services:
       no_proxy: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
     ports:
       - "${BACKEND_PORT:-5000}:5000"
+    depends_on:
+      db:
+        condition: service_healthy
     networks: [opsnet]
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://localhost:5000/health"]
@@ -47,6 +91,13 @@ services:
     env_file: .env
     environment:
       STORE_BACKEND: ${STORE_BACKEND:-sql}
+      # 指向本地 MySQL（覆盖 .env 里写死的 TiDB 地址）
+      TIDB_HOST: db
+      TIDB_PORT: "3306"
+      TIDB_USERNAME: ai_alert
+      TIDB_PASSWORD: ai_alert
+      TIDB_DATABASE: ai_alert
+      DATABASE_URL: "mysql+pymysql://ai_alert:ai_alert@db:3306/ai_alert?charset=utf8mb4"
       # 同 backend：覆盖 BuildKit 烧进来的 NO_PROXY 防内网走代理
       NO_PROXY: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
       no_proxy: "${NO_PROXY:-localhost,127.0.0.1,*.tuna.tsinghua.edu.cn,registry.npmmirror.com,169.24.0.0/16,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,*.chinasws.com}"
@@ -58,6 +109,8 @@ services:
       - "${CHAT_PORT:-8000}:8000"
     depends_on:
       backend:
+        condition: service_healthy
+      db:
         condition: service_healthy
     networks: [opsnet]
 
@@ -74,6 +127,10 @@ services:
       backend:
         condition: service_healthy
     networks: [opsnet]
+
+volumes:
+  ai-ops-mysql-data:
+    # 本地 MySQL 数据持久化。``docker compose down`` 不删（除非 down -v）。
 
 networks:
   opsnet:

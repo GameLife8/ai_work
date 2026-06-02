@@ -418,6 +418,8 @@ def agent_ask():
         "message": outcome.message,
         "trace": outcome.trace,
         "pending_actions": outcome.pending_actions,
+        # token usage（本次 ask 累计），方便 admin 测试时观测成本
+        "usage": getattr(outcome, "usage", {}) or {},
         "trace_summary": [
             {
                 "tool": t.get("tool_name"),

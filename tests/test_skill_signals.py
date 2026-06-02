@@ -21,7 +21,7 @@ from __future__ import annotations
 # ---------- metric_query_peak (skill 内置 scanner，保留) ---------- #
 
 def test_peak_warning_branch_attaches_next_skill():
-    from skills.metric_query_peak import _extract_signals
+    from skills.metric_query import _extract_signals
 
     result = {
         "metric": "cpu.utilization",
@@ -38,7 +38,7 @@ def test_peak_warning_branch_attaches_next_skill():
 
 def test_peak_skips_next_skill_when_host_name_missing():
     """host_name 为空时不递空 host_query 给下游 skill。"""
-    from skills.metric_query_peak import _extract_signals
+    from skills.metric_query import _extract_signals
 
     result = {
         "metric": "cpu.utilization",
@@ -54,7 +54,7 @@ def test_peak_skips_next_skill_when_host_name_missing():
 
 
 def test_peak_memory_critical_attaches_next_skill():
-    from skills.metric_query_peak import _extract_signals
+    from skills.metric_query import _extract_signals
 
     result = {
         "metric": "memory.utilization",

@@ -187,9 +187,15 @@ class ModelManager:
     # ---------- bootstrap ----------
 
     def ensure_bootstrap(self, config_cls: Any) -> None:
-        if self.list():
+        """首启把 env 里的模型配置写成默认。并发安全见
+        ``ConnectionManager.ensure_bootstrap`` 的双重检查锁说明(同一套机制)。"""
+        if self.list():    # 快路径
             return
-        if config_cls.AI_BASE_URL and config_cls.AI_API_KEY:
+        if not (config_cls.AI_BASE_URL and config_cls.AI_API_KEY):
+            return
+        with self.store.bootstrap_lock():
+            if self.list():    # 双重检查
+                return
             self.create(
                 provider=config_cls.AI_PROVIDER,
                 name=f"default-{config_cls.AI_PROVIDER}",

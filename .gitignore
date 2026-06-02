@@ -30,3 +30,6 @@ admin_ui/.chainlit/
 .daemon.json.tmp
 .http-proxy.conf.tmp
 *.token.txt
+
+# 本地 DB 备份/导出（不进仓库,可能含敏感数据 + 体积大）
+backups/

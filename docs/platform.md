@@ -30,7 +30,8 @@
            ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                          drivers                               │
-│  zabbix · swarm · k8s · host_agent · alert_analysis            │
+│  zabbix · swarm · k8s · host_agent · http_api · jenkins ·      │
+│  mcp_client · alert_analysis                                   │
 └──────────┬─────────────────────────────────────────────────────┘
            │
            ▼
@@ -65,7 +66,7 @@ docker compose up -d
 ## 3. 维度一：Connection（接入）
 
 每个 Connection 是某种 type 的具体连接配置（凭证 + 地址）。同类型可存多份。
-当前内置 5 种 type：
+当前内置 8 种 type：
 
 | type | 说明 | 典型字段 |
 |---|---|---|
@@ -73,6 +74,9 @@ docker compose up -d
 | `swarm` | Docker Swarm 集群 | DOCKER_HOST / TLS 证书路径 |
 | `k8s` | Kubernetes 集群 | kubeconfig / context / namespace |
 | `host_agent` | 节点诊断 Agent（每节点 DaemonSet） | kind=k8s/swarm + 对应字段 |
+| `http_api` | 通用 HTTP API（Jira / GitLab / CMDB…）→ 配 HTTP skill | base_url / 多种 auth_kind |
+| `jenkins` | Jenkins CI/CD（实测兼容 2.190+）| base_url / username / api_token 或 password |
+| `mcp_client` | 反向接第三方 MCP server，远端工具注册成本地 skill | server URL / auth |
 | `alert_analysis` | 内置告警研判服务（虚拟） | — |
 
 新增 Connection：admin 后台 **接入管理 → +新增接入**，按 type 选择驱动后表单字段会按 driver 的 schema 自动渲染。详见 [`ops_platform/drivers/`](../ops_platform/drivers/) 各 driver。
@@ -144,18 +148,69 @@ skills/
 
 启动时 [`ops_platform/loader.py`](../ops_platform/loader.py) 扫描整个目录，按 manifest 注册。**新增 skill 零代码改动**：建一个目录，里头是 manifest + 一个 `run` 函数。
 
-### 当前 22 个 skill（按类别）
+### 当前 27 个 skill（按类别）
 
-| 分类 | 数量 | skill |
-|---|---|---|
-| swarm | 5 读 + 5 写 | list_services / get_service_detail / get_service_status / get_failed_tasks / check_service_health / get_service_logs_filter / **force_update_service** / **scale_service** / **update_service_image** / **rollback_service** / **remove_service**(admin) |
-| k8s | 4 读 + 3 写 | list_pods / describe_pod / get_pod_logs / list_deployments / **restart_deployment** / **scale_deployment** / **rollout_undo** |
-| zabbix | 2 读 | get_host_overview / get_host_storage_overview |
-| host | 5 读 + 2 写 | list_nodes / socket_overview / iptables_dump / route_overview / kernel_events / inspect_container_netns / **capture_packets** / **run_command**(admin) |
-| alerts | 1 | analyze_payload |
-| platform | 1 | **get_runbooks** |
+设计哲学是**少而精的"通用一把口"**——不给每种资源建独立 skill，而是 `kube_query` /
+`swarm_query` / `host_query` 三把通用查询口用 `verb`/`category` 组合覆盖几十种 kubectl /
+docker / shell 命令。这样模型不用记一堆 skill 名，工具集也小。
 
-加粗 = 写操作（read_only=False），走二次确认。
+| 分类 | skill |
+|---|---|
+| **通用查询（三把口）** | `kube_query`（k8s get/describe/logs/top/events…，含 verb=logs）· `swarm_query`（docker service/node/task/stack…）· `host_query`（白名单 shell：ss/ip/df/ps/dmesg…）|
+| swarm 写 | **swarm_scale_service** · **swarm_update_service_image** · **swarm_force_update_service** · **swarm_rollback_service** · **swarm_remove_service**(admin) |
+| swarm 聚合 | `swarm_cluster_overview`（集群级巡检：节点 + 服务 + 监控一次拉全）|
+| k8s 写 | **k8s_scale_deployment** · **k8s_restart_deployment** · **k8s_rollout_undo** |
+| 监控 | `zabbix_get_host_overview` · `zabbix_get_host_storage_overview` · `metric_query`（时序：mode=peak 找峰值 / mode=window 取时刻附近）|
+| 主机执行 | **host_run_command**(admin) · **host_run_command_async**(admin，长命令 hybrid 同步/异步) · **host_capture_packets**(admin) · `host_check_task` · `host_list_tasks` · `host_list_nodes` |
+| 网络/内核 | `host_inspect_container_netns`（进容器 netns 看 iptables）· `host_kernel_events`（dmesg + 老节点兼容）|
+| CI/CD | `jenkins_query`（job/build/console/queue/node）|
+| 告警 | `alerts_analyze_payload` |
+| 编排入口 | `platform_get_runbooks` · `platform_run_runbook` |
+
+加粗 = 写操作（read_only=False），走二次确认。`(admin)` = `visibility=admin`，仅 admin 可见可调。
+
+> **历史合并**：`k8s_get_pod_logs` → 折进 `kube_query(verb=logs)`；`metric_query_peak` +
+> `metric_query_window_around` → 合成 `metric_query(mode=…)`。冗余的薄包装一律收口到通用口。
+
+### 工具加载：渐进披露（progressive disclosure）
+
+27 个 skill 的 schema 全发给模型约 22K 字符。以前按关键词意图静态过滤，两个毛病：① 关键词脆，
+还会**挡掉 signal 想调的 skill**；② 工具集随 query 变 → 破坏 prompt cache。现在换成
+[`ops_agent/skill_domains.py`](../ops_agent/skill_domains.py) 的两层架构：
+
+- **Layer 0 常驻（~7K，固定 → 缓存友好）**：三把通用查询口 + `zabbix_get_host_overview` +
+  runbook 入口 + `load_skills` meta-tool。覆盖 ~80% 的问题。
+- **Layer 1 按域懒加载**：模型要专科能力时调 `load_skills(domains=["swarm_write","monitoring"…])`，
+  平台把那个域的 skill schema 加进工具集，**下一轮**即可调用。域有 `swarm_write` / `k8s_write` /
+  `host_exec` / `monitoring` / `network_diag` / `cicd` / `alerts` 7 个。
+- **signal 驱动自动加载**：scanner 发的 `next_skill` 若在某个域里，平台**自动**把该域加载进来——
+  模型立刻能遵循 signal，不用先 load（彻底解决静态过滤"挡 signal"的硬伤）。
+
+> 意图分类（`_classify_intent`）现在**只**用于注入"输出模式提示"（如 list_state 场景的 raw-first
+> 展示），跟工具加载**完全解耦**。
+
+### Skill manifest 字段
+
+```python
+MANIFEST = {
+    "code":                       "swarm_force_update_service",  # 全局唯一
+    "name":                       "强制更新 Swarm 服务",
+    "description":                "...给模型看的何时使用 + 信号→下一步...",
+    "category":                   "swarm",
+    "required_connection_type":   "swarm",
+    "read_only":                  False,
+    "requires_admin_approval":    False,    # True 则只有 admin 能 confirm（user 调起 → admin 审）
+    "visibility":                 "all",    # 'all' / 'admin'；admin-only 由 invoker.invoke 入口 RBAC 强制
+    "confirmation_ttl_seconds":   300,
+    "params_schema":              { ...JSON Schema... },
+}
+
+def run(ctx, *, service_name: str, connection_id: str | None = None) -> dict:
+    return ctx.connection_for("swarm", connection_id).run(...)
+```
+
+> **质量门禁**：[`tests/test_skill_manifest_quality.py`](../tests/test_skill_manifest_quality.py) lint
+> 每个 manifest——描述长度、长描述必带示例、易混淆 skill 必须互指。新 skill 自动强制走规范。
 
 ### Skill manifest 字段
 
@@ -183,17 +238,26 @@ def run(ctx, *, service_name: str, connection_id: str | None = None) -> dict:
 
 ```
 模型 → invoker.invoke()
+    → 入口 RBAC：visibility=admin 的 skill，非 admin 直接 forbidden
     → 因为 read_only=False，不立即执行
-    → 落 pending_action 表，返回 needs_confirmation + token
+    → 落 pending_action 表（记 session_id），返回 needs_confirmation + token
 模型 → 出"提议+风险"中文说明，停止 tool 循环
 chainlit / 后台 → 渲染 ✅/❌ 卡片
 用户点 ✅
     → invoker.confirm(token, ctx)
-    → 校验状态/权限/TTL → 真正执行 → pending 改 executed
+    → 校验状态 / TTL / 会话绑定 / 权限 → 真正执行 → pending 改 executed
 模型 → follow_up_after_action() 给最终中文总结
 ```
 
-详见 [`ops_platform/invoker.py`](../ops_platform/invoker.py)。
+**安全要点**（[`ops_platform/invoker.py`](../ops_platform/invoker.py)）：
+- **会话绑定**：token 记录创建时的 `session_id`。**非 admin** 必须从同一会话确认——
+  防止 token 泄露后被攻击者在别的会话重放。**admin 可跨会话确认**（后台审批是 admin 职责，
+  后台 session ≠ 原聊天 session）。
+- **审计脱敏**：skill_call 审计落库前，用户参数里的密码 / api_key / `-p<pw>` / `KEY=VALUE`
+  等凭证会脱敏成 `***`（`_redact_audit_args`）。但**平台生成的 `_extra`（如 confirmation_token）
+  不脱敏**——审计页靠它反查发起人。
+- **入口 RBAC**：`visibility=admin` 的 skill 在 `invoker.invoke()` 执行层拦截，不只靠 LLM
+  tool schema 过滤（HTTP API / runbook 引用 / 内部调用都挡得住）。
 
 ### Runbook（诊断剧本）· 图执行
 
@@ -280,17 +344,39 @@ model:     ep-xxx / qwen-plus / glm-4 / deepseek-chat / moonshot-v1-32k / ...
 
 ## 8. 数据持久化
 
-DB 默认 TiDB（MySQL 兼容）；本地调试可设 `STORE_BACKEND=memory`。表清单（截至本版本）：
+DB 默认 TiDB（MySQL 兼容）；本地调试可设 `STORE_BACKEND=memory`，或用 `docker-compose.yml`
+里托管的本地 MySQL（`db` 服务）。表清单（截至本版本）：
 
-### 平台表（[`ops_platform/store.py`](../ops_platform/store.py)）
+### 平台表
+存储层拆成三个文件（原 1775 行单文件拆开，零迁移成本）：
+[`store.py`](../ops_platform/store.py)（入口 + `attach_platform_store` + re-export）·
+[`store_memory.py`](../ops_platform/store_memory.py)（内存版）·
+[`store_sql.py`](../ops_platform/store_sql.py)（SQLAlchemy 版）。
+
 - `platform_user` — 用户 + 密码 hash（PBKDF2-SHA256）+ 角色
 - `platform_connection` — 接入的配置；``config_json`` **Fernet 对称加密**，前缀 ``enc:v1:``
-- `platform_model_config` — 模型配置；``api_key`` **Fernet 对称加密**
-- `platform_skill_call` — 所有 skill 调用审计
-- `platform_pending_action` — 写操作待确认队列
+- `platform_model_config` — 模型配置；``api_key`` **Fernet 加密** + `tool_choice_preference`（auto/required/none，admin 按模型实测配）
+- `platform_skill_call` — 所有 skill 调用审计（敏感参数落库前脱敏）
+- `platform_pending_action` — 写操作待确认队列（记 session_id 做会话绑定）
 - `platform_prompt_segment` — 5 段 system prompt（admin 后台可编辑、热加载）
 - `platform_runbook` — 图执行剧本定义
 - `platform_runbook_execution` — 每次 runbook 执行的完整轨迹（节点状态 + 信号 + 报告）
+- `platform_async_task` — 异步长命令任务（host_run_command_async）
+
+### 并发安全：bootstrap 双重检查锁
+首启空库时，多 chainlit worker / 多容器并发跑 `ensure_bootstrap` 会各自 check-then-act 都看到空 →
+各建一遍 env 种子接入 → 重复。修复用**双重检查锁**：快路径无锁查 `list()`；空了拿
+`store.bootstrap_lock()`（MySQL `GET_LOCK` 跨进程命名锁）→ 锁内**再查一次** → 没有才建。
+见 [`connection_manager.py`](../ops_platform/connection_manager.py) / [`model_manager.py`](../ops_platform/model_manager.py)。
+
+### 模型配置变更总线
+`ModelManager` 是模型配置 mutation 的唯一入口：create/update/delete 自动失效 `OpsModelClient`
+缓存 + 触发 `on_change` 回调（alert pipeline 的 legacy client 一并刷新）。admin 改完默认模型
+**无需重启**即下一次会话生效。
+
+### 优雅停机
+`runtime.shutdown()` 停 async-task poller + 关 host_agent 连接池 + dispose DB engine；
+`app.py` 注册 atexit + SIGTERM/SIGINT。k8s rolling update / docker stop 时正在跑的任务有限期收尾。
 
 ### 凭证加密（[`ops_platform/crypto.py`](../ops_platform/crypto.py)）
 
@@ -416,7 +502,7 @@ ai_work/
 | **`platform.md` (本文)** | 平台总览 |
 | [`runbook.md`](runbook.md) | 诊断剧本图执行引擎详解（DSL / 条件 / 信号 / 调试） |
 | [`http-skill.md`](http-skill.md) | YAML 声明式接入外部系统（Tier 1 + Tier 2/3 路线图） |
-| [`host-agent.md`](host-agent.md) | host_agent 部署 + 8 个 host_* skill 详解 |
+| [`host-agent.md`](host-agent.md) | host_agent 部署 + host_* skill 详解 |
 
 ---
 
@@ -424,22 +510,23 @@ ai_work/
 
 | 状态 | 项 |
 |---|---|
-| ✅ | 平台 kernel · skill 插件机制 · 5 driver · 31 skill · 4 graph runbook |
+| ✅ | 平台 kernel · skill 插件机制 · 8 driver · 27 skill · 5 graph runbook |
 | ✅ | 三入口（Chainlit / Admin / MCP） |
-| ✅ | 写操作二次确认链 + 三重锁（visibility + needs_confirmation + admin approval） |
-| ✅ | 火山方舟（Code Plan）+ 国产模型兼容 |
+| ✅ | 写操作二次确认链 + 入口 RBAC + 会话绑定（admin 可跨会话审批）|
+| ✅ | 火山方舟（Code Plan）+ 国产模型兼容 + 模型级 tool_choice 偏好 |
 | ✅ | host_agent 替代 SSH（K8s + Swarm，containerd/docker 双适配） |
-| ✅ | Connection 凭证 Fernet 加密 + 自动迁移 |
+| ✅ | Connection 凭证 Fernet 加密 + 自动迁移 + `STRICT_ENCRYPTION` 生产强制 |
 | ✅ | **结构化 Signals + agent 自动 hint 注入**（跨域 pivot 从软变硬） |
-| ✅ | **Tool-loop digest**（自动压缩节省 token） |
+| ✅ | **渐进披露工具加载**（core 常驻 + load_skills 按域懒加载 + signal 自动加载）|
+| ✅ | **Tool-loop digest**（自动压缩节省 token） · **token usage 监控** |
 | ✅ | **DB-backed prompt 段落库 + admin UI 编辑**（5 段 + CodeMirror） |
 | ✅ | **诊断剧本图执行引擎**（DAG + DSL + 信号驱动 + admin 编辑 + 执行回放） |
 | ✅ | **HTTP Skill (Tier 1)** — YAML 声明式接入外部系统，热加载，详见 [docs/http-skill.md](http-skill.md) |
+| ✅ | **Jenkins CI/CD 接入** — jenkins driver + jenkins_query skill |
+| ✅ | **审计脱敏**（凭证不落明文）· **bootstrap 并发安全**（双重检查锁）· **优雅停机** |
 | 🚧 | HTTP Skill **Tier 2**：OpenAPI/Swagger 批量导入生成 YAML 草稿 |
 | 🚧 | HTTP Skill **Tier 3**：Remote MCP Connection（直接 wrap 外部 MCP server）|
 | 🚧 | 自定义 HTTP node-agent（替代每节点暴露 dockerd TCP）|
-| 🚧 | MCP per-API-key role 区分 |
-| 🚧 | 写操作 webhook hook → SIEM/syslog |
 | 🚧 | 告警自动诊断（alert → 自动选 runbook → 推送给值班） |
 | 📅 | 会话级模型切换 |
 | 📅 | Plugin marketplace（外部 git 安装 skill） |

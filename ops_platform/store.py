@@ -80,6 +80,8 @@ def attach_platform_store(store: Any) -> Any:
         "list_http_skills", "get_http_skill", "upsert_http_skill", "delete_http_skill",
         "create_async_task", "get_async_task", "update_async_task",
         "list_async_tasks", "list_running_async_tasks",
+        # 并发安全:ensure_bootstrap 双重检查锁用
+        "bootstrap_lock",
     ]
     for name in method_names:
         setattr(store, name, getattr(platform, name))

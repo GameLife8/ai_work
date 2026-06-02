@@ -9,6 +9,7 @@ import logging
 import secrets
 import threading
 import uuid
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
 
@@ -34,6 +35,46 @@ class SQLPlatformStore:
     def __init__(self, engine) -> None:
         self.engine = engine
         self._lock = threading.RLock()
+
+    @contextmanager
+    def bootstrap_lock(self, name: str = "ai_ops_bootstrap", timeout: int = 30):
+        """跨进程互斥锁 —— 给 ensure_bootstrap 防并发重复种子用。
+
+        MySQL/TiDB:用 ``GET_LOCK`` 命名锁(连接级,跨进程跨连接生效)。多个 chainlit
+        worker / 多容器同时首启空库时,只有一个能拿到锁建种子,其余等它建完再
+        进来(``ensure_bootstrap`` 内部会双重检查 ``list()`` 发现已有种子直接跳过)。
+
+        SQLite / 其他方言:GET_LOCK 不存在,退化为进程内 ``self._lock``(SQLite 基本
+        是单进程部署,够用;真多进程 SQLite 不是生产场景)。
+
+        yield True 表示拿到了独占锁;False 表示没拿到(超时/不支持),调用方仍应
+        靠双重检查保证幂等,但并发窗口未消除——日志会 warning。
+        """
+        dialect = self.engine.dialect.name
+        if dialect in ("mysql", "mariadb"):
+            conn = self.engine.connect()
+            got = 0
+            try:
+                got = conn.execute(
+                    text("SELECT GET_LOCK(:n, :t)"), {"n": name, "t": timeout}
+                ).scalar()
+                if got != 1:
+                    logger.warning(
+                        "bootstrap_lock: GET_LOCK(%s) 返回 %r(未拿到独占锁),"
+                        "靠双重检查兜底", name, got,
+                    )
+                yield got == 1
+            finally:
+                if got == 1:
+                    try:
+                        conn.execute(text("SELECT RELEASE_LOCK(:n)"), {"n": name})
+                    except Exception:    # pragma: no cover
+                        pass
+                conn.close()
+        else:
+            # SQLite / 其他:进程内锁兜底
+            with self._lock:
+                yield True
 
     def initialize(self) -> None:
         is_sqlite = self.engine.dialect.name == "sqlite"

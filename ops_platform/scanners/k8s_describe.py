@@ -35,12 +35,19 @@ def scan(text: str, *, name: str, namespace: str | None) -> list[dict]:
             a["namespace"] = namespace
         return a
 
+    def logs_args(*, previous: bool = False) -> dict:
+        # k8s_get_pod_logs 已合并进 kube_query(verb=logs);signal 直接指向 kube_query
+        a = {"verb": "logs", **base_args()}
+        if previous:
+            a["previous"] = True
+        return a
+
     if "oomkilled" in low:
         sigs.append(signal(
             SIG_OOM_KILL, severity=SEV_CRITICAL,
             evidence=f"Pod {name} Events 显示 OOMKilled" + (f"（Node={node}）" if node else ""),
-            next_skill="zabbix_get_host_overview" if node else "k8s_get_pod_logs",
-            next_args=({"host_query": node} if node else {**base_args(), "previous": True}),
+            next_skill="zabbix_get_host_overview" if node else "kube_query",
+            next_args=({"host_query": node} if node else logs_args(previous=True)),
             context={"node": node},
         ))
     if "evicted" in low and ("diskpressure" in low or "disk-pressure" in low):
@@ -77,14 +84,14 @@ def scan(text: str, *, name: str, namespace: str | None) -> list[dict]:
         sigs.append(signal(
             SIG_CRASH_LOOP, severity=SEV_CRITICAL,
             evidence=f"Pod {name} 进入 CrashLoopBackOff",
-            next_skill="k8s_get_pod_logs",
-            next_args={**base_args(), "previous": True},
+            next_skill="kube_query",
+            next_args=logs_args(previous=True),
         ))
     if "liveness probe failed" in low or "readiness probe failed" in low or "startup probe failed" in low:
         sigs.append(signal(
             SIG_PROBE_FAIL, severity=SEV_WARNING,
             evidence=f"Pod {name} 探针失败",
-            next_skill="k8s_get_pod_logs",
-            next_args=base_args(),
+            next_skill="kube_query",
+            next_args=logs_args(),
         ))
     return sigs

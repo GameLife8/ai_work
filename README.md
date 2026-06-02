@@ -86,7 +86,7 @@ URL:  http://your-host:8765/mcp
 Auth: Authorization: Bearer <MCP_API_KEYS 之一>
 ```
 
-Claude Code / Cursor 等 MCP 客户端配置后，可以直接调用平台的 22 个 skill 完成排障。详见
+Claude Code / Cursor 等 MCP 客户端配置后，可以直接调用平台的 27 个 skill 完成排障。详见
 [`docs/platform.md`](docs/platform.md) MCP 章节。
 
 ## 部署 host_agent（替代 SSH）
@@ -138,7 +138,7 @@ ai_work/
 │   ├── mcp_server.py            # MCP tool 暴露
 │   └── drivers/                 # 接入驱动
 │       ├── zabbix.py · swarm.py · k8s.py · host_agent.py · alert_analysis.py
-├── skills/                      # 22 个 skill 插件（每目录一个）
+├── skills/                      # 27 个 skill 插件（每目录一个）
 ├── services/                    # 底层 client（zabbix / swarm / k8s / host_agent）
 ├── admin_app/                   # Flask 后台蓝图（/admin/api/v1/*）
 ├── admin_ui/                    # Vue 3 + Vite 后台（→ Dockerfile.admin-ui 出 nginx 镜像）
@@ -178,7 +178,7 @@ ai_work/
 ## 当前状态
 
 ✅ 已完成：
-- 平台 kernel（skill 插件机制 / 5 driver / 31 skill / 4 graph runbook）
+- 平台 kernel（skill 插件机制 / 8 driver / 27 skill / 5 graph runbook）
 - 三入口（Chainlit + Admin + MCP）共用 invoker
 - 写操作二次确认链 + 三重锁（visibility + needs_confirmation + admin approval）
 - 国产模型兼容（火山方舟 Code Plan 为默认 + 通义/智谱/DeepSeek）

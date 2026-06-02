@@ -128,20 +128,41 @@ def _pending_record(session_id: str = "sess-A", status: str = "pending"):
     }
 
 
-def test_confirm_rejects_cross_session_token(invoker_setup):
-    """会话 A 生成的 token，从会话 B 调 confirm 必须被拒。"""
+def test_confirm_rejects_cross_session_token_for_non_admin(invoker_setup):
+    """会话 A 生成的 token，**非 admin** 用户从会话 B 调 confirm 必须被拒。"""
     inv, store, SkillContext = invoker_setup
     store.get_pending_action.return_value = _pending_record(session_id="sess-A")
 
     ctx = SkillContext(
         runtime=MagicMock(),
-        user={"username": "admin", "role": "admin"},
+        user={"username": "bob", "role": "user"},   # 非 admin
         session_id="sess-B",
     )
     result = inv.confirm("tok-xyz", ctx)
     assert result["status"] == "error"
     assert result["error_code"] == "session_mismatch"
     inv.registry.execute.assert_not_called()
+
+
+def test_confirm_admin_can_cross_session(invoker_setup):
+    """**admin 可跨会话确认**——后台 PendingActions 页审批是合法操作（后台 session
+    ≠ 原聊天 session），不能被 session_mismatch 挡（这曾是引入的回归）。"""
+    inv, store, SkillContext = invoker_setup
+    store.get_pending_action.return_value = _pending_record(session_id="sess-A")
+    inv.registry.get.return_value = MagicMock(
+        code="swarm_scale_service", confirmation_ttl_seconds=300,
+        requires_admin_approval=False,
+    )
+    inv._execute = MagicMock(return_value={"status": "ok", "result": {"done": True}})
+
+    ctx = SkillContext(
+        runtime=MagicMock(),
+        user={"username": "admin", "role": "admin"},
+        session_id="backend-session",   # 跟 sess-A 不同
+    )
+    result = inv.confirm("tok-xyz", ctx)
+    assert result["status"] == "ok", "admin 跨会话确认应放行"
+    inv._execute.assert_called_once()
 
 
 def test_confirm_accepts_same_session_token(invoker_setup):
@@ -165,8 +186,8 @@ def test_confirm_accepts_same_session_token(invoker_setup):
     inv._execute.assert_called_once()
 
 
-def test_reject_also_checks_session(invoker_setup):
-    """reject 同样校验 session（防 DoS 拒绝别人的 pending action）。"""
+def test_reject_also_checks_session_for_non_admin(invoker_setup):
+    """reject 同样对**非 admin**校验 session（防 DoS 拒绝别人的 pending action）。"""
     inv, store, SkillContext = invoker_setup
     store.get_pending_action.return_value = _pending_record(session_id="sess-A")
     ctx = SkillContext(
@@ -177,6 +198,20 @@ def test_reject_also_checks_session(invoker_setup):
     result = inv.reject("tok-xyz", ctx, reason="malicious reject")
     assert result["error_code"] == "session_mismatch"
     store.update_pending_action_status.assert_not_called()
+
+
+def test_reject_admin_can_cross_session(invoker_setup):
+    """admin 后台拒绝任意会话的 pending action 是合法的。"""
+    inv, store, SkillContext = invoker_setup
+    store.get_pending_action.return_value = _pending_record(session_id="sess-A")
+    store.update_pending_action_status.return_value = {"status": "rejected"}
+    ctx = SkillContext(
+        runtime=MagicMock(),
+        user={"username": "admin", "role": "admin"},
+        session_id="backend-session",
+    )
+    result = inv.reject("tok-xyz", ctx, reason="admin 驳回")
+    assert result["status"] == "rejected"
 
 
 def test_reject_accepts_same_session(invoker_setup):
@@ -211,6 +246,50 @@ def test_confirm_record_without_session_passes_through(invoker_setup):
 # ============================================================
 # #3 审计日志脱敏
 # ============================================================
+
+
+def test_execute_does_not_redact_extra_audit_confirmation_token():
+    """``_extra``（平台生成的审计元数据,如 confirmation_token）**不能**被脱敏——
+    审计页靠 ``args._extra.confirmation_token`` 反查写操作发起人。
+    （回归:之前误把 confirmation_token 当 'token' 脱成 ***。）"""
+    store = MagicMock()
+    registry = MagicMock()
+    spec = MagicMock(code="swarm_scale_service", read_only=False)
+    registry.execute.return_value = {"status": "ok", "result": {}}
+
+    inv = SkillInvoker(registry, store)
+    from ops_platform.context import SkillContext
+    ctx = SkillContext(runtime=MagicMock(), user={"username": "admin", "role": "admin"},
+                       session_id="s")
+
+    inv._execute(spec, {"service": "web", "replicas": 3}, ctx,
+                 extra_audit={"confirmation_token": "tok_abc123"})
+
+    # 抓 save_skill_call 实际落库的 args
+    saved_args = store.save_skill_call.call_args.kwargs["args"]
+    assert saved_args["_extra"]["confirmation_token"] == "tok_abc123", (
+        "confirmation_token 被脱敏了——审计'反查发起人'功能失效"
+    )
+
+
+def test_execute_still_redacts_user_param_secrets():
+    """但用户**参数**里的真敏感字段仍要脱敏（password / command 里的 -p 等）。"""
+    store = MagicMock()
+    registry = MagicMock()
+    spec = MagicMock(code="host_run_command", read_only=False)
+    registry.execute.return_value = {"status": "ok", "result": {}}
+
+    inv = SkillInvoker(registry, store)
+    from ops_platform.context import SkillContext
+    ctx = SkillContext(runtime=MagicMock(), user={"username": "admin", "role": "admin"},
+                       session_id="s")
+
+    inv._execute(spec, {"node": "n1", "command": "mysql -psecret123"}, ctx,
+                 extra_audit={"confirmation_token": "tok_xyz"})
+
+    saved_args = store.save_skill_call.call_args.kwargs["args"]
+    assert "secret123" not in saved_args["command"], "命令里的密码应脱敏"
+    assert saved_args["_extra"]["confirmation_token"] == "tok_xyz", "审计 token 应保留"
 
 
 def test_is_sensitive_key_lookup():

@@ -113,10 +113,24 @@ class ConnectionManager:
     # ---------- bootstrap ----------
 
     def ensure_bootstrap(self, config_cls: Any) -> None:
-        """首启时把旧的 .env 配置写成默认 connection，保持向后兼容。"""
-        if self.list():
+        """首启时把旧的 .env 配置写成默认 connection，保持向后兼容。
+
+        **并发安全(双重检查锁)**:多个 chainlit worker / 多容器同时首启空库时,
+        check-then-act 会各自看到空库,各建一遍种子 → 重复。这里:
+          1. 快路径:已有 connection 直接返回(无锁开销)
+          2. 慢路径:拿 ``store.bootstrap_lock``(MySQL GET_LOCK 跨进程) → **锁内
+             再查一次** list()(可能别的 worker 刚建完)→ 没有才建。
+        """
+        if self.list():    # 快路径
             return
 
+        with self.store.bootstrap_lock():
+            if self.list():    # 双重检查:锁外到锁内之间可能已被别的 worker 种好
+                return
+            self._do_bootstrap(config_cls)
+
+    def _do_bootstrap(self, config_cls: Any) -> None:
+        """实际建种子。调用方必须已持有 bootstrap_lock + 双重检查过 list()。"""
         if config_cls.ZABBIX_BASE_URL:
             self.create(
                 type_code="zabbix",

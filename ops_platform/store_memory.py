@@ -9,6 +9,7 @@ import json
 import logging
 import threading
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import UTC, datetime
 from typing import Any
@@ -35,6 +36,15 @@ class InMemoryPlatformStore:
         self.skill_calls: list[dict] = []
         self.pending_actions: dict[str, dict] = {}
         self._lock = threading.RLock()
+
+    @contextmanager
+    def bootstrap_lock(self, name: str = "ai_ops_bootstrap", timeout: int = 30):
+        """内存 store 是单进程,用进程内 RLock 即可串行化 ensure_bootstrap。
+
+        签名跟 SQLPlatformStore.bootstrap_lock 一致,让 manager 层无脑调用。
+        """
+        with self._lock:
+            yield True
 
     # users
     def list_users(self) -> list[dict]:

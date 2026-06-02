@@ -46,21 +46,10 @@ def main() -> int:
         if result.get("stdout"):
             print(f"    stdout 前 200 字: {(result.get('stdout') or '')[:200]!r}")
     print()
-    # 验证 _is_config_query_trace_item
-    from ops_agent.agent import _is_config_query_trace_item, _augment_message_for_intent
-    for i, t in enumerate(out.trace):
-        print(f"  trace[{i}] _is_config_query_trace_item: {_is_config_query_trace_item(t)}")
-    # 手动跑一次 augment 看返回什么
-    print()
-    print("=== 手动跑 augment ===")
-    augmented = _augment_message_for_intent(msg, out.trace, q)
-    print(f"原 msg 长度: {len(msg)}")
-    print(f"augment 后长度: {len(augmented)}")
-    if augmented != msg:
-        print(f"差异（augment 追加部分）：")
-        print(augmented[len(msg):][:500])
-    else:
-        print("augment 没动！")
+    # NOTE:raw-first 的代码兜底已删(改为 system prompt 铁律 #2 硬约束),
+    # 这里直接看模型最终 message 自己有没有贴 raw。
+    print("=== 模型最终 message（看它自己有没有贴 raw 表格/代码块）===")
+    print(out.message[:800])
     return 0
 
 

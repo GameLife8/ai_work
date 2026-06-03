@@ -153,3 +153,55 @@ def test_chainlit_resume_session_replays_history_messages() -> None:
     assert "list_chat_messages" in body, "_resume_session 必须读历史 message"
     # 必须 send 至少一条消息把历史显示出来
     assert "cl.Message" in body or "Message(" in body
+
+
+# ---------- SQL store:消息保存不能抹掉会话 owner(回归) ---------- #
+
+
+def test_sql_save_message_does_not_wipe_session_owner(tmp_path) -> None:
+    """回归(真实线上 bug):SQLStore.save_chat_message 内部会调
+    ``save_chat_session(sid)`` 续命,但**绝不能**把会话 metadata(尤其
+    ``metadata.user`` = owner)覆盖成 ``{}``。
+
+    旧 bug:首条消息把 metadata_json 抹成 ``{}`` → ``list_chat_sessions_by_user``
+    靠 ``metadata.$.user`` 过滤就再也查不到 → 用户**有内容**的历史会话"凭空消失",
+    历史下拉里只剩没发过消息的空会话。InMemoryStore 一直是对的,只有 SQLStore
+    会抹。这条测试钉死 SQL 行为跟 InMemory 对齐。
+    """
+    from models.db import SQLStore
+
+    store = SQLStore(f"sqlite:///{tmp_path / 'chat.db'}")
+    store.initialize()
+
+    store.save_chat_session("s1", metadata={"user": "alice", "channel": "chainlit"})
+    # 首条用户消息——内部 save_chat_session("s1") 的 metadata=None
+    store.save_chat_message("s1", "user", "看下 nginx pod")
+    store.save_chat_message("s1", "assistant", "好的")
+
+    # owner 必须还在——这正是 list_chat_sessions_by_user(靠 metadata.$.user 过滤)
+    # 能不能查到这条会话的关键。(注:list 查询用 MySQL 的 JSON_UNQUOTE,sqlite 跑不了,
+    # 所以这里直接断言底层 metadata 没被抹,等价于"MySQL 下查得到"。)
+    s = store.get_chat_session("s1")
+    md = s.get("metadata_json") or {}
+    assert md.get("user") == "alice", f"会话 owner 被消息保存抹掉了:{md!r}"
+    assert md.get("channel") == "chainlit", "其它 metadata 字段也不该丢"
+
+
+def test_sql_ensure_exists_call_preserves_metadata(tmp_path) -> None:
+    """``save_chat_session(sid)`` 不带 metadata = 仅确保存在 / 续命,
+    既有 metadata 必须原样保留(不被空 dict 覆盖)。"""
+    from models.db import SQLStore
+
+    store = SQLStore(f"sqlite:///{tmp_path / 'chat2.db'}")
+    store.initialize()
+
+    store.save_chat_session("s1", metadata={"user": "bob", "k": "v"})
+    store.save_chat_session("s1")          # 续命:metadata=None,不能动 metadata
+    md = (store.get_chat_session("s1") or {}).get("metadata_json") or {}
+    assert md.get("user") == "bob"
+    assert md.get("k") == "v"
+
+    # 显式传新 metadata 时才更新
+    store.save_chat_session("s1", metadata={"user": "bob", "k": "v2"})
+    md2 = (store.get_chat_session("s1") or {}).get("metadata_json") or {}
+    assert md2.get("k") == "v2"

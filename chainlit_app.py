@@ -397,28 +397,22 @@ def _format_session_label(s: dict, runtime) -> str:
 
 
 async def _start_new_session(user: dict) -> str:
-    """生成新 uuid + 写 chat_session,返回 session_id。"""
+    """生成新 uuid + 设为当前会话,返回 session_id。
+
+    ⚠️ **不在这里写 chat_session 行**。否则每次打开/刷新页面(on_chat_start 默认
+    都会开新会话)都会凭空落一条空会话,把历史下拉塞满"(空会话)"。改成**懒持久化**:
+    真正第一条消息进来时(on_message)才落 session 行,并带上 owner metadata。
+    """
     sid = str(uuid.uuid4())
     cl.user_session.set("session_id", sid)
-    try:
-        _runtime.store.save_chat_session(
-            sid,
-            metadata={
-                "channel": "chainlit",
-                "entrypoint": "chainlit_app.py",
-                "user": (user or {}).get("username"),
-                "role": (user or {}).get("role"),
-                "started_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
-            },
-        )
-    except Exception as exc:    # noqa: BLE001
-        print(f"[chainlit] save_chat_session failed: {exc}")
+    cl.user_session.set("session_persisted", False)
     return sid
 
 
 async def _resume_session(sid: str, user: dict) -> None:
     """绑定到已有 session_id + 在 UI 上重放最近 N 条消息让用户看到上下文。"""
     cl.user_session.set("session_id", sid)
+    cl.user_session.set("session_persisted", True)   # 已在 DB 里,无需懒持久化
     try:
         msgs = _runtime.store.list_chat_messages(sid, limit=40, exclude_summary=True)
     except Exception as exc:
@@ -631,6 +625,21 @@ async def on_message(message: cl.Message) -> None:
     text = (message.content or "").strip()
 
     if runtime and session_id and text:
+        # 懒持久化:第一条真实消息时才落 session 行,并带上 owner metadata。
+        # 这样既不产生空会话(历史下拉干净),又保证 metadata.user 一定写进去
+        # (list_chat_sessions_by_user 靠它过滤;丢了的话用户历史就查不到)。
+        if not cl.user_session.get("session_persisted"):
+            try:
+                runtime.store.save_chat_session(session_id, metadata={
+                    "channel": "chainlit",
+                    "entrypoint": "chainlit_app.py",
+                    "user": (user or {}).get("username"),
+                    "role": (user or {}).get("role"),
+                    "started_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+                })
+            except Exception as exc:    # noqa: BLE001
+                print(f"[chainlit] lazy save_chat_session failed: {exc}")
+            cl.user_session.set("session_persisted", True)
         runtime.store.save_chat_message(session_id, "user", text,
                                         metadata={"user": (user or {}).get("username")})
 

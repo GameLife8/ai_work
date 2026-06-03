@@ -1097,18 +1097,36 @@ class SQLStore:
                 {"session_id": session_id},
             ).first()
             if exists:
-                conn.execute(
-                    text(
-                        """
-                        UPDATE chat_session
-                        SET metadata_json = :metadata_json,
-                            updated_at = :updated_at,
-                            last_message_at = :last_message_at
-                        WHERE session_id = :session_id
-                        """
-                    ),
-                    payload,
-                )
+                # ⚠️ metadata=None 表示"仅确保存在 / 续命"——save_chat_message 每条消息都会
+                # 这样调一次。这种情况**绝不能**用空 metadata 覆盖既有 metadata_json，否则
+                # 首条消息就会把会话 owner(metadata.user)抹成 {}，该会话从此在
+                # list_chat_sessions_by_user 里查不到，用户历史"凭空消失"。
+                # 只有显式传了 metadata 才更新它(跟 InMemoryStore 行为对齐)。
+                if metadata is not None:
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE chat_session
+                            SET metadata_json = :metadata_json,
+                                updated_at = :updated_at,
+                                last_message_at = :last_message_at
+                            WHERE session_id = :session_id
+                            """
+                        ),
+                        payload,
+                    )
+                else:
+                    conn.execute(
+                        text(
+                            """
+                            UPDATE chat_session
+                            SET updated_at = :updated_at,
+                                last_message_at = :last_message_at
+                            WHERE session_id = :session_id
+                            """
+                        ),
+                        payload,
+                    )
             else:
                 conn.execute(
                     text(

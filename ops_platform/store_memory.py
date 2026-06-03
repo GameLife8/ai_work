@@ -385,48 +385,6 @@ class InMemoryPlatformStore:
         rec = self.runbook_executions.get(execution_id)
         return deepcopy(rec) if rec else None
 
-    # ---- http skills ----
-    def __init_http_skills_attr__(self) -> None:
-        if not hasattr(self, "http_skills"):
-            self.http_skills: dict[str, dict] = {}
-
-    def list_http_skills(self) -> list[dict]:
-        self.__init_http_skills_attr__()
-        return [deepcopy(v) for v in self.http_skills.values()]
-
-    def get_http_skill(self, code: str) -> dict | None:
-        self.__init_http_skills_attr__()
-        rec = self.http_skills.get(code)
-        return deepcopy(rec) if rec else None
-
-    def upsert_http_skill(self, *, code: str, title: str, description: str,
-                          category: str, connection_id: str | None,
-                          definition: dict, enabled: bool = True,
-                          updated_by: str | None = None) -> dict:
-        self.__init_http_skills_attr__()
-        with self._lock:
-            existing = self.http_skills.get(code) or {}
-            rec = {
-                "key": code,
-                "code": code,
-                "title": title,
-                "description": description or "",
-                "category": category or "integration",
-                "connection_id": connection_id,
-                "definition": deepcopy(definition or {}),
-                "enabled": bool(enabled),
-                "version": int(existing.get("version", 0)) + 1,
-                "updated_by": updated_by,
-                "updated_at": _now(),
-            }
-            self.http_skills[code] = rec
-            return deepcopy(rec)
-
-    def delete_http_skill(self, code: str) -> None:
-        self.__init_http_skills_attr__()
-        with self._lock:
-            self.http_skills.pop(code, None)
-
     # ---- async tasks ----------------------------------------------------- #
 
     def __init_async_tasks_attr__(self) -> None:

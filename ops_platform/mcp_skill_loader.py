@@ -3,7 +3,7 @@
 
 加载时机
 ========
-1. 启动末尾 ``runtime.py`` 调一次 ``reload()`` —— 跟 ``http_skill_loader`` 同位。
+1. 启动末尾 ``runtime.py`` 调一次 ``reload()``。
 2. admin 在后台改完 mcp_client connection 时手动触发（暂未在 UI 上挂；先后端 API）。
 
 设计要点
@@ -15,7 +15,7 @@
 - **Handler 包装**：每个 MCP 工具变成的 SkillSpec.handler 是一个闭包，捕获
   ``connection_id`` + ``original_tool_name``——执行时通过 ``ctx.connection_for``
   拿 ExternalMCPClient 调 ``call_tool``。
-- **重名兜底**：跟原生 skill / http_skill 撞名时记 warning 并加 ``mcp__`` 强制前缀重试。
+- **重名兜底**：跟原生 skill 撞名时记 warning 并加 ``mcp__`` 强制前缀重试。
 """
 
 from __future__ import annotations

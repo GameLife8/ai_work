@@ -97,6 +97,12 @@ class SQLPlatformStore:
         """对老数据库做幂等 column 增量。比 IF NOT EXISTS 通用——先 SELECT 探测，
         没列再 ADD COLUMN（MySQL 5.7/TiDB 不支持 ALTER TABLE IF NOT EXISTS）。"""
         with self.engine.begin() as conn:
+            # HTTP Skill 功能已移除 —— 幂等清掉残留表（DROP IF EXISTS 安全，无表也不报错）
+            try:
+                conn.execute(text("DROP TABLE IF EXISTS platform_http_skill"))
+            except Exception as exc:    # pragma: no cover
+                logger.warning("DROP platform_http_skill 失败（忽略）：%s", exc)
+
             try:
                 conn.execute(text("SELECT tags_json FROM platform_connection LIMIT 1"))
             except Exception:
@@ -295,20 +301,6 @@ class SQLPlatformStore:
                 created_at VARCHAR(64)
             )
             """,
-            """
-            CREATE TABLE IF NOT EXISTS platform_http_skill (
-                skill_code VARCHAR(128) PRIMARY KEY,
-                title VARCHAR(255),
-                description TEXT,
-                category VARCHAR(64),
-                connection_id VARCHAR(64),
-                definition_json TEXT,
-                enabled INTEGER NOT NULL DEFAULT 1,
-                version INTEGER NOT NULL DEFAULT 1,
-                updated_by VARCHAR(128),
-                updated_at VARCHAR(64)
-            )
-            """,
             # platform_async_task —— 持久化所有异步任务（agent 内存只是短期镜像）
             #
             # 关键设计：
@@ -472,20 +464,6 @@ class SQLPlatformStore:
                 started_at VARCHAR(64),
                 ended_at VARCHAR(64),
                 created_at VARCHAR(64)
-            )
-            """,
-            """
-            CREATE TABLE IF NOT EXISTS platform_http_skill (
-                skill_code VARCHAR(128) PRIMARY KEY,
-                title VARCHAR(255),
-                description TEXT,
-                category VARCHAR(64),
-                connection_id VARCHAR(64),
-                definition_json LONGTEXT,
-                enabled TINYINT NOT NULL DEFAULT 1,
-                version INT NOT NULL DEFAULT 1,
-                updated_by VARCHAR(128),
-                updated_at VARCHAR(64)
             )
             """,
             """
@@ -1097,80 +1075,6 @@ class SQLPlatformStore:
                 {"id": execution_id},
             ).mappings().first()
         return self._row_to_execution(row) if row else None
-
-    # ---------- http skills ----------
-
-    @staticmethod
-    def _row_to_http_skill(row) -> dict:
-        d = dict(row)
-        if "skill_code" in d:
-            d["key"] = d["skill_code"]
-            d["code"] = d.pop("skill_code")
-        d["definition"] = json.loads(d.pop("definition_json") or "{}")
-        d["enabled"] = bool(d.get("enabled", 1))
-        d["version"] = int(d.get("version") or 1)
-        return d
-
-    def list_http_skills(self) -> list[dict]:
-        with self.engine.begin() as conn:
-            rows = conn.execute(text("SELECT * FROM platform_http_skill ORDER BY skill_code")).mappings().all()
-        return [self._row_to_http_skill(r) for r in rows]
-
-    def get_http_skill(self, code: str) -> dict | None:
-        with self.engine.begin() as conn:
-            row = conn.execute(
-                text("SELECT * FROM platform_http_skill WHERE skill_code=:c"),
-                {"c": code},
-            ).mappings().first()
-        return self._row_to_http_skill(row) if row else None
-
-    def upsert_http_skill(self, *, code: str, title: str, description: str,
-                          category: str, connection_id: str | None,
-                          definition: dict, enabled: bool = True,
-                          updated_by: str | None = None) -> dict:
-        now = _now()
-        with self.engine.begin() as conn:
-            existing = conn.execute(
-                text("SELECT version FROM platform_http_skill WHERE skill_code=:c"),
-                {"c": code},
-            ).mappings().first()
-            params = {
-                "c": code,
-                "title": title,
-                "description": description or "",
-                "category": category or "integration",
-                "connection_id": connection_id,
-                "definition_json": json.dumps(definition or {}, ensure_ascii=False),
-                "enabled": 1 if enabled else 0,
-                "updated_by": updated_by,
-                "updated_at": now,
-            }
-            if existing:
-                params["version"] = int(existing["version"] or 1) + 1
-                conn.execute(
-                    text("""UPDATE platform_http_skill
-                            SET title=:title, description=:description, category=:category,
-                                connection_id=:connection_id, definition_json=:definition_json,
-                                enabled=:enabled, version=:version,
-                                updated_by=:updated_by, updated_at=:updated_at
-                            WHERE skill_code=:c"""),
-                    params,
-                )
-            else:
-                params["version"] = 1
-                conn.execute(
-                    text("""INSERT INTO platform_http_skill
-                            (skill_code, title, description, category, connection_id,
-                             definition_json, enabled, version, updated_by, updated_at)
-                            VALUES (:c, :title, :description, :category, :connection_id,
-                                    :definition_json, :enabled, :version, :updated_by, :updated_at)"""),
-                    params,
-                )
-        return self.get_http_skill(code)
-
-    def delete_http_skill(self, code: str) -> None:
-        with self.engine.begin() as conn:
-            conn.execute(text("DELETE FROM platform_http_skill WHERE skill_code=:c"), {"c": code})
 
     def update_pending_action_status(self, token: str, *, status: str,
                                      decided_by: str | None = None,

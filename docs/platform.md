@@ -30,7 +30,7 @@
            ▼
 ┌────────────────────────────────────────────────────────────────┐
 │                          drivers                               │
-│  zabbix · swarm · k8s · host_agent · http_api · jenkins ·      │
+│  zabbix · swarm · k8s · host_agent · jenkins ·                 │
 │  mcp_client · alert_analysis                                   │
 └──────────┬─────────────────────────────────────────────────────┘
            │
@@ -74,7 +74,6 @@ docker compose up -d
 | `swarm` | Docker Swarm 集群 | DOCKER_HOST / TLS 证书路径 |
 | `k8s` | Kubernetes 集群 | kubeconfig / context / namespace |
 | `host_agent` | 节点诊断 Agent（每节点 DaemonSet） | kind=k8s/swarm + 对应字段 |
-| `http_api` | 通用 HTTP API（Jira / GitLab / CMDB…）→ 配 HTTP skill | base_url / 多种 auth_kind |
 | `jenkins` | Jenkins CI/CD（实测兼容 2.190+）| base_url / username / api_token 或 password |
 | `mcp_client` | 反向接第三方 MCP server，远端工具注册成本地 skill | server URL / auth |
 | `alert_analysis` | 内置告警研判服务（虚拟） | — |
@@ -257,7 +256,7 @@ chainlit / 后台 → 渲染 ✅/❌ 卡片
   等凭证会脱敏成 `***`（`_redact_audit_args`）。但**平台生成的 `_extra`（如 confirmation_token）
   不脱敏**——审计页靠它反查发起人。
 - **入口 RBAC**：`visibility=admin` 的 skill 在 `invoker.invoke()` 执行层拦截，不只靠 LLM
-  tool schema 过滤（HTTP API / runbook 引用 / 内部调用都挡得住）。
+  tool schema 过滤（runbook 引用 / 内部调用都挡得住）。
 
 ### Runbook（诊断剧本）· 图执行
 
@@ -420,7 +419,7 @@ docker compose up -d backend
      - 从 DB 默认 connection 派生 zabbix_client / docker_swarm_client
      - 从 DB 默认 model 派生 ai_client（alert pipeline 用的）
      - context_fetcher / alert_service / alert_analysis_service 也跟着重建
-4. http_skill_loader.reload() / runbook_registry.reload()：从 DB 加载所有 YAML
+4. mcp_skill_loader.reload() / runbook_registry.reload()：从 DB 加载远端 MCP 工具与 YAML runbook
 5. _attach_refresh_method：挂 runtime.refresh_legacy_clients()
 6. _kick_off_async_health_check：后台线程把每条 connection 拨号一次，状态写回 DB
 ```
@@ -501,7 +500,6 @@ ai_work/
 | [`README.md`](../README.md) | 项目根 README，启动指引 |
 | **`platform.md` (本文)** | 平台总览 |
 | [`runbook.md`](runbook.md) | 诊断剧本图执行引擎详解（DSL / 条件 / 信号 / 调试） |
-| [`http-skill.md`](http-skill.md) | YAML 声明式接入外部系统（Tier 1 + Tier 2/3 路线图） |
 | [`host-agent.md`](host-agent.md) | host_agent 部署 + host_* skill 详解 |
 
 ---
@@ -510,7 +508,7 @@ ai_work/
 
 | 状态 | 项 |
 |---|---|
-| ✅ | 平台 kernel · skill 插件机制 · 8 driver · 28 skill · 6 graph runbook |
+| ✅ | 平台 kernel · skill 插件机制 · 7 driver · 28 skill · 6 graph runbook |
 | ✅ | 三入口（Chainlit / Admin / MCP） |
 | ✅ | 写操作二次确认链 + 入口 RBAC + 会话绑定（admin 可跨会话审批）|
 | ✅ | 火山方舟（Code Plan）+ 国产模型兼容 + 模型级 tool_choice 偏好 |
@@ -521,11 +519,8 @@ ai_work/
 | ✅ | **Tool-loop digest**（自动压缩节省 token） · **token usage 监控** |
 | ✅ | **DB-backed prompt 段落库 + admin UI 编辑**（5 段 + CodeMirror） |
 | ✅ | **诊断剧本图执行引擎**（DAG + DSL + 信号驱动 + admin 编辑 + 执行回放） |
-| ✅ | **HTTP Skill (Tier 1)** — YAML 声明式接入外部系统，热加载，详见 [docs/http-skill.md](http-skill.md) |
 | ✅ | **Jenkins CI/CD 接入** — jenkins driver + jenkins_query skill |
 | ✅ | **审计脱敏**（凭证不落明文）· **bootstrap 并发安全**（双重检查锁）· **优雅停机** |
-| 🚧 | HTTP Skill **Tier 2**：OpenAPI/Swagger 批量导入生成 YAML 草稿 |
-| 🚧 | HTTP Skill **Tier 3**：Remote MCP Connection（直接 wrap 外部 MCP server）|
 | 🚧 | 自定义 HTTP node-agent（替代每节点暴露 dockerd TCP）|
 | 🚧 | 告警自动诊断（alert → 自动选 runbook → 推送给值班） |
 | 📅 | 会话级模型切换 |

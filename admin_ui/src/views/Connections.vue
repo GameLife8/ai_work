@@ -182,12 +182,6 @@ const TYPE_HELP = [
     when: '需要进宿主机执行命令——网络/磁盘/内核取证、长命令异步任务。',
   },
   {
-    code: 'http_api', name: 'HTTP API（外部系统）',
-    color: '#64748b',
-    desc: '通用 HTTP 接入。配 base_url + auth 后，配合"HTTP Skill"可包装任意外部 REST API 成 skill。',
-    when: '想把工单/CMDB/堡垒机这类系统的 API 接进来给 LLM 调时。',
-  },
-  {
     code: 'jenkins', name: 'Jenkins CI/CD',
     color: '#16a34a',
     desc: '对接 Jenkins REST API，看 job/build 状态、最近构建结果、控制台输出、排队任务、节点健康。',

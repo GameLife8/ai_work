@@ -663,7 +663,7 @@ class UnifiedOpsAgent:
         ]
 
         # 优先级：常用类型靠前
-        type_order = ["host_agent", "swarm", "k8s", "zabbix", "http_api", "alert_analysis"]
+        type_order = ["host_agent", "swarm", "k8s", "zabbix", "jenkins", "alert_analysis"]
         ordered_types = [t for t in type_order if t in by_type] + [
             t for t in by_type if t not in type_order
         ]
@@ -749,8 +749,8 @@ class UnifiedOpsAgent:
             return f"K8s API server = ``{server or '?'}``"
         if type_code == "zabbix":
             return f"Zabbix = ``{cfg.get('base_url','')}``"
-        if type_code == "http_api":
-            return f"HTTP API base = ``{cfg.get('base_url','')}``"
+        if type_code == "jenkins":
+            return f"Jenkins = ``{cfg.get('base_url','')}``"
         return ""
 
     def ask(

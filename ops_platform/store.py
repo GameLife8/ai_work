@@ -77,7 +77,6 @@ def attach_platform_store(store: Any) -> Any:
         "list_prompt_segments", "get_prompt_segment", "upsert_prompt_segment", "delete_prompt_segment",
         "list_runbooks", "get_runbook", "upsert_runbook", "delete_runbook",
         "save_runbook_execution", "list_runbook_executions", "get_runbook_execution",
-        "list_http_skills", "get_http_skill", "upsert_http_skill", "delete_http_skill",
         "create_async_task", "get_async_task", "update_async_task",
         "list_async_tasks", "list_running_async_tasks",
         # 并发安全:ensure_bootstrap 双重检查锁用

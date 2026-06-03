@@ -12,8 +12,6 @@ from ops_platform import (
     SkillRegistry,
 )
 from ops_platform.async_tasks import AsyncTaskService, attach_async_task_service
-from ops_platform.http_skill_loader import HttpSkillLoader
-from ops_platform.http_skill_seeds import seed_default_http_skills
 from ops_platform.loader import load_skills_from_package
 from ops_platform.mcp_skill_loader import MCPSkillLoader
 from ops_platform.runbook_engine import RunbookRegistry
@@ -51,7 +49,6 @@ class AppRuntime:
     skill_registry: SkillRegistry
     skill_invoker: SkillInvoker
     runbook_registry: RunbookRegistry
-    http_skill_loader: HttpSkillLoader
     mcp_skill_loader: MCPSkillLoader
     async_task_service: AsyncTaskService | None = None
 
@@ -84,7 +81,6 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     model_manager = ModelManager(store)
 
     runbook_registry = RunbookRegistry(None)  # 先占位
-    http_skill_loader = HttpSkillLoader.__new__(HttpSkillLoader)
     mcp_skill_loader = MCPSkillLoader.__new__(MCPSkillLoader)
 
     # 先建 runtime 骨架，下面再把 alert pipeline 的 legacy clients 灌进来
@@ -104,7 +100,6 @@ def create_runtime(config_cls=Config) -> AppRuntime:
         skill_registry=skill_registry,
         skill_invoker=SkillInvoker(skill_registry, store),
         runbook_registry=runbook_registry,
-        http_skill_loader=http_skill_loader,
         mcp_skill_loader=mcp_skill_loader,
     )
     connection_manager.attach_runtime(runtime)
@@ -118,11 +113,6 @@ def create_runtime(config_cls=Config) -> AppRuntime:
     runbook_registry.runtime = runtime
     seed_default_runbooks(store)
     runbook_registry.reload()
-
-    # 装配 http_skill_loader：先 seed 默认（如 zabbix_jsonrpc，默认 disabled），再 reload
-    HttpSkillLoader.__init__(http_skill_loader, runtime)
-    seed_default_http_skills(store)
-    http_skill_loader.reload()
 
     # 装配 mcp_skill_loader：扫所有 enabled 的 mcp_client connection 拉远端 tools 注册成 skill。
     # 失败不阻塞启动——远端 MCP 服务可能暂时挂、网络抖动等。后续 admin 改完触发手动 reload。

@@ -12,7 +12,6 @@ const routes = [
       { path: 'connections', component: () => import('./views/Connections.vue') },
       { path: 'models', component: () => import('./views/Models.vue') },
       { path: 'skills', component: () => import('./views/Skills.vue') },
-      { path: 'http-skills', component: () => import('./views/HttpSkills.vue'), meta: { adminOnly: true } },
       { path: 'runbooks', component: () => import('./views/Runbooks.vue'), meta: { adminOnly: true } },
       { path: 'runbook-runs', component: () => import('./views/RunbookRuns.vue'), meta: { adminOnly: true } },
       { path: 'prompts', component: () => import('./views/Prompts.vue'), meta: { adminOnly: true } },

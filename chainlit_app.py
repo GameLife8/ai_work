@@ -219,7 +219,7 @@ def _format_welcome_message(user: dict | None, inventory: dict[str, list[dict]])
         "k8s":           "☸️",
         "zabbix":        "📊",
         "alert_analysis":"📥",
-        "http_api":      "🌐",
+        "jenkins":       "🔧",
     }
     type_purpose = {
         "host_agent":    "host_* skill（进宿主取证）",
@@ -227,7 +227,7 @@ def _format_welcome_message(user: dict | None, inventory: dict[str, list[dict]])
         "k8s":           "k8s_* skill（pod/deployment）",
         "zabbix":        "zabbix_* skill（监控数据）",
         "alert_analysis":"告警预分析",
-        "http_api":      "外部 HTTP API",
+        "jenkins":       "jenkins_query（CI/CD）",
     }
 
     sections: list[str] = []

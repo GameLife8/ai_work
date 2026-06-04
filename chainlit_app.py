@@ -764,14 +764,25 @@ async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, sess
             )
         step.output = json.dumps(envelope, ensure_ascii=False, indent=2, default=str)
 
-    runtime.store.save_chat_message(
-        session_id, "assistant",
-        json.dumps(envelope, ensure_ascii=False),
-        metadata={"action_decision": res.get("name"), "token": token},
-    )
-
     async with cl.Step(name="📝 模型整理执行结果…", type="llm"):
         follow_up = await asyncio.to_thread(
             agent.follow_up_after_action, envelope, user=user, session_id=session_id,
         )
+
+    # 落库:assistant 正文 = 模型的执行总结(resume 时能重放——修"确认/拒绝后内容被截断"的根因:
+    # 这段 follow_up 以前只发 UI、从不入库,一 resume 就没了)。原始 envelope 挂在 ``trace``
+    # 里(admin 可回放),**不再当正文存**——否则 resume 重放历史会冒出一坨生 JSON。
+    if runtime and session_id:
+        try:
+            runtime.store.save_chat_message(
+                session_id, "assistant", follow_up,
+                trace=[{
+                    "tool_name": f"confirm:{res.get('name')}",
+                    "tool_result": envelope,
+                    "status": envelope.get("status"),
+                }],
+                metadata={"action_decision": res.get("name"), "token": token},
+            )
+        except Exception as exc:    # noqa: BLE001
+            print(f"[chainlit] save follow-up failed: {exc}")
     await cl.Message(content=follow_up).send()

@@ -67,9 +67,13 @@ services:
         condition: any
         delay: 5s
       update_config:
-        parallelism: 1
+        parallelism: 2
         delay: 5s
-        failure_action: rollback
+        # continue（不 rollback）：老 swarm 节点偶发拉新 digest 失败（"No such image"），
+        # rollback 会因为**单个**烂节点把整批升级全退回。改成 continue：好节点照常升级,
+        # 烂节点的 task 按 restart_policy 自己重试,不连累整体。
+        failure_action: continue
+        max_failure_ratio: 0.5
       resources:
         limits:    { cpus: "0.5", memory: 128M }     # 比 direct 模式更小，只跑 HTTP server
         reservations: { cpus: "0.02", memory: 24M }

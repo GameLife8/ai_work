@@ -143,9 +143,14 @@ class _HttpExec:
         cmd: list[str],
         *,
         nsenter: str = DEFAULT_NSENTER_STR,
+        container: str | None = None,
         timeout: int | None = None,
     ) -> tuple[str, str, int]:
         """发请求，返回 (stdout, stderr, returncode)。
+
+        ``container`` 非空:让 agent **内部**解析该容器的宿主机 PID(docker inspect /
+        crictl,不走业务命令白名单),并把 ``nsenter -t <pid>`` 的目标换成它——这样命令
+        进的是**目标容器**的 namespace,而不是宿主机 PID 1。
 
         网络错误也映射成 returncode = -1 + stderr 描述，不抛——保持跟 exec 路径
         一样的"无异常返回 HostExecResult"语义。
@@ -156,6 +161,8 @@ class _HttpExec:
             "nsenter": nsenter or "",
             "timeout_sec": int(timeout or self.timeout_seconds),
         }
+        if container:
+            body["container"] = str(container)
         try:
             # 用 self._session 复用 TCP 连接 + 已注入的 Bearer header
             resp = self._session.post(
@@ -324,8 +331,37 @@ class HostAgentClient:
             timeout=timeout,
         )
 
+    def exec_in_container_netns(
+        self,
+        node: str,
+        container: str,
+        inner_cmd: list[str],
+        *,
+        namespaces: tuple[str, ...] = ("n",),
+        timeout: int | None = None,
+    ) -> HostExecResult:
+        """在**目标容器**的 namespace 里跑命令(默认只换网络 namespace)。
+
+        跟 ``nsenter_on_node(target_pid=...)`` 的区别:**容器 PID 由 agent 内部解析**
+        (docker inspect / crictl,不走业务命令白名单,也绕开 docker_proxy 对 ``docker``
+        业务命令的硬拦),agent 再 ``nsenter -t <pid> <namespaces> -- cmd``。命令在 agent
+        / tools 镜像的文件系统里执行(自带 dig/nslookup/ip/ss),docker_proxy 模式自动起
+        ``--rm`` 特权 sibling 跑、跑完清掉。
+
+        只 http transport 支持——exec transport(kubectl/docker exec)不走 agent 编排。
+        """
+        if self.transport != "http":
+            raise NotImplementedError(
+                "exec_in_container_netns 需要 transport=http(靠 agent 内部解析容器 PID + 编排)"
+            )
+        ns_str = "".join(namespaces)
+        return self._http_exec_with_nsenter(
+            node, inner_cmd, ns_str, container=container, timeout=timeout,
+        )
+
     def _http_exec_with_nsenter(
-        self, node: str, cmd: list[str], nsenter: str, *, timeout: int | None = None,
+        self, node: str, cmd: list[str], nsenter: str, *,
+        container: str | None = None, timeout: int | None = None,
     ) -> HostExecResult:
         """子类提供 node→ip 映射后，在这里调用 _HttpExec。"""
         raise NotImplementedError("transport=http 的子类必须实现 _http_exec_with_nsenter")
@@ -499,10 +535,12 @@ class K8sHostAgent(HostAgentClient):
                               transport="exec")
 
     def _http_exec_with_nsenter(
-        self, node: str, cmd: list[str], nsenter: str, *, timeout: int | None = None,
+        self, node: str, cmd: list[str], nsenter: str, *,
+        container: str | None = None, timeout: int | None = None,
     ) -> HostExecResult:
         ip = self._node_internal_ip(node)
-        stdout, stderr, rc = self.http.exec(ip, cmd, nsenter=nsenter, timeout=timeout)
+        stdout, stderr, rc = self.http.exec(
+            ip, cmd, nsenter=nsenter, container=container, timeout=timeout)
         return HostExecResult(node=node, command=cmd, stdout=stdout, stderr=stderr,
                               returncode=rc, transport="http")
 
@@ -604,10 +642,12 @@ class SwarmHostAgent(HostAgentClient):
                               transport="exec")
 
     def _http_exec_with_nsenter(
-        self, node: str, cmd: list[str], nsenter: str, *, timeout: int | None = None,
+        self, node: str, cmd: list[str], nsenter: str, *,
+        container: str | None = None, timeout: int | None = None,
     ) -> HostExecResult:
         ip = self._node_internal_ip(node)
-        stdout, stderr, rc = self.http.exec(ip, cmd, nsenter=nsenter, timeout=timeout)
+        stdout, stderr, rc = self.http.exec(
+            ip, cmd, nsenter=nsenter, container=container, timeout=timeout)
         return HostExecResult(node=node, command=cmd, stdout=stdout, stderr=stderr,
                               returncode=rc, transport="http")
 

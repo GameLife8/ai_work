@@ -56,7 +56,10 @@ read_only:
   - du
   - mount
 
-  # 容器排障（K8s 节点）
+  # 容器排障（K8s 节点）。
+  # 注意:容器→宿主机 PID 的解析(docker inspect / crictl)由 **agent 内部编排**完成
+  # (用挂进来的 docker.sock / runtime socket),**不**经过这里的业务命令白名单——所以
+  # 不需要把 docker 放进白名单(放了在 docker_proxy 模式还会被硬拦)。
   - crictl
   - ctr
 

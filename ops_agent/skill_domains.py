@@ -65,7 +65,8 @@ SKILL_DOMAINS: dict[str, list[str]] = {
         "k8s_cluster_overview",               # k8s 集群级聚合巡检
     ],
     "network_diag": [
-        "host_inspect_container_netns", "host_kernel_events",
+        "host_inspect_container_netns", "host_exec_in_container_netns",
+        "host_kernel_events",
     ],
     "cicd": [
         "jenkins_query",
@@ -83,7 +84,7 @@ DOMAIN_DESCRIPTIONS: dict[str, str] = {
     "host_exec": "主机命令执行（host_run_command 短/长 + 抓包 + 异步任务轮询）——"
                  "host_query 白名单覆盖不到的命令（docker / virsh 等）走这里",
     "monitoring": "监控细节（磁盘各挂载点 / 指标时序峰值 / 集群级巡检聚合）",
-    "network_diag": "网络/内核深度排查（进容器 netns 看 iptables / dmesg 内核事件）",
+    "network_diag": "网络/内核深度排查（进容器 netns 看 iptables/路由、从容器网络视角做 DNS/连通性诊断、dmesg 内核事件）",
     "cicd": "Jenkins CI/CD 查询（job / build / console / 队列 / 节点）",
     "alerts": "告警 payload 结构化预分析",
 }

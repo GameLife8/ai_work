@@ -278,9 +278,21 @@ def _build_argv(payload: dict) -> tuple[list[str], float, int]:
     if not isinstance(ns_str, str):
         raise ValueError("nsenter 必须是字符串，如 'muinp' 或 ''")
 
+    # nsenter 目标 PID：默认 1（宿主机 init = "进宿主机"）。进**容器** namespace 时,
+    # 由 exec handler 先把 ``container`` 解析成宿主机 PID 塞进 ``payload["target_pid"]``。
+    # 容器排障一般只传 ``nsenter="n"``（只换网络 namespace）→ 命令仍在 agent/tools 镜像的
+    # mount namespace 里找,dig/nslookup/ip/ss 这些工具都在,不会 executable not found。
+    target_pid = payload.get("target_pid")
+    try:
+        target_pid = int(target_pid) if target_pid is not None else 1
+    except (TypeError, ValueError):
+        raise ValueError("target_pid 必须是正整数")
+    if target_pid <= 0:
+        raise ValueError("target_pid 必须 > 0")
+
     # 拼 nsenter 段
     if ns_str:
-        ns_args: list[str] = ["-t", "1"]
+        ns_args: list[str] = ["-t", str(target_pid)]
         for ch in ns_str:
             flag = _NS_FLAGS.get(ch)
             if not flag:
@@ -340,6 +352,107 @@ def _build_argv(payload: dict) -> tuple[list[str], float, int]:
     return argv, timeout, max_bytes
 
 
+# ---------- 容器 PID 解析（agent 内部编排，不走业务白名单） ----------
+#
+# 为什么放 agent 内部而不是让 skill 发 ``docker inspect`` 业务命令：
+#   1. ``docker`` 不在 allowed.yml 白名单 → 业务命令会 403；
+#   2. docker_proxy 模式还**额外硬拦** ``docker`` 业务命令（防穿透本地 daemon）。
+# 但 agent 进程本来就挂着 ``/var/run/docker.sock`` + 自带 docker-cli（direct 模式 k8s
+# manifest 也挂了 docker.sock / containerd.sock），所以 agent **自己**跑 docker inspect /
+# crictl 拿 PID 是合法编排，绕开上面两条限制。
+
+def _safe_int(s) -> int | None:
+    try:
+        return int(str(s or "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+async def _run_capture(argv: list[str], timeout: float = 10.0) -> tuple[int, str, str]:
+    """跑一条 agent **内部**命令（不经 /v1/exec 白名单），返回 (rc, stdout, stderr)。"""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *argv,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError as exc:
+        return 127, "", f"{argv[0]}: not found ({exc})"
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        return -1, "", f"{argv[0]}: timeout"
+    return (
+        proc.returncode if proc.returncode is not None else -1,
+        out.decode("utf-8", "replace"),
+        err.decode("utf-8", "replace"),
+    )
+
+
+async def _resolve_container_pid(container: str) -> tuple[int | None, str, str]:
+    """容器名/ID → 宿主机主进程 PID（docker → crictl → ctr）。返回 (pid, runtime, err)。"""
+    # 1. docker（Swarm / docker 节点）—— 先精确 inspect
+    rc, out, err1 = await _run_capture(
+        ["docker", "inspect", "--format", "{{.State.Pid}}", container])
+    pid = _safe_int(out)
+    if rc == 0 and pid:
+        return pid, "docker", ""
+    # docker inspect 没命中 → 按名字**前缀/子串**找该节点上的容器(Swarm task 名是
+    # ``svc.slot.taskid``,用户/模型往往只给 service 名 ``svc``)。取第一个匹配。
+    rc_ps, out_ps, _ = await _run_capture(
+        ["docker", "ps", "-q", "--filter", f"name={container}"])
+    cid = out_ps.strip().splitlines()[0] if (rc_ps == 0 and out_ps.strip()) else ""
+    if cid:
+        rc2, out2, e2 = await _run_capture(
+            ["docker", "inspect", "--format", "{{.State.Pid}}", cid])
+        pid = _safe_int(out2)
+        if rc2 == 0 and pid:
+            return pid, "docker", ""
+        err1 = (e2 or err1)
+    # 2. crictl（K8s containerd / CRI-O）
+    rc, out, _ = await _run_capture(["crictl", "ps", "-q", "--name", container])
+    cid = out.strip().splitlines()[0] if (rc == 0 and out.strip()) else container
+    rc, out, err2 = await _run_capture(
+        ["crictl", "inspect", "-o", "go-template", "--template", "{{.info.pid}}", cid])
+    pid = _safe_int(out)
+    if rc == 0 and pid:
+        return pid, "crictl", ""
+    # 3. ctr 兜底
+    rc, out, err3 = await _run_capture(
+        ["ctr", "-n", "k8s.io", "container", "info", container])
+    if rc == 0 and out.strip().startswith("{"):
+        try:
+            cpid = (json.loads(out).get("Status") or {}).get("Pid")
+            if isinstance(cpid, int) and cpid > 0:
+                return cpid, "ctr", ""
+        except json.JSONDecodeError:
+            pass
+    return None, "", (
+        f"docker:[{err1.strip()}] crictl:[{err2.strip()}] ctr:[{err3.strip()}]"
+    )
+
+
+async def _apply_container_target(payload: dict):
+    """若请求带 ``container``，解析成 PID 塞进 ``payload['target_pid']``。
+
+    返回 ``None`` 表示 OK（或没传 container）；返回 ``web.Response`` 表示解析失败，
+    调用方应直接把它返回给客户端。
+    """
+    container = payload.get("container")
+    if not container:
+        return None
+    pid, runtime, err = await _resolve_container_pid(str(container))
+    if not pid:
+        return web.json_response(
+            {"error": f"container_pid_not_found: {err}", "container": container},
+            status=404,
+        )
+    payload["target_pid"] = pid
+    payload["_container_runtime"] = runtime
+    return None
+
+
 # ---------- 路由 handlers ----------
 
 async def livez(_request: web.Request) -> web.Response:
@@ -369,6 +482,11 @@ async def exec_oneshot(request: web.Request) -> web.Response:
         payload = await request.json()
     except (json.JSONDecodeError, ValueError):
         return web.json_response({"error": "invalid_json"}, status=400)
+
+    # 容器 netns 排障:把 ``container`` 解析成宿主机 PID 塞进 payload（agent 内部编排）
+    err_resp = await _apply_container_target(payload)
+    if err_resp is not None:
+        return err_resp
 
     try:
         argv, timeout, max_bytes = _build_argv(payload)
@@ -441,6 +559,11 @@ async def exec_stream(request: web.Request) -> web.StreamResponse:
         payload = await request.json()
     except (json.JSONDecodeError, ValueError):
         return web.json_response({"error": "invalid_json"}, status=400)
+
+    # 容器 netns 排障:把 ``container`` 解析成宿主机 PID 塞进 payload（agent 内部编排）
+    err_resp = await _apply_container_target(payload)
+    if err_resp is not None:
+        return err_resp
 
     try:
         argv, timeout, _max_bytes = _build_argv(payload)

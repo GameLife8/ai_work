@@ -156,6 +156,10 @@ def test_preroute_hits_runbook_skips_tool_loop() -> None:
     assert name == "platform_run_runbook"
     assert args["user_query"] == "sws-swarm 集群巡检一下,看看宿主机内存cpu 硬盘"
     assert args["inputs"] == {}
+    # 关键回归:必须把预路由**选中的 rb.key** 透传给 platform_run_runbook,
+    # 否则它会拿 user_query 再 match 一次(字母序最前 = k8s),跑错集群类型的 runbook
+    # ——这正是 "bigdata(swarm) 却跑了 k8s audit" 的根因。
+    assert args["name"] == "cluster_health_audit_swarm"
     # 3) trace 只有 1 条,就是这次 platform_run_runbook
     assert len(out.trace) == 1
     assert out.trace[0]["tool_name"] == "platform_run_runbook"

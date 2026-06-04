@@ -36,6 +36,63 @@ from ops_platform.runbook_engine import (
 logger = logging.getLogger(__name__)
 
 
+# ---- #5:模型直接调本 skill(没传 name)时,按"意图集群类型"在同关键词候选里消歧 ----
+_CLUSTER_TYPES = frozenset({"swarm", "k8s"})
+
+
+def _runbook_cluster_types(rb, skill_registry) -> set:
+    """runbook 各节点 skill 需要的集群类型(只取 swarm/k8s)。"""
+    types: set = set()
+    for node in (getattr(rb, "nodes", {}) or {}).values():
+        sk = getattr(node, "skill", None)
+        if not sk:
+            continue
+        try:
+            spec = skill_registry.get(sk)
+        except Exception:  # noqa: BLE001
+            continue
+        rct = getattr(spec, "required_connection_type", None)
+        if rct in _CLUSTER_TYPES:
+            types.add(rct)
+    return types
+
+
+def _intended_cluster_types(ctx, runtime, connection_id) -> set:
+    """这次想跑哪种集群——从会话 selected_connections + 显式 connection_id 推断。"""
+    want: set = set()
+    sel = getattr(ctx, "selected_connections", None) or {}
+    for t in _CLUSTER_TYPES:
+        if sel.get(t):
+            want.add(t)
+    if connection_id:
+        try:
+            conn = runtime.connection_manager.get(connection_id)
+            if conn and conn.get("type_code") in _CLUSTER_TYPES:
+                want.add(conn["type_code"])
+        except Exception:  # noqa: BLE001
+            pass
+    return want
+
+
+def _match_cluster_aware(registry, runtime, ctx, user_query, connection_id):
+    """name 没给时,在同关键词命中的多候选里按"意图集群类型"挑兼容那个。
+
+    单/无候选 → 跟 match_by_query 一致;多候选且能推断集群类型 → 挑兼容;
+    推不出 → 退回排名最高(不更糟)。这样"巡检 bigdata-swarm"不会再误跑 k8s audit。
+    """
+    candidates = registry.match_all_by_query(user_query or "")
+    if len(candidates) <= 1:
+        return candidates[0] if candidates else None
+    want = _intended_cluster_types(ctx, runtime, connection_id)
+    skill_registry = getattr(runtime, "skill_registry", None)
+    if want and skill_registry is not None:
+        for rb in candidates:
+            ct = _runbook_cluster_types(rb, skill_registry) & _CLUSTER_TYPES
+            if not ct or (ct & want):
+                return rb
+    return candidates[0]
+
+
 MANIFEST = {
     "code": "platform_run_runbook",
     "name": "执行诊断剧本",
@@ -79,7 +136,11 @@ def run(ctx, *, user_query: str, name: str | None = None, inputs: dict | None = 
     if registry is None:
         return {"error": "runbook_registry 未初始化（runtime 未装配）"}
 
-    rb = registry.find(name=name, user_query=user_query or "")
+    if name:
+        rb = registry.find(name=name, user_query=user_query or "")
+    else:
+        # #5:没传 name → 按意图集群类型消歧(替代 registry.find 里的盲 match_by_query)
+        rb = _match_cluster_aware(registry, runtime, ctx, user_query, connection_id)
     if rb is None:
         return {
             "error": "no_matching_runbook",

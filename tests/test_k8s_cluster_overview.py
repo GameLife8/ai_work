@@ -60,15 +60,17 @@ def test_parse_pods_flags_crashloop():
 
 
 def test_parse_pods_caps_abnormal_list():
-    """几百个异常 pod → 明细截断到上限,但 count 准确。"""
+    """几百个异常 pod → 明细截断到上限(_MAX_ABNORMAL_PODS),但 count 准确。"""
+    from skills.k8s_cluster_overview import _MAX_ABNORMAL_PODS
+    n = _MAX_ABNORMAL_PODS + 50
     items = [
         {"metadata": {"namespace": "ns", "name": f"evicted-{i}"},
          "spec": {}, "status": {"phase": "Failed", "containerStatuses": []}}
-        for i in range(100)
+        for i in range(n)
     ]
     out = _parse_pods(items, restart_threshold=5)
-    assert out["abnormal_count"] == 100      # 总数准确
-    assert len(out["abnormal"]) == 40        # 明细截断
+    assert out["abnormal_count"] == n                       # 总数准确
+    assert len(out["abnormal"]) == _MAX_ABNORMAL_PODS       # 明细截断到上限
     assert out["truncated"] is True
 
 

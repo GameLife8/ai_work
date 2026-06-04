@@ -100,11 +100,23 @@ def test_codewave_only_swarm_candidate_returns_none():
     assert chosen is None
 
 
-def test_generic_query_no_cluster_named_uses_top():
-    """没点名集群 → 用排名最高的候选(行为不变)。"""
+def test_generic_query_ambiguous_cluster_types_returns_none():
+    """没点名集群 + 候选跨 swarm/k8s(歧义)→ 返回 None。
+
+    #2 fail-safe:不再盲选字母序最前的候选去跑默认集群(那是"静默巡检错集群"的根源),
+    改成交模型按全量接入清单自己选。
+    """
+    agent = _agent_with_conns(_CONNS, _SKILL_REQ_BOTH)
+    chosen = agent._pick_cluster_compatible_runbook(
+        [_swarm_audit_rb(), _k8s_audit_rb()], "做个集群巡检")
+    assert chosen is None
+
+
+def test_generic_query_single_cluster_type_uses_top():
+    """没点名集群 + 候选都是同一集群类型(无歧义)→ 用排名最高的。"""
     agent = _agent_with_conns(_CONNS, _SKILL_REQ_BOTH)
     top = _swarm_audit_rb()
-    chosen = agent._pick_cluster_compatible_runbook([top, _k8s_audit_rb()], "做个集群巡检")
+    chosen = agent._pick_cluster_compatible_runbook([top], "做个集群巡检")
     assert chosen is top
 
 
@@ -113,3 +125,55 @@ def test_runbook_without_cluster_type_always_eligible():
     agent = _agent_with_conns(_CONNS, {})   # skill 无 required type
     chosen = agent._pick_cluster_compatible_runbook([_swarm_audit_rb()], "codewave 集群巡检")
     assert chosen is not None   # 无类型约束 → 兼容任何集群
+
+
+# ---- #5:platform_run_runbook 没传 name 时按意图集群类型消歧 ----
+
+
+def _cluster_aware_runtime():
+    runtime = MagicMock()
+
+    def fake_get(code):
+        spec = MagicMock()
+        spec.required_connection_type = _SKILL_REQ_BOTH.get(code)
+        return spec
+
+    runtime.skill_registry.get.side_effect = fake_get
+    return runtime
+
+
+def test_run_runbook_cluster_aware_by_selected_connection():
+    """会话选了 swarm,候选 [k8s, swarm](k8s 字母序在前)→ 挑 swarm,不再误跑 k8s。"""
+    from skills.platform_run_runbook import _match_cluster_aware
+    swarm_rb, k8s_rb = _swarm_audit_rb(), _k8s_audit_rb()
+    registry = MagicMock()
+    registry.match_all_by_query.return_value = [k8s_rb, swarm_rb]
+    ctx = MagicMock()
+    ctx.selected_connections = {"swarm": "sws-swarm-id"}
+    chosen = _match_cluster_aware(registry, _cluster_aware_runtime(), ctx, "集群巡检", None)
+    assert chosen is swarm_rb
+
+
+def test_run_runbook_cluster_aware_by_connection_id():
+    """显式 connection_id 指向 k8s 接入 → 挑 k8s audit。"""
+    from skills.platform_run_runbook import _match_cluster_aware
+    swarm_rb, k8s_rb = _swarm_audit_rb(), _k8s_audit_rb()
+    registry = MagicMock()
+    registry.match_all_by_query.return_value = [k8s_rb, swarm_rb]
+    runtime = _cluster_aware_runtime()
+    runtime.connection_manager.get.return_value = {"type_code": "k8s", "id": "cw"}
+    ctx = MagicMock()
+    ctx.selected_connections = {}
+    chosen = _match_cluster_aware(registry, runtime, ctx, "集群巡检", "cw")
+    assert chosen is k8s_rb
+
+
+def test_run_runbook_single_candidate_unchanged():
+    """只有一个候选 → 直接用它(行为不变)。"""
+    from skills.platform_run_runbook import _match_cluster_aware
+    only = _swarm_audit_rb()
+    registry = MagicMock()
+    registry.match_all_by_query.return_value = [only]
+    ctx = MagicMock(); ctx.selected_connections = {}
+    chosen = _match_cluster_aware(registry, _cluster_aware_runtime(), ctx, "集群巡检", None)
+    assert chosen is only

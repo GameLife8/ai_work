@@ -329,7 +329,8 @@ _RAW_FIRST_SKIP_INTENTS = frozenset({"write_action", "diagnose"})
 
 # 输出"可枚举/可展示"原文的只读 skill
 _DISPLAYABLE_READ_SKILLS = frozenset({
-    "kube_query", "swarm_query", "host_query", "swarm_cluster_overview",
+    "kube_query", "swarm_query", "host_query",
+    "swarm_cluster_overview", "k8s_cluster_overview",
     "zabbix_get_host_overview", "zabbix_get_host_storage_overview", "jenkins_query",
 })
 
@@ -605,7 +606,9 @@ class UnifiedOpsAgent:
             return assemble_default()
         return assemble_from_records(records)
 
-    def _build_cluster_registry_prompt(self, *, selected_connections: dict[str, str]) -> str:
+    def _build_cluster_registry_prompt(
+        self, *, selected_connections: dict[str, str], user_message: str = "",
+    ) -> str:
         """生成"当前平台可用集群名录"prompt，每次 ask 重新求值。
 
         目的：让 LLM 从用户口语里的别名、节点名前缀、IP 关键字 → 匹配到正确的
@@ -643,6 +646,16 @@ class UnifiedOpsAgent:
                 continue
             by_type.setdefault(c.get("type_code", "other"), []).append(c)
 
+        # #3:把"用户本次大概率指的集群"钉死——预路由(歧义/不兼容)放弃后,模型不再飘到默认集群。
+        resolved = self._resolve_clusters_from_query(user_message) if user_message else {}
+        resolved_picks: list[str] = []
+        for _t, _cid in resolved.items():
+            _conn = next((c for c in conns if c.get("id") == _cid), None)
+            if _conn:
+                resolved_picks.append(
+                    f"``{_conn.get('alias') or _conn.get('name')}``（{_t}, connection_id={_cid}）"
+                )
+
         lines: list[str] = [
             "## 当前平台可用集群（动态注入）",
             "",
@@ -661,6 +674,13 @@ class UnifiedOpsAgent:
             "的 skill 就用同一关键词对应该 type 的 connection_id。",
             "",
         ]
+        if resolved_picks:
+            lines.insert(2, (
+                "🎯 **你本次大概率指的集群**：" + " · ".join(resolved_picks)
+                + "。涉及这些 type 的 skill / runbook **必须传对应 connection_id**，"
+                "除非用户明确改指别的集群。"
+            ))
+            lines.insert(3, "")
 
         # 优先级：常用类型靠前
         type_order = ["host_agent", "swarm", "k8s", "zabbix", "jenkins", "alert_analysis"]
@@ -681,6 +701,8 @@ class UnifiedOpsAgent:
                 clue = self._connection_routing_clue(t, cfg)
 
                 flag_tags = []
+                if resolved.get(t) == cid:
+                    flag_tags.append("[🎯本次命中]")
                 if c.get("is_default"):
                     flag_tags.append("[默认]")
                 if selected_connections.get(t) == cid:
@@ -833,6 +855,7 @@ class UnifiedOpsAgent:
             # 口语里的别名 / IP / 节点名 推断要传哪个 connection_id 给 skill。
             {"role": "system", "content": self._build_cluster_registry_prompt(
                 selected_connections=selected_connections or {},
+                user_message=user_message,
             )},
         ]
         if summary_text:
@@ -1179,26 +1202,33 @@ class UnifiedOpsAgent:
     def _pick_cluster_compatible_runbook(
         self, candidates: list[Any], user_message: str,
     ) -> Any | None:
-        """从命中候选里挑集群类型兼容用户路由的那个;挑不到返回 None。
+        """从命中候选里挑集群类型兼容用户路由的那个;挑不到返回 None(交模型,**绝不静默跑默认集群**)。
 
-        规则:
-          - 用户**没点名**具体集群(resolved 无 swarm/k8s)→ 直接用排名最高的候选
-            (通用"集群巡检"走默认集群,行为不变)。
-          - 用户**点名**了某集群类型 → 按候选排名从高到低,挑第一个
-            "需要的集群类型 ∈ 用户路由到的类型"(或不绑定集群类型)的候选。
-            全都不兼容 → None(调用方跳过预路由,走 tool loop)。
+        规则(fail-safe —— "静默巡检错集群"是最坏失败,宁可交模型也不盲猜):
+          - 用户**点名**了某集群类型(resolved 有 swarm/k8s)→ 按候选排名挑第一个
+            "需要的集群类型 ∈ 用户路由到的类型"(或不绑集群类型)的候选;全不兼容 → None。
+          - 用户**没点名** + 候选**跨多个集群类型**(通用"集群巡检"同时命中 swarm/k8s
+            两个 audit)→ **歧义,返回 None**——交模型按全量接入清单自己选,不盲选字母序最前的。
+          - 用户**没点名** + 候选只涉及**单一**集群类型(或都不绑类型)→ 无歧义,用排名最高的。
         """
         resolved = self._resolve_clusters_from_query(user_message)
         user_cluster_types = set(resolved.keys()) & self._CLUSTER_TYPES
 
-        if not user_cluster_types:
-            return candidates[0] if candidates else None
+        if user_cluster_types:
+            for rb in candidates:
+                required = self._runbook_required_conn_types(rb) & self._CLUSTER_TYPES
+                if not required or (required & user_cluster_types):
+                    return rb
+            return None
 
+        # 没点名集群:看候选覆盖几种集群类型
+        cand_types: set[str] = set()
         for rb in candidates:
-            required = self._runbook_required_conn_types(rb) & self._CLUSTER_TYPES
-            if not required or (required & user_cluster_types):
-                return rb
-        return None
+            cand_types |= self._runbook_required_conn_types(rb) & self._CLUSTER_TYPES
+        if len(cand_types) > 1:
+            # 通用词同时命中 swarm + k8s 巡检 → 歧义,不盲选默认,交模型(带接入清单 + 路由线索)
+            return None
+        return candidates[0] if candidates else None
 
     def _maybe_runbook_preroute(
         self,
@@ -1251,7 +1281,10 @@ class UnifiedOpsAgent:
             rb.key,
         )
 
-        args = {"user_query": user_message, "inputs": {}}
+        # 关键:必须把**预路由选中的 rb.key** 传给 platform_run_runbook。
+        # 否则它会拿 user_query 再 match 一次(registry.find→match_by_query 取字母序最前),
+        # 把这里挑好的"集群类型兼容 runbook"丢掉——这正是 "bigdata(swarm) 却跑了 k8s" 的根因。
+        args = {"name": rb.key, "user_query": user_message, "inputs": {}}
         envelope = self.invoker.invoke("platform_run_runbook", args, ctx)
         trace = [self._to_trace_item("platform_run_runbook", args, envelope)]
 
@@ -1270,11 +1303,43 @@ class UnifiedOpsAgent:
                 f"原始 ``node_states`` 已落审计,可在管理后台 → Runbook 执行历史查看。"
             )
 
+        # #4 可见性补丁:报告头部固定标明"本次巡检集群",一旦路由跑偏用户一眼可见
+        # (这次 bug 正是缺这个,误以为巡检了 bigdata 实际跑了默认 it-cluster01)。
+        banner = self._runbook_cluster_banner(rb, user_message)
+        if banner and final_report and not final_report.startswith(">"):
+            final_report = banner + "\n\n" + final_report
+
         return AgentOutcome(
             message=final_report,
             trace=trace,
             pending_actions=[],
         )
+
+    def _runbook_cluster_banner(self, rb: Any, user_message: str) -> str:
+        """生成"本次巡检集群：<alias>(<type>)"提示行;挑不出集群类型则空串。
+
+        用跟 platform_run_runbook 一致的解析口径:``_resolve_clusters_from_query`` 命中则用
+        命中的 connection,否则该 type 的平台默认 connection——保证 banner 跟实际跑的集群一致。
+        """
+        types = self._runbook_required_conn_types(rb) & self._CLUSTER_TYPES
+        if not types:
+            return ""
+        resolved = self._resolve_clusters_from_query(user_message)
+        cm = getattr(self.runtime, "connection_manager", None)
+        if cm is None:
+            return ""
+        parts: list[str] = []
+        for t in sorted(types):
+            cid = resolved.get(t)
+            try:
+                conn = cm.get(cid) if cid else cm.get_default(t)
+            except Exception:  # noqa: BLE001
+                conn = None
+            if conn:
+                alias = conn.get("alias") or conn.get("name") or "?"
+                suffix = "" if cid else "（平台默认）"
+                parts.append(f"{alias}（{t}）{suffix}")
+        return ("> 🎯 **本次巡检集群**：" + " · ".join(parts)) if parts else ""
 
     @staticmethod
     def _to_trace_item(name: str, args: dict, envelope: dict) -> dict:

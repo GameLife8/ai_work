@@ -156,8 +156,9 @@ def _parse_node(item: dict) -> dict:
 
 
 # 异常 pod 详情列表上限——防止集群里堆积的 Evicted/Failed pod 把报告表格和 token 撑爆。
-# count 仍是准确总数,只截断**明细列表**。
-_MAX_ABNORMAL_PODS = 40
+# count 仍是准确总数,只截断**明细列表**。``truncated`` 标记是否截断,报告模板据此提示
+# “还有 N 个未列出”。100 是实测下报告可读性 vs token 的折中(40 太少,异常多的集群看不全)。
+_MAX_ABNORMAL_PODS = 100
 
 
 def _parse_pods(items: list[dict], restart_threshold: int) -> dict[str, Any]:

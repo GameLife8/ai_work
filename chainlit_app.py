@@ -405,14 +405,15 @@ async def _start_new_session(user: dict) -> str:
     """
     sid = str(uuid.uuid4())
     cl.user_session.set("session_id", sid)
-    cl.user_session.set("session_persisted", False)
     return sid
 
 
 async def _resume_session(sid: str, user: dict) -> None:
     """绑定到已有 session_id + 在 UI 上重放最近 N 条消息让用户看到上下文。"""
     cl.user_session.set("session_id", sid)
-    cl.user_session.set("session_persisted", True)   # 已在 DB 里,无需懒持久化
+    # 注意:**不**在这里设 session_persisted/owner_saved 跳过 owner 写入——
+    # resume 的会话若当初是用空 metadata 建的,得靠下一条消息的 owner 写入补上 user,
+    # 否则它永远在 list_chat_sessions_by_user 里查不到(老 bug)。
     try:
         msgs = _runtime.store.list_chat_messages(sid, limit=40, exclude_summary=True)
     except Exception as exc:
@@ -625,23 +626,32 @@ async def on_message(message: cl.Message) -> None:
     text = (message.content or "").strip()
 
     if runtime and session_id and text:
-        # 懒持久化:第一条真实消息时才落 session 行,并带上 owner metadata。
-        # 这样既不产生空会话(历史下拉干净),又保证 metadata.user 一定写进去
-        # (list_chat_sessions_by_user 靠它过滤;丢了的话用户历史就查不到)。
-        if not cl.user_session.get("session_persisted"):
+        # 确保会话带上 owner metadata。list_chat_sessions_by_user 靠 metadata.user 过滤,
+        # 缺了用户历史就查不到该会话("凭空消失")。
+        #
+        # ⚠️ **不能**用 session_persisted 门控(老 bug 根因):_resume_session 会把它置 True,
+        # 导致 resume 后首条消息跳过 owner 写入,紧接着 save_chat_message 内部的 keep-alive
+        # ``save_chat_session(sid)``(metadata=None)若该行不存在就 INSERT 一个空 ``{}`` →
+        # metadata.user 为空 → 会话在历史里查不到(昨天会话没存住的真因)。
+        #
+        # 改成**按 session_id 维度只写一次** owner metadata,且**先于** save_chat_message。
+        # save_chat_session(metadata=) 幂等:既能建新行,也能给缺 owner 的旧行补上。
+        username = (user or {}).get("username")
+        owner_key = f"owner_saved:{session_id}"
+        if username and not cl.user_session.get(owner_key):
             try:
                 runtime.store.save_chat_session(session_id, metadata={
                     "channel": "chainlit",
                     "entrypoint": "chainlit_app.py",
-                    "user": (user or {}).get("username"),
+                    "user": username,
                     "role": (user or {}).get("role"),
                     "started_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
                 })
+                cl.user_session.set(owner_key, True)
             except Exception as exc:    # noqa: BLE001
-                print(f"[chainlit] lazy save_chat_session failed: {exc}")
-            cl.user_session.set("session_persisted", True)
+                print(f"[chainlit] ensure session owner failed: {exc}")
         runtime.store.save_chat_message(session_id, "user", text,
-                                        metadata={"user": (user or {}).get("username")})
+                                        metadata={"user": username})
 
     # ---- 模型分析中：用 cl.Step 显示 spinner，agent.ask 在线程池里跑不阻塞事件循环 ----
     async with cl.Step(name="🤖 模型分析中…", type="llm") as step:

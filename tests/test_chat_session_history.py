@@ -155,6 +155,36 @@ def test_chainlit_resume_session_replays_history_messages() -> None:
     assert "cl.Message" in body or "Message(" in body
 
 
+def test_chainlit_resume_does_not_skip_owner_metadata() -> None:
+    """回归(昨天会话没存住):resume 不能跳过 owner metadata 写入。
+
+    旧 bug:``_resume_session`` 设 ``session_persisted=True`` → ``on_message`` 跳过带
+    user 的 ``save_chat_session`` → 紧接着 ``save_chat_message`` 的 keep-alive 用空
+    metadata 建会话 → ``metadata.user`` 为空 → ``list_chat_sessions_by_user`` 查不到 →
+    用户历史"凭空消失"。修复:owner 写入按 ``session_id`` 维度门控,不靠 session_persisted。
+    """
+    import re
+    import chainlit_app
+    src = open(chainlit_app.__file__, encoding="utf-8").read()
+
+    rm = re.search(r"async def _resume_session\(.*?(?=\nasync def |\ndef |\Z)", src, re.S)
+    assert rm and 'set("session_persisted", True)' not in rm.group(0), (
+        "_resume_session 不能再设 session_persisted=True(会跳过 owner metadata 写入)"
+    )
+
+    om = re.search(r"async def on_message\(.*?(?=\n@cl\.|\nasync def |\Z)", src, re.S)
+    assert om, "找不到 on_message"
+    body = om.group(0)
+    # owner 写入按 session 维度门控(owner_saved),而不是 session_persisted
+    assert "owner_saved" in body, "on_message 应按 session 维度门控 owner metadata 写入"
+    # 去掉整行注释后,代码里不应再出现 session_persisted(只允许出现在解释性注释里)
+    code = "\n".join(l for l in body.splitlines() if not l.strip().startswith("#"))
+    assert "session_persisted" not in code, (
+        "on_message 不应再用 session_persisted 门控 owner 写入(注释除外)"
+    )
+    assert "save_chat_session" in body and "save_chat_message" in body
+
+
 # ---------- SQL store:消息保存不能抹掉会话 owner(回归) ---------- #
 
 

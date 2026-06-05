@@ -29,15 +29,30 @@ RUN sed -i 's|dl-cdn.alpinelinux.org|mirrors.aliyun.com|g' /etc/apk/repositories
         util-linux \
         # 文件 / 系统 / 容器排障
         lsof procps coreutils findutils file \
+        # curl —— 仅构建期下载 crictl 用(busybox wget 拉镜像源会被 400/503;curl 正常)。
+        # 运行时 allowed.yml 没放 curl,集群内 SSRF 边界不变。
+        curl \
         # Docker CLI ——只在 AGENT_MODE=docker_proxy 模式下用，调本地 /var/run/docker.sock
         # 起 sibling 容器跑 nsenter。direct 模式装着也不碍事（~20MB）。
         docker-cli \
-        # K8s 节点用 crictl（containerd-only 集群必备）
-        # alpine 没有 crictl 包，运维侧建议自己 push 进镜像；下面只装 ctr 配套依赖
         # Python + aiohttp + yaml
         python3 py3-aiohttp py3-yaml \
  && cp /usr/share/zoneinfo/Asia/Shanghai /etc/localtime \
  && echo "Asia/Shanghai" > /etc/timezone
+
+# crictl —— K8s(containerd)节点拿「容器/Pod → 宿主机 PID」用。alpine 没有 cri-tools 包,
+# 装官方静态二进制。crictl 读 CONTAINER_RUNTIME_ENDPOINT 环境变量连 containerd.sock
+# (deploy/ai-ops-agent-k8s.yaml 里已设该 env + 挂了 /run/containerd/containerd.sock)。
+ARG CRICTL_VERSION=v1.30.0
+# github releases 国内直连拉不动(503)。默认走 daocloud 的 github 镜像;
+# 私有化/换源用 ``--build-arg CRICTL_MIRROR=<你的镜像基址>`` 覆盖(直连 github 传 https://github.com)。
+ARG CRICTL_MIRROR=https://files.m.daocloud.io/github.com
+RUN set -eux; \
+    arch="$(uname -m)"; case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac; \
+    curl -fsSL -o /tmp/crictl.tgz "${CRICTL_MIRROR}/kubernetes-sigs/cri-tools/releases/download/${CRICTL_VERSION}/crictl-${CRICTL_VERSION}-linux-${arch}.tar.gz"; \
+    tar -xzf /tmp/crictl.tgz -C /usr/local/bin crictl; \
+    rm /tmp/crictl.tgz; \
+    /usr/local/bin/crictl --version
 
 # Agent 主体 + 白名单
 COPY agent/agent.py /usr/local/bin/agent.py

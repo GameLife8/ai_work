@@ -410,9 +410,20 @@ async def _resolve_container_pid(container: str) -> tuple[int | None, str, str]:
         if rc2 == 0 and pid:
             return pid, "docker", ""
         err1 = (e2 or err1)
-    # 2. crictl（K8s containerd / CRI-O）
+    # 2. crictl（K8s containerd / CRI-O）。传进来的可能是**容器名**,也可能是 **Pod 名**:
+    #    a) 先按容器名找(``crictl ps --name`` 匹配的是容器名)
+    #    b) 没中 → 按 Pod 名找(``crictl pods --name`` → pod id → 该 pod 第一个容器)
+    #    c) 还没中 → 当成原始容器 id 前缀直接 inspect
     rc, out, _ = await _run_capture(["crictl", "ps", "-q", "--name", container])
-    cid = out.strip().splitlines()[0] if (rc == 0 and out.strip()) else container
+    cid = out.strip().splitlines()[0] if (rc == 0 and out.strip()) else ""
+    if not cid:
+        rc, out, _ = await _run_capture(["crictl", "pods", "-q", "--name", container])
+        pod_id = out.strip().splitlines()[0] if (rc == 0 and out.strip()) else ""
+        if pod_id:
+            rc, out, _ = await _run_capture(["crictl", "ps", "-q", "--pod", pod_id])
+            cid = out.strip().splitlines()[0] if (rc == 0 and out.strip()) else ""
+    if not cid:
+        cid = container
     rc, out, err2 = await _run_capture(
         ["crictl", "inspect", "-o", "go-template", "--template", "{{.info.pid}}", cid])
     pid = _safe_int(out)

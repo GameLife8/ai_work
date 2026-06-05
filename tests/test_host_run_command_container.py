@@ -32,15 +32,19 @@ class _Client:
 class _Ctx:
     def __init__(self, c):
         self._c = c
+        self.routed_node = None
 
-    def connection_for(self, _t, _c):
+    def connection_for(self, _t, _c=None, *, node=None):
+        self.routed_node = node          # 验证 skill 把 node 透传给连接解析(按 node 路由)
         return self._c
 
 
 def test_container_runs_in_netns_default_net_only():
     from skills.host_run_command import run
     c = _Client()
-    out = run(_Ctx(c), node="192.168.2.44", container="csga", command="nc -zv 1.2.3.4 8107")
+    ctx = _Ctx(c)
+    out = run(ctx, node="192.168.2.44", container="csga", command="nc -zv 1.2.3.4 8107")
+    assert ctx.routed_node == "192.168.2.44"         # node 透传到连接解析 → 按 node 路由集群
     assert out["ok"] and not c.host_calls            # 没走宿主机路径
     call = c.netns_calls[0]
     assert call["container"] == "csga"

@@ -167,7 +167,7 @@ def run(
         }
 
     # 解析最终 connection_id 入库审计
-    resolved_conn_id = ctx.resolve_connection_id("host_agent", connection_id)
+    resolved_conn_id = ctx.resolve_connection_id("host_agent", connection_id, node=node)
     if not resolved_conn_id:
         return {"ok": False, "error": "未找到 host_agent 类型的 connection"}
 

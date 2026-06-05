@@ -3,12 +3,19 @@ from __future__ import annotations
 import json
 import logging
 import threading
+import time
 from typing import Any
 
 from ops_platform import drivers
 
 
 logger = logging.getLogger(__name__)
+
+# 按节点名路由 host_agent 用的索引缓存参数。
+# host 命令的路由真相是「这个 node 物理上属于哪个集群」——node 名天然唯一归属一个
+# host_agent 连接,拿 node 反查连接比靠"会话 tag / 默认连接"稳得多。
+_NODE_INDEX_TTL = 300.0          # 正常缓存 5min(agent DaemonSet/service 的节点很稳定)
+_NODE_INDEX_MIN_REFRESH = 15.0   # 强刷也至少隔 15s,防"不存在的 node"把索引刷爆
 
 
 class ConnectionManager:
@@ -23,6 +30,9 @@ class ConnectionManager:
         self._runtime_ref = runtime_ref
         self._client_cache: dict[str, Any] = {}
         self._lock = threading.RLock()
+        # node → connection_id 索引(按节点名路由 host_agent),带 TTL,见 find_host_agent_for_node
+        self._node_index: dict[str, str] = {}
+        self._node_index_ts: float = 0.0
 
     def attach_runtime(self, runtime: Any) -> None:
         self._runtime_ref = runtime
@@ -48,18 +58,22 @@ class ConnectionManager:
             created_by=created_by,
             tags=tags or [],
         )
+        with self._lock:
+            self._node_index_ts = 0.0   # 新增连接 → 下次按 node 路由时重建索引
         return record
 
     def update(self, connection_id: str, **fields) -> dict[str, Any]:
         record = self.store.update_connection(connection_id, **fields)
         with self._lock:
             self._client_cache.pop(connection_id, None)
+            self._node_index_ts = 0.0
         return record
 
     def delete(self, connection_id: str) -> None:
         self.store.delete_connection(connection_id)
         with self._lock:
             self._client_cache.pop(connection_id, None)
+            self._node_index_ts = 0.0
 
     # ---------- client 解析 ----------
 
@@ -92,6 +106,54 @@ class ConnectionManager:
         # 没显式标默认就返回第一个 enabled 的
         items = [c for c in self.list(type_code=type_code) if c.get("enabled", True)]
         return items[0] if items else None
+
+    # ---------- 按节点名路由 host_agent ----------
+
+    def find_host_agent_for_node(self, node: str, *, refresh: bool = False) -> str | None:
+        """按节点名找它所属的 host_agent ``connection_id``;找不到返回 None（**全程不抛**）。
+
+        host 命令的路由真相是「这个 node 物理上在哪个集群」。遍历各 host_agent 连接的
+        ``list_nodes()`` 建 node→connection 索引并缓存(TTL ``_NODE_INDEX_TTL``)。
+        ``refresh=True`` 强制重建(受 ``_NODE_INDEX_MIN_REFRESH`` 节流)——给"缓存未命中
+        再确认一次,抓刚加入的节点"用。任何单连接列举失败都跳过,不影响整体路由。
+        """
+        if not node:
+            return None
+        node = str(node).strip()
+        now = time.monotonic()
+        with self._lock:
+            age = now - self._node_index_ts
+            need = (self._node_index_ts == 0.0) or (age >= _NODE_INDEX_TTL)
+            if refresh and age >= _NODE_INDEX_MIN_REFRESH:
+                need = True
+        if need:
+            index = self._build_node_index()   # 不持锁:内部含 kubectl/docker 网络调用
+            with self._lock:
+                self._node_index = index
+                self._node_index_ts = time.monotonic()
+        with self._lock:
+            return self._node_index.get(node)
+
+    def _build_node_index(self) -> dict[str, str]:
+        """列各 host_agent 连接的节点,建 node→connection_id 索引。
+
+        单个连接列举失败(集群不可达 / 凭证失效等)只 ``warning`` + 跳过,绝不拖垮其它
+        连接的路由;node 名先到先得(理应唯一归属一个集群)。
+        """
+        index: dict[str, str] = {}
+        for conn in self.list(type_code="host_agent"):
+            if not conn.get("enabled", True):
+                continue
+            cid = conn["id"]
+            try:
+                nodes = self.get_client(cid).list_nodes()
+            except Exception as exc:   # noqa: BLE001 —— 一个集群挂了不能拖垮按 node 路由
+                logger.warning("node 索引:连接 %s 列举节点失败,跳过:%s",
+                               conn.get("name") or cid, exc)
+                continue
+            for n in nodes or []:
+                index.setdefault(str(n), cid)
+        return index
 
     def validate(self, connection_id: str) -> dict[str, Any]:
         record = self.get(connection_id)

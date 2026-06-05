@@ -42,7 +42,7 @@ def run(
     max_packets: int = 200,
     connection_id: str | None = None,
 ) -> dict:
-    client = ctx.connection_for("host_agent", connection_id)
+    client = ctx.connection_for("host_agent", connection_id, node=node)
     cmd = [
         "timeout", str(int(duration)),
         "tcpdump", "-i", interface,

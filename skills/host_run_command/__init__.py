@@ -71,7 +71,7 @@ def run(
     namespaces: str | None = None,
     connection_id: str | None = None,
 ) -> dict:
-    client = ctx.connection_for("host_agent", connection_id)
+    client = ctx.connection_for("host_agent", connection_id, node=node)
     # 准则:不解析、不改写命令——原样塞进 sh -c,让模型用任意 shell 语法。
     inner = ["sh", "-c", command]
 

@@ -138,7 +138,7 @@ def _find_container_pid(client, node: str, container: str) -> tuple[int | None, 
 
 
 def run(ctx, *, node: str, container: str, connection_id: str | None = None) -> dict:
-    client = ctx.connection_for("host_agent", connection_id)
+    client = ctx.connection_for("host_agent", connection_id, node=node)
     pid, runtime, err = _find_container_pid(client, node, container)
     if not pid:
         return {

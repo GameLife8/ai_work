@@ -146,7 +146,7 @@ def run(
     connection_id: str | None = None,
 ) -> dict:
     argv = _validate_command(command)
-    client = ctx.connection_for("host_agent", connection_id)
+    client = ctx.connection_for("host_agent", connection_id, node=node)
 
     ns_tuple = tuple(c for c in namespaces if c in {"m", "u", "i", "n", "p", "U", "C"})
     ns_tuple = ns_tuple or ("m", "u", "i", "n", "p")

@@ -94,7 +94,7 @@ class _Ctx:
         self.user = {"username": "alice"}
         self.session_id = "sess-1"
 
-    def resolve_connection_id(self, type_code: str, override: str | None) -> str:
+    def resolve_connection_id(self, type_code: str, override: str | None = None, *, node=None) -> str:
         return override or "ha-default"
 
 

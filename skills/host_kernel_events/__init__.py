@@ -61,7 +61,7 @@ def run(
     connection_id: str | None = None,
 ) -> dict:
     """三段式 fallback 兼容老 dmesg。"""
-    client = ctx.connection_for("host_agent", connection_id)
+    client = ctx.connection_for("host_agent", connection_id, node=node)
 
     attempts = (
         ["dmesg", "--time-format", "iso", "--ctime"],

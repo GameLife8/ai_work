@@ -65,7 +65,7 @@ SKILL_DOMAINS: dict[str, list[str]] = {
         "k8s_cluster_overview",               # k8s 集群级聚合巡检
     ],
     "network_diag": [
-        "host_inspect_container_netns", "host_exec_in_container_netns",
+        "host_inspect_container_netns",
         "host_kernel_events",
     ],
     "cicd": [

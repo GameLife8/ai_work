@@ -76,11 +76,11 @@ DEFAULTS: dict[str, dict[str, str]] = {
             "    **不要**就此打住或反问用户，立刻换一个**等价工具**重试——"
             "DNS：nslookup→dig→getent hosts→``python3 -c 'import socket'``；"
             "连通性：curl→wget→nc；socket：ss→netstat。\n"
-            "11. **容器网络视角的诊断走专用 skill，不要在宿主机硬跑**：要从**某个容器内**做 DNS 解析 / "
-            "连通性测试（「容器 X 里访问域名 Y 解析到哪」「容器 X 出网正常吗」），\n"
-            "    直接用 ``host_exec_in_container_netns``（它自动定位容器 PID、起带工具镜像的容器 "
-            "``nsenter`` 进容器网络 namespace 跑命令）——**这是默认正确路径，不用等用户提醒去查 PID、"
-            "也不要在宿主机上跑缺工具的 nslookup/dig**。"
+            "11. **容器网络视角的诊断:用 host_run_command 传 container,不要在宿主机硬跑**：要从"
+            "**某个容器内**做 DNS 解析 / 连通性测试（「容器 X 里访问域名 Y 解析到哪」「容器 X 出网正常吗」），\n"
+            "    用 ``host_run_command(node, command='nslookup Y', container='X')``——传了 ``container`` 平台会"
+            "自动定位容器 PID、进它的网络 namespace 跑命令,命令在自带 dig/nslookup/nc 的镜像里执行,"
+            "**不会缺工具,也不用你先去查 PID**。命令你随意写(nslookup/dig/nc/ping...),平台不限制。"
         ),
     },
 
@@ -115,8 +115,8 @@ DEFAULTS: dict[str, dict[str, str]] = {
             "- 端口连不上 → ``host_query(command='ss -ltnup')`` + ``host_query(command='iptables-save', probe_port=N)``\n"
             "- DNS 问题 → 宿主机视角 ``host_query(command='dig X.cluster.local')``;**从某容器的网络视角解析**\n"
             "  (「容器 X 里访问域名 Y 解析到哪个 IP」「容器 X 连不连得通 Z」)→ "
-            "``host_exec_in_container_netns(node, container, command='nslookup Y')``——它起一个自带网络工具的\n"
-            "  容器 ``nsenter`` 进目标容器 netns 再跑命令,**不会因宿主机/agent 没装 dig/nslookup 而失败**\n"
+            "``host_run_command(node, command='nslookup Y', container='X')``——传 container 就进目标容器 netns 跑命令\n"
+            "  (命令在自带网络工具的镜像里执行,**不会因容器/宿主机没装 dig/nslookup/nc 而失败**;命令随意写)\n"
             "- 内核层 → ``host_kernel_events`` 看 OOM/conntrack/IO error（自动兼容老 CentOS 7 dmesg）"
         ),
     },

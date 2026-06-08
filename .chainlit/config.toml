@@ -85,7 +85,9 @@ cot = "full"
 
 # Specify a JavaScript file that can be used to customize the user interface.
 # The JavaScript file can be served from the public directory.
-# custom_js = "/public/test.js"
+# 剪贴板兜底:HTTP(非安全上下文)下 navigator.clipboard 不存在,复制按钮会报
+# "Cannot read properties of undefined (reading 'writeText')";用 execCommand 兜底。
+custom_js = "/public/clipboard-polyfill.js"
 
 # Specify additional attributes for custom JS file
 # custom_js_attributes = "async type = \"module\""

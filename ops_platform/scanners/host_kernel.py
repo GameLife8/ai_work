@@ -32,7 +32,7 @@ def scan(node: str, events_text: str) -> list[dict]:
         sigs.append(signal(
             SIG_CONNTRACK_FULL, severity=SEV_WARNING,
             evidence=f"节点 {node} conntrack 表满（nf_conntrack: table full），新连接将被丢",
-            next_skill="host_query",
+            next_skill="host_run_command",
             next_args={"node": node, "command": "iptables-save"},
             context={"node": node},
         ))

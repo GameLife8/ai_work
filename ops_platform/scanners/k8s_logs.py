@@ -31,7 +31,7 @@ def scan(text: str, *, pod: str, namespace: str | None) -> list[dict]:
         sigs.append(signal(
             SIG_CONNECTION_REFUSED, severity=SEV_WARNING,
             evidence=f"Pod {pod} 日志报 'connection refused'（依赖服务未监听或被防火墙阻断）",
-            next_skill="host_query",
+            next_skill="host_run_command",
             next_args={"command": "ss -ltnup"},
             context={"namespace": namespace, "pod": pod},
         ))
@@ -56,7 +56,7 @@ def scan(text: str, *, pod: str, namespace: str | None) -> list[dict]:
             next_args={"verb": "describe", "resource": "pod", "name": pod,
                        "namespace": namespace} if namespace else {"verb": "describe", "resource": "pod", "name": pod},
             context={"namespace": namespace, "pod": pod,
-                     "hint": "再查 host_inspect_container_netns 看容器内 DNS 配置"},
+                     "hint": "再用 host_run_command 跑 nsenter 进容器 netns 看 DNS(套路见 container_netns_diag 剧本)"},
         ))
 
     if "permission denied" in low or "operation not permitted" in low:

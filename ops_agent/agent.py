@@ -90,12 +90,6 @@ _SUMMARY_PROMPT = (
 # 不能放在这里走单关键词逻辑——用户经常说"配置可以展示一下"（noun 在前 verb 在后），
 # 单关键词"展示配置"按字面顺序匹配会漏。
 _INTENT_KEYWORDS: dict[str, list[str]] = {
-    # F 类：异步长任务
-    "async_task": [
-        "异步", "长命令", "跑一会", "后台跑",
-        "du -sh", "find /", "journalctl", "tcpdump",
-        "看刚才那个任务", "任务跑完了吗", "任务结果",
-    ],
     # E 类：写操作
     "write_action": [
         "重启服务", "扩容", "缩容", "扩到", "缩到", "扩成", "改成",
@@ -220,25 +214,6 @@ _INTENT_HINTS: dict[str, str] = {
         "第二轮基于 needs_confirmation 写 2-3 句:原因 → 风险/回滚 → "
         "结尾「请在下方点击 ✅ 确认 或 ❌ 取消」。**不要重写卡片已有的 skill/参数/有效期**。"
     ),
-    "async_task": (
-        "🎯 **本次用户意图：异步长任务（F 类）—— 提交回执 + 轮询提示**\n"
-        "估计 > 30s 的命令一律用 ``host_run_command_async``。\n"
-        "\n"
-        "**提交时**：\n"
-        "```\n"
-        "已提交异步任务：\n"
-        "- task_id: ptk_xxx\n"
-        "- node: bigdata6\n"
-        "- 命令: du -sh /var/log/*\n"
-        "- 最大运行时间: 600s\n"
-        "预计 1–5 分钟跑完，你说「看任务结果」我去 host_check_task 取。\n"
-        "```\n"
-        "**查询任务结果时**：\n"
-        "```\n"
-        "任务 ptk_xxx 已完成（耗时 X 秒），结果如下：\n"
-        "（贴 stdout 代码块）\n"
-        "```"
-    ),
     "knowledge": (
         "🎯 **本次用户意图：知识 / 引导（G 类）—— 结构化清单**\n"
         "**必须按这个格式输出**：\n"
@@ -285,7 +260,7 @@ def _classify_intent(user_message: str) -> str | None:
         return "config_view"
 
     # 其余意图用单关键词 OR 匹配
-    priority = ["async_task", "write_action", "monitor",
+    priority = ["write_action", "monitor",
                 "list_state", "knowledge", "chat_intro", "diagnose"]
     for intent in priority:
         for kw in _INTENT_KEYWORDS.get(intent, []):
@@ -724,7 +699,7 @@ class UnifiedOpsAgent:
             "## 路由示例（few-shot）",
             "",
             "用户说「**bigdata6** 节点磁盘看一下」→ bigdata6 命中 `BigData Swarm` 的"
-            "节点命名规律 → 调 ``host_query(node='bigdata6', command='df -h')`` 传该集群的 ``connection_id``。",
+            "节点命名规律 → 调 ``host_run_command(node='bigdata6', command='df -h')``(平台按 node 自动路由集群)。",
             "",
             "用户说「**codewave** 上 default 命名空间 pod 状态」→ codewave 命中 K8s "
             "集群的别名 → 调 ``kube_query(verb='get', resource='pods', namespace='default')`` 传该集群的 ``connection_id``。",

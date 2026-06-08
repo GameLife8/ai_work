@@ -1,7 +1,7 @@
 """扫 iptables-save / nft list ruleset 输出。
 
 接收 ``probe_port``——如果传了，匹配 ``--dport <port>`` 命中 DROP/REJECT 的行，
-emit ``port_blocked_by_iptables`` 信号让模型 pivot 到 host_query(command='ss -ltnup')
+emit ``port_blocked_by_iptables`` 信号让模型 pivot 到 host_run_command(command='ss -ltnup')
 对照监听。
 """
 
@@ -46,7 +46,7 @@ def scan(node: str, text: str, *, probe_port: int | None = None, mode: str = "ip
             f"节点 {node} 防火墙规则中检测到 ``--dport {probe_port}`` 的 DROP/REJECT 规则 "
             f"（命中 {len(hits)} 条）。示例：``{sample}``"
         ),
-        next_skill="host_query",
+        next_skill="host_run_command",
         next_args={"node": node, "command": f"ss -ltnup"},
         context={"node": node, "port": int(probe_port), "rule_count": len(hits),
                  "hint": f"对比 ss 看 :{probe_port} 是否真的有进程在监听"},

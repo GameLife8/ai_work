@@ -83,7 +83,7 @@ def test_every_skill_is_core_or_in_exactly_one_domain():
 
 def test_core_has_the_three_query_mouths_and_runbook():
     """三把通用查询口 + runbook 入口 必须常驻。"""
-    for must in ("kube_query", "swarm_query", "host_query",
+    for must in ("kube_query", "swarm_query", "host_run_command",
                  "platform_run_runbook", "platform_get_runbooks"):
         assert must in CORE_SKILLS, f"{must} 应当在 Layer 0 常驻核心"
 

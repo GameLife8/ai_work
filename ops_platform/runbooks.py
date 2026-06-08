@@ -4,16 +4,20 @@
 瞎撞、减少漏查。这里只放剧本数据，剧本的自动执行还有另一份 DAG 版本在
 ``runbook_seeds.py``（被 ``platform_run_runbook`` 执行）。
 
-skill 体系重构后说明 (2026-05)
-==============================
-本平台经历过一次"少而精"的 skill 重构：删掉了一批浅封装（``k8s_list_pods`` /
-``swarm_get_service_detail`` / ``host_socket_overview`` 等），合并成三把口：
+skill 体系重构 (2026-06,大道至简)
+==================================
+主机命令全部合并到**唯一执行口** ``host_run_command``(node + command,**每次执行
+弹确认**,平台按 node 自动路由到所属集群)。原来的 host_query / host_kernel_events /
+host_inspect_container_netns / host_capture_packets / host_run_command_async /
+host_list_* 全删 —— 看监听端口 / 防火墙 / 路由 / 内核事件 / 进容器 netns,统统直接用
+``host_run_command`` 跑对应命令(ss / iptables-save / ip route / dmesg / nsenter ...)。
+只读查询底座仍在:
 
-- ``kube_query``  —— 任意 ``kubectl get/describe/logs/top/events``
-- ``swarm_query`` —— 任意 ``docker service/node/task ls/inspect/ps/logs``
-- ``host_query``  —— 任意宿主机白名单内的只读命令（ss/ip/iptables-save/dmesg/df/...）
+- ``kube_query``      —— 任意 ``kubectl get/describe/logs/top/events``
+- ``swarm_query``     —— 任意 ``docker service/node/task ls/inspect/ps/logs``
+- ``host_run_command`` —— 节点上任意命令(主机层,或 nsenter 进容器)
 
-下面所有 step 都按新 skill 写。
+下面所有 step 都按这个写。
 """
 
 from __future__ import annotations
@@ -174,71 +178,105 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
             "丢包", "iptables", "DNAT", "overlay 异常", "service VIP",
         ],
         "preface": (
-            "**这是不依赖 SSH 的网络排障路径**——通过部署在每节点的 ai-ops-agent 容器，"
-            "走 nsenter 进宿主机 namespace 取证。第一步永远先 host_list_nodes 拿目标节点。"
+            "**不依赖 SSH 的网络排障**——全程用 ``host_run_command`` 在目标节点宿主机视角跑命令"
+            "(每条弹确认)。要进**某容器**的网络视角,见 ``container_netns_diag``。"
         ),
         "steps": [
             {
-                "skill": "host_list_nodes",
-                "why": "确定 host_agent 已经覆盖目标集群，并拿到 node 列表",
-            },
-            {
-                "skill": "host_query",
+                "skill": "host_run_command",
                 "args_hint": "node=<node>, command='ss -ltnup'",
-                "why": "宿主机视角看监听端口；先确认目标端口是不是真的有进程在 listen",
+                "why": "宿主机视角看监听端口;先确认目标端口是不是真有进程在 listen",
             },
             {
-                "skill": "host_query",
-                "args_hint": "node=<node>, command='iptables-save', probe_port=<目标端口>",
-                "why": "排查端口被 iptables/nft DROP / DNAT 错位 / kube-proxy 规则丢失。probe_port 让 scanner 自动识别拦截规则。",
+                "skill": "host_run_command",
+                "args_hint": "node=<node>, command=\"iptables-save | grep -E '<目标端口>|DROP|DNAT'\"",
+                "why": "排查端口被 iptables/nft DROP / DNAT 错位 / kube-proxy 规则丢失;grep 收窄到目标端口",
                 "signal_to_next": {
-                    "看到 chain KUBE-SERVICES 引用了不存在的 chain": "→ kube-proxy 异常，kube_query(verb=describe, resource=pod, name=<kube-proxy pod>)",
-                    "看到大量 DOCKER-USER DROP": "→ Swarm/docker 的网络 ACL 配置问题",
+                    "KUBE-SERVICES 引用了不存在的 chain": "→ kube-proxy 异常,kube_query(verb=describe, resource=pod, name=<kube-proxy pod>)",
+                    "大量 DOCKER-USER DROP": "→ Swarm/docker 网络 ACL 配置问题",
                 },
             },
             {
-                "skill": "host_query",
-                "args_hint": "node=<node>, command='ip route'   （需要时再跑 'ip rule'）",
-                "why": "确认默认路由 / 多网卡选择 / overlay 接口（vxlan / cni0 / flannel.1）状态",
+                "skill": "host_run_command",
+                "args_hint": "node=<node>, command='ip route; ip rule'",
+                "why": "默认路由 / 多网卡选择 / overlay 接口(vxlan / cni0 / flannel.1)状态",
             },
             {
-                "skill": "host_inspect_container_netns",
-                "why": "上面是宿主机视角；如果是某个容器内连不出去，要进它自己的 netns 再查一遍",
+                "skill": "host_run_command",
+                "args_hint": "node=<node>, command=\"dmesg -T 2>/dev/null | grep -iE 'conntrack|nf_|drop|retransmit' | tail -50\"",
+                "why": "内核层:conntrack table full / nf_conntrack drop / TCP 重传 / NIC offload 错误(老 CentOS7 ``dmesg`` 无 -T 就去掉)",
             },
             {
-                "skill": "host_kernel_events",
-                "args_hint": "node=<node>, keyword='conntrack'",
-                "why": "看 conntrack table full / nf_conntrack drop / TCP retransmit / NIC offload 错误。自动兼容老 CentOS 7 dmesg。",
-                "tip": "keyword 试 'conntrack' / 'drop' / 'nf_'",
-            },
-            {
-                "skill": "host_capture_packets",
-                "why": "**最后兵器**——前面没结论时抓包确认。filter 务必精确，duration ≤ 30s",
+                "skill": "host_run_command",
+                "args_hint": "node=<node>, command='timeout 20 tcpdump -ni any port <端口> -c 200'",
+                "why": "**最后兵器**——前面没结论时抓包确认。filter 务必精确,duration ≤ 30s,加 -c 限包数",
             },
         ],
-        "stop_when": "已能给出「链路在哪一段断」的结论 + 关键证据（iptables 行 / dmesg 行 / 抓包结果）",
+        "stop_when": "已能给出「链路在哪一段断」的结论 + 关键证据(iptables 行 / dmesg 行 / 抓包结果)",
+    },
+
+    "container_netns_diag": {
+        "title": "进容器看网络视角:容器里访问域名解析到哪个 IP / 容器连不连得通某地址",
+        "triggers": [
+            "容器里访问", "容器内解析", "容器 DNS", "容器里 ping",
+            "容器连不连得通", "从容器看", "容器网络视角", "容器出网",
+        ],
+        "preface": (
+            "问「**某容器里**访问域名 X 解析到哪个 IP / 连不连得通 Y」时,要进**那个容器自己的"
+            "网络 namespace** 跑命令(宿主机的 DNS/路由跟容器可能不一样,直接在宿主机跑会得到错的答案)。"
+            "全程 ``host_run_command``,三步:**定位节点 → 拿容器宿主机 PID → nsenter 进它的 netns**。"
+        ),
+        "steps": [
+            {
+                "skill": "host_run_command",
+                "args_hint": (
+                    "Swarm: node=<任意管理节点>, command=\"docker service ps <服务名> "
+                    "--filter desired-state=running --format '{{.Node}} {{.Name}}'\";"
+                    "K8s: command='kubectl get pod <pod> -o wide' 看 NODE 列"
+                ),
+                "why": "**先定位容器在哪个节点**——Swarm 容器名是 ``服务名.序号.任务ID``,常跑在 worker;"
+                       "只在管理节点 ``docker ps`` 找不到就放弃 = 典型错误",
+            },
+            {
+                "skill": "host_run_command",
+                "args_hint": (
+                    "Swarm: node=<上一步的节点>, command=\"docker inspect -f '{{.State.Pid}}' "
+                    "<完整容器名或ID前缀>\";K8s(containerd): "
+                    "command=\"crictl inspect --output go-template --template '{{.info.pid}}' "
+                    "$(crictl ps -q --name <容器名片段> | head -1)\""
+                ),
+                "why": "拿容器的**宿主机 PID**——进它 namespace 的钥匙",
+            },
+            {
+                "skill": "host_run_command",
+                "args_hint": (
+                    "node=<同上>, command='nsenter -t <PID> -n getent hosts oss.chinasws.com'"
+                    "(解析到哪个 IP);连通性 command='nsenter -t <PID> -n nc -zv 10.0.0.5 5432'"
+                ),
+                "why": "``nsenter -t <PID> -n`` 进容器**网络** namespace——这才是容器自己的 DNS/路由视角。"
+                       "工具用宿主机的(getent/nslookup/nc/curl),宿主机没装就换一个(``getent hosts`` ≈ nslookup)。",
+                "tip": "想看容器自己的 resolv.conf,加 ``-m`` 进它 mount namespace:"
+                       "``nsenter -t <PID> -n -m cat /etc/resolv.conf``",
+            },
+        ],
+        "stop_when": "已拿到容器网络视角下的解析结果 / 连通性结论 + 证据(IP / nc 返回)",
     },
 
     "node_health_audit": {
         "title": "节点深度健康检查（ad-hoc）",
         "triggers": ["这台节点有问题", "节点抖动", "Node NotReady", "怀疑硬件问题"],
         "steps": [
-            {"skill": "host_list_nodes", "why": "确认 agent 覆盖到目标节点"},
             {"skill": "zabbix_get_host_overview", "why": "先用 Zabbix 看 CPU/MEM/可用性的统计视图"},
             {"skill": "zabbix_get_host_storage_overview", "why": "看挂载点容量"},
             {
-                "skill": "host_kernel_events",
-                "why": "Zabbix 看不到的内核层事件（OOM / IO error / 硬件错误）",
-                "tip": "keyword 试 'oom' / 'i/o error' / 'mce' / 'edac' / 'temperature'",
-            },
-            {
-                "skill": "host_run_command_async",
-                "why": "长命令异步（du / find / journalctl 等），admin 审批。提交后用 host_check_task 轮询。",
-                "tip": "典型用法：command='du -sh /var/lib/*', max_runtime_sec=600",
+                "skill": "host_run_command",
+                "args_hint": "node=<node>, command=\"dmesg -T 2>/dev/null | grep -iE 'oom|i/o error|mce|edac|hardware' | tail -50\"",
+                "why": "Zabbix 看不到的内核层事件(OOM / IO error / 硬件错误);老 CentOS7 ``dmesg`` 无 -T 就去掉",
             },
             {
                 "skill": "host_run_command",
-                "why": "**逃生口** —— 短命令（< 30s）的 admin 审批通道；常见 systemctl status docker/kubelet",
+                "args_hint": "node=<node>, command='du -sh /var/lib/* 2>/dev/null | sort -rh | head'  /  'systemctl status docker kubelet'",
+                "why": "**逃生口**——任意主机命令(查大目录 / 看服务状态 / journalctl 等),每条弹确认",
             },
         ],
     },
@@ -254,23 +292,28 @@ GENERAL_GUIDANCE = {
         "**必须**追加一次 zabbix 主机概览或磁盘概览查询。"
     ),
     "skill_inventory_v2": (
-        "**少而精的新 skill 架构（35→22）**：\n"
-        "- 通用查询三把口：kube_query / swarm_query / host_query —— 所有只读查询走这三个\n"
-        "- 写操作专用：k8s_scale_deployment / swarm_remove_service / host_run_command(_async) / 等\n"
-        "- 复合或元数据：host_inspect_container_netns / host_kernel_events / zabbix_get_host_* / "
-        "host_list_nodes / platform_*\n"
-        "**不要再调旧名字**（k8s_list_pods / swarm_get_service_detail / host_socket_overview 等）——已删除。"
+        "**大道至简的 skill 架构**：\n"
+        "- 只读查询:kube_query / swarm_query —— k8s/swarm 的只读查询走这俩\n"
+        "- **唯一命令执行口:host_run_command** —— 节点上任意命令(主机层 ss/ip/iptables/dmesg/df,"
+        "或 nsenter 进容器),**每次执行弹确认**,平台按 node 自动路由集群。原来的 host_query / "
+        "host_kernel_events / host_inspect_container_netns / host_capture_packets / "
+        "host_run_command_async / host_list_* 全删 —— 统统用 host_run_command 跑命令\n"
+        "- 监控:zabbix_get_host_* / metric_query / *_cluster_overview\n"
+        "- 写操作:k8s_scale_deployment / swarm_remove_service / 等\n"
+        "**不要再调已删的名字**(host_query / host_kernel_events / host_list_nodes / "
+        "k8s_list_pods / swarm_get_service_detail 等)。"
     ),
     "pivot_keys": {
         "swarm_task → zabbix_host": "swarm_query(verb=ps) 的 Node 列 → zabbix host_query",
         "k8s_pod → zabbix_host": "kube_query(verb=get, resource=pods, output=json) 的 spec.nodeName → zabbix host_query",
         "service_name → swarm_logs": "在 swarm_query(verb=logs) 里逐次换 filters.grep",
-        "host_resource → host_kernel_events": (
-            "Zabbix 看不到的内核层异常（OOM / IO error / conntrack）走 host_kernel_events（带老节点兼容）"
+        "host_resource → 内核事件": (
+            "Zabbix 看不到的内核层异常(OOM / IO error / conntrack)走 "
+            "host_run_command(command=\"dmesg -T 2>/dev/null | grep -iE 'oom|conntrack|i/o error'\")"
         ),
-        "node_name → host_query": (
-            "怀疑端口被防火墙拦时，从 swarm/k8s 拿到 Node 名后 host_query(command='ss -ltnup') "
-            "+ host_query(command='iptables-save', probe_port=N)"
+        "node_name → host_run_command": (
+            "怀疑端口被防火墙拦时,从 swarm/k8s 拿到 Node 名后 host_run_command(command='ss -ltnup') "
+            "+ host_run_command(command=\"iptables-save | grep <端口>\")"
         ),
         "want_app_config": (
             "想看 K8s 应用配置（如 coredns Corefile）：**先 ConfigMap**——"
@@ -279,9 +322,9 @@ GENERAL_GUIDANCE = {
     },
     "ssh_replacement_note": (
         "本平台默认禁止 SSH。所有「进宿主机查」的需求统一走 host_agent connection + "
-        "host_query/host_run_command/host_run_command_async。底层是部署在每个节点的"
-        "特权 agent 容器（mode:global / DaemonSet）。"
-        "如果 host_list_nodes 返回为空，说明 agent 还没部署，参考 docs/host-agent.md。"
+        "**host_run_command**(节点上任意命令,每次弹确认,按 node 自动路由集群)。底层是部署在"
+        "每个节点的特权 agent 容器(mode:global / DaemonSet)。"
+        "如果 host_run_command 报该 node 没有 agent,说明 agent 还没部署,参考 docs/host-agent.md。"
     ),
     "stop_conditions": [
         "已经能给出 当前状态 + 检测过程 + 关键证据 + 判断结论 + 建议操作",

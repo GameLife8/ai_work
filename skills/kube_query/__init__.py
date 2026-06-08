@@ -25,7 +25,7 @@ k8s_get_pod_logs / k8s_list_deployments ...），结果：
 
 **禁止**：``exec`` / ``port-forward`` / ``edit`` / ``apply`` / ``delete`` /
 ``scale`` / ``patch`` / ``rollout`` / ``-w``/``--watch``（长连接） —— 这些是写
-操作或可能阻塞，走专用 skill 或 host_run_command_async。
+操作或可能阻塞，走专用写 skill 或 host_run_command。
 
 参数 schema
 -----------

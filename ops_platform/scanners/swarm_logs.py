@@ -24,7 +24,7 @@ def scan(service_name: str, log_text: str) -> list[dict]:
             SIG_CONNECTION_REFUSED, severity=SEV_CRITICAL,
             evidence=(
                 f"日志中出现 'connection refused'（服务 {service_name}）。"
-                "建议先 swarm_query(category=service, verb=ps) 拿 Node，再 host_query(command='ss -ltnup') 看监听。"
+                "建议先 swarm_query(category=service, verb=ps) 拿 Node，再 host_run_command(command='ss -ltnup') 看监听。"
             ),
             next_skill="swarm_query",
             next_args={"category": "service", "verb": "ps", "name": service_name,
@@ -53,7 +53,7 @@ def scan(service_name: str, log_text: str) -> list[dict]:
             ),
             next_skill="swarm_query",
             next_args={"category": "service", "verb": "ps", "name": service_name},
-            context={"hint": "下一步可 host_inspect_container_netns 看容器内 DNS 配置"},
+            context={"hint": "下一步可 host_run_command 跑 nsenter 进容器 netns 看 DNS(套路见 container_netns_diag 剧本)"},
         ))
 
     if ("out of memory" in low or "oomkill" in low or "java.lang.outofmemoryerror" in low) and SIG_OOM_KILL not in seen:

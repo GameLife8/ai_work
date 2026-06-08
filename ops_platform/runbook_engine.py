@@ -1022,8 +1022,8 @@ DEFAULT_REPORT_PROMPT = """\
   **明确写出哪一步失败、失败原因 (state.error)**，不要绕过；
 - 全局 ``global_status != "done"`` 或 ``abort_reason`` 非空 → 在"判断结论"段
   开头第一句声明"⚠️ 本次诊断中途中止：<原因>，证据可能不完整"。
-- 关键 pivot 节点（zabbix_get_host_overview / host_storage_overview /
-  host_kernel_events 等）失败时不能只贴前置节点的证据就下结论——必须告诉用户
+- 关键 pivot 节点（zabbix_get_host_overview / host_storage_overview
+  等）失败时不能只贴前置节点的证据就下结论——必须告诉用户
   缺了什么信息、补什么 skill 能补全。
 
 请只引用 node_states 里 status=done 节点的真实证据，不要编造。

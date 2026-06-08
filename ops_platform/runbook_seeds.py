@@ -12,8 +12,9 @@
 - ``swarm_check_service_health`` / ``swarm_get_failed_tasks`` / ``swarm_get_service_detail``
   / ``swarm_get_service_logs_filter``    →  ``swarm_query`` 配 category/verb
 - ``k8s_list_pods`` / ``k8s_describe_pod`` / ``k8s_get_pod_logs``  →  ``kube_query``
-- ``host_socket_overview`` / ``host_iptables_dump`` / ``host_route_overview``
-  / ``host_kernel_events``                                         →  ``host_query``
+- ``host_socket_overview`` / ``host_iptables_dump`` / ``host_kernel_events`` / ``host_query``
+  / ``host_inspect_container_netns`` / ``host_capture_packets``    →  全删,统一走唯一执行口
+  ``host_run_command``(写 skill,不能进自动 DAG;主机排障改走 runbooks.py 文本剧本)
 """
 
 from __future__ import annotations
@@ -253,63 +254,18 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
     },
 
     # ------------------------------------------------------------------
-    # 网络不通排障（用 host_agent + nsenter）
+    # 主机告警深度健康检查（Zabbix 概览 + 磁盘）
     # ------------------------------------------------------------------
-    {
-        "key": "network_troubleshooting",
-        "title": "网络不通 / 端口连不上 / 丢包",
-        "description": "通过 host_agent + nsenter 在宿主机视角排查网络问题，不依赖 SSH。",
-        "triggers": ["连不上", "ping 不通", "telnet 不通", "端口不通", "网络抖动", "丢包", "DNAT", "iptables"],
-        "inputs": ["node"],
-        "optional_inputs": ["port_filter"],
-        "start_node": "list_nodes",
-        "nodes": {
-            "list_nodes": {
-                "skill": "host_list_nodes",
-                "description": "确认目标 node 上有 agent",
-                "args": {},
-                "edges": [{"target": "sockets"}],
-            },
-            "sockets": {
-                "skill": "host_query",
-                "description": "宿主机视角看监听端口",
-                "args": {"node": "$user.node", "command": "ss -ltnup"},
-                "edges": [{"target": "iptables"}],
-            },
-            "iptables": {
-                "skill": "host_query",
-                "description": "看防火墙是否拦了端口",
-                "args": {"node": "$user.node", "command": "iptables-save",
-                         "probe_port": "$user.port_filter"},
-                "on_error": "skip",
-                "edges": [{"target": "routes"}],
-            },
-            "routes": {
-                "skill": "host_query",
-                "description": "路由表",
-                "args": {"node": "$user.node", "command": "ip route"},
-                "on_error": "skip",
-                "edges": [{"target": "kernel"}],
-            },
-            "kernel": {
-                "skill": "host_kernel_events",
-                "description": "内核事件（看 conntrack table full / drop / NIC 错；自动兼容老节点 dmesg）",
-                "args": {"node": "$user.node", "keyword": "conntrack"},
-                "on_error": "skip",
-            },
-        },
-    },
-
-    # ------------------------------------------------------------------
-    # 主机告警深度健康检查
-    # ------------------------------------------------------------------
+    # 注：原「网络不通排障」「内核事件」DAG 已下线——主机命令统一走 host_run_command
+    # (写 skill,每次弹确认),不能进自动执行的 DAG。这类排障改走 runbooks.py 的
+    # 文本剧本(network_troubleshooting / container_netns_diag / node_health_audit),
+    # 模型读着用 host_run_command 自己跑。
     {
         "key": "host_resource_alert",
         "title": "主机告警深度健康检查",
-        "description": "Zabbix 概览 + 磁盘 + 内核事件三件套，覆盖宿主机绝大部分异常。",
+        "description": "Zabbix 概览 + 磁盘,覆盖宿主机 CPU/内存/可用性/磁盘告警。",
         "triggers": ["主机CPU高", "内存高", "磁盘满", "宕机", "Zabbix 告警", "节点抖动", "Node NotReady"],
         "inputs": ["host_query"],
-        "optional_inputs": ["agent_node"],
         "start_node": "overview",
         "nodes": {
             "overview": {
@@ -320,18 +276,6 @@ DEFAULT_RUNBOOKS: list[dict[str, Any]] = [
             "storage": {
                 "skill": "zabbix_get_host_storage_overview",
                 "args": {"host_query": "$user.host_query"},
-                "on_error": "skip",
-                "edges": [{
-                    "target": "kernel",
-                    "label": "if agent_node provided",
-                    "when": {"type": "field_ne", "path": "$user.agent_node", "value": None},
-                }],
-            },
-            "kernel": {
-                "skill": "host_kernel_events",
-                "description": "Zabbix 看不到的内核层事件（OOM / I/O error / hardware error；自动兼容老节点）",
-                "args": {"node": "$user.agent_node", "keyword": "oom"},
-                "if_when": {"type": "field_ne", "path": "$user.agent_node", "value": None},
                 "on_error": "skip",
             },
         },

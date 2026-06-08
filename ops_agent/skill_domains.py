@@ -34,7 +34,7 @@ from typing import Any
 CORE_SKILLS: frozenset[str] = frozenset({
     "kube_query",                  # k8s 只读一把口（含 verb=logs）
     "swarm_query",                 # swarm 只读一把口
-    "host_query",                  # 主机只读一把口（白名单命令）
+    "host_run_command",            # 主机/容器命令唯一执行口（每次执行弹确认，逃生口）
     "zabbix_get_host_overview",    # 主机监控概览（高频）
     "platform_run_runbook",        # 复合问题编排入口
     "platform_get_runbooks",       # runbook 发现
@@ -52,21 +52,12 @@ SKILL_DOMAINS: dict[str, list[str]] = {
     "k8s_write": [
         "k8s_scale_deployment", "k8s_restart_deployment", "k8s_rollout_undo",
     ],
-    "host_exec": [
-        # 主机命令执行（白名单覆盖不到的）+ 异步任务 + 抓包
-        "host_run_command", "host_run_command_async", "host_capture_packets",
-        "host_check_task", "host_list_tasks", "host_list_nodes",
-    ],
     "monitoring": [
         # zabbix 概览已在 core；这里是监控的"细节"层
         "zabbix_get_host_storage_overview",   # 磁盘各挂载点
         "metric_query",                       # 时序（峰值 / 时刻附近）
         "swarm_cluster_overview",             # swarm 集群级聚合巡检
         "k8s_cluster_overview",               # k8s 集群级聚合巡检
-    ],
-    "network_diag": [
-        "host_inspect_container_netns",
-        "host_kernel_events",
     ],
     "cicd": [
         "jenkins_query",
@@ -81,10 +72,7 @@ SKILL_DOMAINS: dict[str, list[str]] = {
 DOMAIN_DESCRIPTIONS: dict[str, str] = {
     "swarm_write": "Swarm 写操作（扩缩容 / 换镜像 / 强制更新 / 回滚 / 删服务）",
     "k8s_write": "K8s 写操作（扩缩 deployment / 重启 / 回滚）",
-    "host_exec": "主机命令执行（host_run_command 短/长 + 抓包 + 异步任务轮询）——"
-                 "host_query 白名单覆盖不到的命令（docker / virsh 等）走这里",
     "monitoring": "监控细节（磁盘各挂载点 / 指标时序峰值 / 集群级巡检聚合）",
-    "network_diag": "网络/内核深度排查（进容器 netns 看 iptables/路由、从容器网络视角做 DNS/连通性诊断、dmesg 内核事件）",
     "cicd": "Jenkins CI/CD 查询（job / build / console / 队列 / 节点）",
     "alerts": "告警 payload 结构化预分析",
 }
@@ -104,9 +92,9 @@ def load_skills_tool_schema() -> dict[str, Any]:
         "function": {
             "name": "load_skills",
             "description": (
-                "**按需加载某个能力域的工具**。你默认只能看到核心查询口"
-                "（kube_query / swarm_query / host_query / zabbix_get_host_overview）"
-                "+ runbook 入口。需要**写操作 / 监控细节 / 主机命令执行 / CI / 告警分析**等"
+                "**按需加载某个能力域的工具**。你默认只能看到核心口"
+                "（kube_query / swarm_query / host_run_command / zabbix_get_host_overview）"
+                "+ runbook 入口。需要**写操作 / 监控细节 / CI / 告警分析**等"
                 "专科能力时，先调本工具把对应域加载进来，**下一轮**就能调用该域的真实 skill。\n"
                 "可用域：\n" + domain_lines + "\n"
                 "可一次加载多个域：``load_skills(domains=[\"swarm_write\",\"monitoring\"])``。"

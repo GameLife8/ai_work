@@ -65,6 +65,7 @@ def load_skills_from_package(package_name: str, registry: SkillRegistry) -> int:
             enabled=bool(manifest.get("enabled", True)),
             requires_admin_approval=bool(manifest.get("requires_admin_approval", False)),
             confirmation_ttl_seconds=int(manifest.get("confirmation_ttl_seconds", 300)),
+            read_only_params=tuple(manifest.get("read_only_params") or ()),
         )
         registry.register(spec)
         count += 1

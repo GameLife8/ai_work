@@ -167,10 +167,18 @@ class SkillInvoker:
                 code="forbidden",
             )
 
-        if spec.read_only:
+        # 只读 skill,或「只传只读参数」的写 skill(如 host_run_command 只传 task_id =
+        # 查异步任务结果)→ 直接执行,免确认。
+        if spec.read_only or self._is_read_only_invocation(spec, params):
             return self._execute(spec, params, ctx)
         # 写操作：进入两步流程，先生成 pending action
         return self._prepare(spec, params, ctx)
+
+    @staticmethod
+    def _is_read_only_invocation(spec: SkillSpec, params: dict[str, Any]) -> bool:
+        """写 skill 的某些"纯查询"调用免确认:只要命中 ``read_only_params`` 里任一参数。"""
+        ro = getattr(spec, "read_only_params", ()) or ()
+        return any(params.get(p) for p in ro)
 
     # ---------- prepare ----------
 

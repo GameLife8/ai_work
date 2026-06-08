@@ -21,6 +21,9 @@ class SkillSpec:
     enabled: bool = True
     requires_admin_approval: bool = False
     confirmation_ttl_seconds: int = 300
+    # 写 skill 在「只传这些参数」时其实是只读的 → 该次调用免确认直接执行。
+    # 例:host_run_command 只传 ``task_id`` = 查异步任务结果(读),不该弹确认。
+    read_only_params: tuple[str, ...] = ()
     source: str = "python"         # 'python' | 'http' | 'mcp'（future）
     source_id: str | None = None   # http skill 的 DB row id（便于热加载逐条管理）
 

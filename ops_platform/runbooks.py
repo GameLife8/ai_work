@@ -224,39 +224,46 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
         "preface": (
             "问「**某容器里**访问域名 X 解析到哪个 IP / 连不连得通 Y」时,要进**那个容器自己的"
             "网络 namespace** 跑命令(宿主机的 DNS/路由跟容器可能不一样,直接在宿主机跑会得到错的答案)。"
-            "全程 ``host_run_command``,三步:**定位节点 → 拿容器宿主机 PID → nsenter 进它的 netns**。"
+            "全程 ``host_run_command``,两步:**定位节点 → 在该节点上 filter 拿容器 PID 再 nsenter**。\n"
+            "**⚠️ Swarm 容器名的坑(最容易栽)**:真实容器名是 ``<服务>.<副本>.<任务ID>``"
+            "(如 ``dm_prod_sws_bas_prod.1.wgvv0qyk7a4jh3mnbee5bf1o1``),而 ``docker service ps`` 给的是"
+            "**任务名** ``<服务>.<副本>``(没有 .任务ID)。**绝不能拿任务名直接 ``docker inspect``** ——"
+            "inspect 只认精确名 / ID 前缀,**不认名字前缀**,会报 ``No such object``。必须用 "
+            "``docker ps --filter name=``(支持名字子串匹配)先拿到真实容器 ID。"
         ),
         "steps": [
             {
                 "skill": "host_run_command",
                 "args_hint": (
                     "Swarm: node=<任意管理节点>, command=\"docker service ps <服务名> "
-                    "--filter desired-state=running --format '{{.Node}} {{.Name}}'\";"
+                    "--filter desired-state=running --format '{{.Node}}'\" 看跑在哪个/哪些节点;"
                     "K8s: command='kubectl get pod <pod> -o wide' 看 NODE 列"
                 ),
-                "why": "**先定位容器在哪个节点**——Swarm 容器名是 ``服务名.序号.任务ID``,常跑在 worker;"
-                       "只在管理节点 ``docker ps`` 找不到就放弃 = 典型错误",
+                "why": "**先定位容器在哪个节点**——Swarm 容器常跑在 worker,不在管理节点",
             },
             {
                 "skill": "host_run_command",
                 "args_hint": (
-                    "Swarm: node=<上一步的节点>, command=\"docker inspect -f '{{.State.Pid}}' "
-                    "<完整容器名或ID前缀>\";K8s(containerd): "
-                    "command=\"crictl inspect --output go-template --template '{{.info.pid}}' "
-                    "$(crictl ps -q --name <容器名片段> | head -1)\""
+                    "**到上一步的节点上,一条命令搞定「拿 PID + 进 netns」**(末尾命令随意换 getent/nc/curl/cat):\n"
+                    "Swarm: node=<那个节点>, command=\"PID=$(docker inspect -f '{{.State.Pid}}' "
+                    "$(docker ps -q --filter name=<服务>.<副本> | head -1)); echo PID=$PID; "
+                    "nsenter -t $PID -n getent hosts oss.chinasws.com\"\n"
+                    "K8s(containerd): node=<那个节点>, command=\"PID=$(crictl inspect --output go-template "
+                    "--template '{{.info.pid}}' $(crictl ps -q --name <容器名片段> | head -1)); "
+                    "echo PID=$PID; nsenter -t $PID -n getent hosts oss.chinasws.com\""
                 ),
-                "why": "拿容器的**宿主机 PID**——进它 namespace 的钥匙",
-            },
-            {
-                "skill": "host_run_command",
-                "args_hint": (
-                    "node=<同上>, command='nsenter -t <PID> -n getent hosts oss.chinasws.com'"
-                    "(解析到哪个 IP);连通性 command='nsenter -t <PID> -n nc -zv 10.0.0.5 5432'"
+                "why": (
+                    "``docker ps --filter name=`` / ``crictl ps --name`` 都按名字**子串**匹配,能命中带 "
+                    ".任务ID 后缀的真名 → 拿容器 ID → inspect 出宿主机 PID → ``nsenter -t $PID -n`` 进容器"
+                    "**网络** namespace 跑命令。工具用宿主机的(getent/nslookup/nc/curl),没装就换一个"
+                    "(``getent hosts`` ≈ nslookup)。"
                 ),
-                "why": "``nsenter -t <PID> -n`` 进容器**网络** namespace——这才是容器自己的 DNS/路由视角。"
-                       "工具用宿主机的(getent/nslookup/nc/curl),宿主机没装就换一个(``getent hosts`` ≈ nslookup)。",
-                "tip": "想看容器自己的 resolv.conf,加 ``-m`` 进它 mount namespace:"
-                       "``nsenter -t <PID> -n -m cat /etc/resolv.conf``",
+                "tip": (
+                    "① 看容器自己的 resolv.conf:加 ``-m`` 进 mount namespace —— "
+                    "``nsenter -t $PID -n -m cat /etc/resolv.conf``;"
+                    "② 连通性:把 ``getent hosts <域名>`` 换成 ``nc -zv <ip> <port>``;"
+                    "③ 副本号 >9 的服务,给 filter 末尾加个点锚定(``name=<服务>.<副本>.``)避免 .1 误匹配 .10"
+                ),
             },
         ],
         "stop_when": "已拿到容器网络视角下的解析结果 / 连通性结论 + 证据(IP / nc 返回)",

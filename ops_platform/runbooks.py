@@ -244,25 +244,34 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
             {
                 "skill": "host_run_command",
                 "args_hint": (
-                    "**到上一步的节点上,一条命令搞定「拿 PID + 进 netns」**(末尾命令随意换 getent/nc/curl/cat):\n"
-                    "Swarm: node=<那个节点>, command=\"PID=$(docker inspect -f '{{.State.Pid}}' "
-                    "$(docker ps -q --filter name=<服务>.<副本> | head -1)); echo PID=$PID; "
-                    "nsenter -t $PID -n getent hosts oss.chinasws.com\"\n"
-                    "K8s(containerd): node=<那个节点>, command=\"PID=$(crictl inspect --output go-template "
-                    "--template '{{.info.pid}}' $(crictl ps -q --pod $(crictl pods -q --name <Pod名> | head -1) | head -1)); "
-                    "echo PID=$PID; nsenter -t $PID -n getent hosts oss.chinasws.com\""
+                    "**到上一步的节点上,把下面整条串成一个 command(用 ; 连接)传给 host_run_command**:"
+                    "拿 PID → 读容器**真实** nameserver → **每个探测都 timeout 包住**。把 <域名> 换成目标。\n"
+                    "① 拿 PID(按集群选一行):\n"
+                    "   Swarm: PID=$(docker inspect -f '{{.State.Pid}}' $(docker ps -q --filter name=<服务>.<副本> | head -1))\n"
+                    "   K8s:   PID=$(crictl inspect -o go-template --template '{{.info.pid}}' $(crictl ps -q --pod $(crictl pods -q --name <Pod名> | head -1) | head -1))\n"
+                    "② 读容器自己的 DNS 服务器(/proc,distroless 没 cat 也能读):\n"
+                    "   NS=$(awk '/^nameserver/{print $2;exit}' /proc/$PID/root/etc/resolv.conf); echo PID=$PID DNS=$NS\n"
+                    "③ 探测(都 timeout 包住;**主力用 getent**——宿主机一定有,nslookup/dig 不一定):\n"
+                    "   timeout 8 nsenter -t $PID -n getent hosts <域名>; echo getent_rc=$?     # 解析到哪个 IP\n"
+                    "   timeout 8 nsenter -t $PID -n nslookup <域名> $NS 2>&1 | tail -3         # getent 没结果时补失败原因\n"
+                    "   timeout 6 nsenter -t $PID -n nc -zv -w3 <域名> 443 2>&1                 # 连通性"
                 ),
                 "why": (
-                    "``docker ps --filter name=`` / ``crictl ps --name`` 都按名字**子串**匹配,能命中带 "
-                    ".任务ID 后缀的真名 → 拿容器 ID → inspect 出宿主机 PID → ``nsenter -t $PID -n`` 进容器"
-                    "**网络** namespace 跑命令。工具用宿主机的(getent/nslookup/nc/curl),没装就换一个"
-                    "(``getent hosts`` ≈ nslookup)。"
+                    "三个稳定点缺一不可:① **PID 解析**用 ``docker ps --filter`` / ``crictl pods --name → "
+                    "ps --pod``(子串匹配,命中带 .任务ID/Pod 后缀的真名);② **每个网络探测都 ``timeout`` 包住**"
+                    "——撞上死 DNS,getent 会卡满 resolv.conf 的 timeout、nslookup 会一直重试,不兜就拖到 "
+                    "host_run_command 的 60s 黑盒超时;③ 命令跑在**宿主机 namespace**(host_run_command 已 "
+                    "``nsenter -t 1``),所以工具是**宿主机的**——**``getent`` 一定有(glibc),``nslookup``/"
+                    "``dig`` 看节点装没装**(不少节点没有)。所以**主力 getent 拿 IP**,nslookup 只在 getent "
+                    "没结果时补失败原因。"
                 ),
                 "tip": (
-                    "① 看容器自己的 resolv.conf:加 ``-m`` 进 mount namespace —— "
-                    "``nsenter -t $PID -n -m cat /etc/resolv.conf``;"
-                    "② 连通性:把 ``getent hosts <域名>`` 换成 ``nc -zv <ip> <port>``;"
-                    "③ 副本号 >9 的服务,给 filter 末尾加个点锚定(``name=<服务>.<副本>.``)避免 .1 误匹配 .10"
+                    "① ``getent`` 返回 IP = 答案;``getent_rc=124``(超时)+ nslookup 报 ``communications error "
+                    "to $NS timed out`` = 「该节点到 DNS ``$NS:53`` 不通,解析不了」(常见于锁 egress 的 master)"
+                    "—— **这就是结论,别说「未能完成」**;② 宿主机连 nslookup 都没有时,靠 ``/proc`` 读到的 "
+                    "``$NS`` + getent 超时也能下结论「DNS ``$NS`` 不可达」;③ hostNetwork Pod(etcd/kube-* 等)"
+                    "netns = 宿主机,结果即宿主机视角;④ 副本号 >9 的服务给 filter 末尾加点"
+                    "(``name=<服务>.<副本>.``)避免 .1 误匹配 .10"
                 ),
             },
         ],
@@ -333,9 +342,22 @@ GENERAL_GUIDANCE = {
         "每个节点的特权 agent 容器(mode:global / DaemonSet)。"
         "如果 host_run_command 报该 node 没有 agent,说明 agent 还没部署,参考 docs/host-agent.md。"
     ),
+    "network_probe_rule": (
+        "**网络探测(DNS / 连通性 / 抓包)天生会卡——一律用 ``timeout N`` 包住每一条**"
+        "(如 ``timeout 5 nsenter -t $PID -n nslookup a.com $NS`` / ``timeout 5 nc -zv -w3 h p`` / "
+        "``timeout 20 tcpdump ... -c 200``),**绝不让单条裸命令拖到 host_run_command 的 60s 同步上限**"
+        "黑盒超时(那只会回个没营养的「command timeout after 60s」)。\n"
+        "**一个工具超时/不存在就换下一个**:DNS ``getent hosts → nslookup → dig``(命令跑在宿主机"
+        "namespace,``getent`` 一定有、nslookup/dig 不一定);连通性 "
+        "``nc -zv → curl -sk → bash -c 'echo>/dev/tcp/h/p'``。**不断换招重试,逼近一个明确结论**——"
+        "要么「解析到 X.X.X.X / 端口通」,要么「DNS 服务器 Y:53 超时 → 解析不通(常见于节点锁 egress)」。"
+        "**超时本身就是结论的一部分**(一定带上是哪个服务器 / 哪个端口超时),"
+        "**严禁用「未能完成 / 需要进一步排查吗」这种话草草收尾**——那是没干活。"
+    ),
     "stop_conditions": [
         "已经能给出 当前状态 + 检测过程 + 关键证据 + 判断结论 + 建议操作",
-        "已重试同一 skill ≥ 2 次仍然没新信息（避免死循环）",
+        "已重试**同一条**命令 ≥ 2 次仍无新信息才停;**换不同探测 / 工具 / 参数不算重复**,"
+        "鼓励换招逼近结论(尤其网络探测,见 network_probe_rule——超时就换招,别放弃)",
         "进入写操作 needs_confirmation 流程后立即停止 tool 循环，等待用户确认",
     ],
 }

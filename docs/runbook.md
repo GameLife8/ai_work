@@ -233,16 +233,19 @@ DAG 加载时跑 DFS 染色法找环，发现立即拒绝并报错路径 `a → 
 
 ## 7. 默认出厂剧本
 
-平台首启时往 `platform_runbook` 表 seed 4 条（详见 [`runbook_seeds.py`](../ops_platform/runbook_seeds.py)）：
+平台首启时往 `platform_runbook` 表 seed 5 条**可执行 DAG**（详见 [`runbook_seeds.py`](../ops_platform/runbook_seeds.py)）：
 
-| key | 触发 | 节点数 | 关键 pivot |
+| key | 触发 | 节点 | 关键 pivot |
 |---|---|---|---|
-| `swarm_service_not_starting` | 起不来 / 不停重启 / CrashLoop | 7 | OOM/磁盘/镜像三向 pivot |
-| `k8s_pod_crashloop` | CrashLoopBackOff / OOMKilled / Evicted | 6 | 信号驱动 host_overview / host_storage |
-| `network_troubleshooting` | 连不上 / 丢包 / iptables | 5 | host_agent + nsenter 全套 |
-| `host_resource_alert` | 主机CPU高 / 内存高 / 磁盘满 | 3 | 跨 Zabbix → 内核事件 |
+| `swarm_service_not_starting` | 起不来 / 不停重启 / CrashLoop | swarm_query | OOM/磁盘/镜像三向 pivot |
+| `k8s_pod_crashloop` | CrashLoopBackOff / OOMKilled / Evicted | kube_query | 信号驱动 host_overview / host_storage |
+| `host_resource_alert` | 主机CPU高 / 内存高 / 磁盘满 | zabbix | 概览 + 磁盘各挂载点 |
+| `cluster_health_audit_swarm` | swarm 巡检 / 集群体检 | swarm_cluster_overview | 一把口聚合（节点+服务+监控） |
+| `cluster_health_audit_k8s` | k8s 巡检 / 集群体检 | k8s_cluster_overview | 一把口聚合（节点+异常 pod+监控） |
 
 **admin 改过的剧本不会被 seed 覆盖**——只在表为空时 seed。
+
+> **可执行 DAG 只能编排只读 skill**——写 skill（`host_run_command` 等）一旦泄进自动执行，引擎会硬拦（见 [`runbook_engine.py`](../ops_platform/runbook_engine.py) `needs_confirmation` 检查）。所以「进容器 `nsenter` 做 DNS/连通性诊断」这类必须走 `host_run_command`(写) 的场景**不做成 DAG**，而是写成**文本剧本**（`container_netns_diag` / `network_troubleshooting` / `node_health_audit`，在 [`ops_platform/runbooks.py`](../ops_platform/runbooks.py)），由 `platform_get_runbooks` 返回，模型读着用 `host_run_command` 自己一步步跑。
 
 ---
 

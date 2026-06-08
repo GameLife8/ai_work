@@ -6,14 +6,16 @@
 #
 # 改动后 **必须重启 agent 容器** 才能生效（agent 启动时一次性加载，不做 inotify 监听）。
 #
-# 设计原则
+# 设计原则（大道至简后）
 # --------
-# - **只允许"取证型"命令**——读 socket / 路由 / iptables / dmesg / proc 等。
-# - **不允许写操作**（``iptables -A`` / ``ip route add`` / ``echo > /proc/sysrq-trigger``）。
-#   写操作如果业务真需要，应该走平台的 ``host_run_command`` skill（带 admin 审批）。
-# - **不允许 curl / wget / nc** —— 防止集群内 SSRF / 数据外泄。需要的话明确知会 admin。
-# - **不允许 nsenter / unshare** —— agent 会自动包 ``nsenter -t 1``，再让调用方传
-#   这俩等于让 sandbox 形同虚设。
+# - 下面列了一批取证型只读命令（ss / ip / iptables-save / dmesg / cat / dig / getent /
+#   crictl…），**但真正决定"能跑什么"的是文件末尾的 ``sh`` / ``bash``**：``host_run_command``
+#   始终以 ``sh -c <命令>`` 调 agent，所以模型给的任意命令（含写操作 / curl / nc / 嵌套
+#   nsenter）都经 ``sh`` 放行。
+# - **真正的安全边界是平台侧的「每次执行弹确认」（当前会话用户审批）+ 全量审计**，不是这份
+#   白名单。与其在 agent 维护一份永远追不全的黑/白名单，不如让审批人对每条命令负责。
+# - 除 ``sh`` / ``bash`` 外的条目如今基本是历史遗留：早期那批直接传 ss/ip/dmesg（不经 sh）的
+#   read-only host skill 已删；保留这些条目无害，模型把它们写在 ``sh -c`` 串里执行。
 
 read_only:
   # 网络 socket / 路由 / 接口

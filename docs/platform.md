@@ -118,9 +118,8 @@ agent 在 tool 循环里看到信号 → 自动渲染中文 hint 注入下一轮
 模型路由到对应 skill 的概率显著上升。在 runbook 引擎里，signals 还能直接驱动条件分支
 （`when: {type: has_signal, signal_type: oom_kill}`）。
 
-**已发信号的 skill**：
-`swarm_get_failed_tasks` / `swarm_check_service_health` / `swarm_get_service_logs_filter`
-/ `k8s_describe_pod` / `k8s_list_pods` / `host_kernel_events` / `host_socket_overview`
+**会被 scanner 扫描发信号的 skill**：
+`swarm_query`（失败任务扫 OOM / no_space / 镜像拉取失败）· `kube_query`（pod 扫 CrashLoop / ImagePull / Evicted / OOM）
 
 ### Tool-loop Digest：压缩 invoker 输出
 
@@ -147,21 +146,26 @@ skills/
 
 启动时 [`ops_platform/loader.py`](../ops_platform/loader.py) 扫描整个目录，按 manifest 注册。**新增 skill 零代码改动**：建一个目录，里头是 manifest + 一个 `run` 函数。
 
-### 当前 27 个 skill（按类别）
+### 当前 20 个 skill（按类别）
 
-设计哲学是**少而精的"通用一把口"**——不给每种资源建独立 skill，而是 `kube_query` /
-`swarm_query` / `host_query` 三把通用查询口用 `verb`/`category` 组合覆盖几十种 kubectl /
-docker / shell 命令。这样模型不用记一堆 skill 名，工具集也小。
+设计哲学是**大道至简**——只读查询留**两把口**（`kube_query` / `swarm_query`），而**所有
+节点命令**（主机层 ss/ip/iptables/dmesg、`nsenter` 进容器、Swarm/K8s 的 docker/kubectl
+写操作、临时取证）统一走**唯一执行口 `host_run_command`**：模型给什么 shell 命令就执行
+什么（代码不拼接、不限制），**每次执行弹确认**，平台按 `node` 自动路由到所属集群。
+
+> 原来的 `host_query` / `host_inspect_container_netns` / `host_kernel_events` /
+> `host_capture_packets` / `host_run_command_async` / `host_list_*` 已全删——统统用
+> `host_run_command` 跑命令；「进容器 netns 做 DNS/连通性诊断」的 nsenter 套路写进了
+> `container_netns_diag` runbook 让模型学（见 [runbook.md](runbook.md)）。
 
 | 分类 | skill |
 |---|---|
-| **通用查询（三把口）** | `kube_query`（k8s get/describe/logs/top/events…，含 verb=logs）· `swarm_query`（docker service/node/task/stack…）· `host_query`（白名单 shell：ss/ip/df/ps/dmesg…）|
+| **只读查询（两把口）** | `kube_query`（k8s get/describe/logs/top/events…，含 verb=logs）· `swarm_query`（docker service/node/task/stack…）|
+| **命令执行（唯一口）** | **`host_run_command`**(admin) —— 节点上**任意**命令（主机层 / `nsenter` 进容器），不拼接不限制、每次弹确认、按 `node` 自动路由集群；长命令传 `max_runtime_sec` 走异步、回传 `task_id` 轮询（**轮询免确认**，靠 manifest 的 `read_only_params`）|
 | swarm 写 | **swarm_scale_service** · **swarm_update_service_image** · **swarm_force_update_service** · **swarm_rollback_service** · **swarm_remove_service**(admin) |
 | 集群巡检聚合 | `swarm_cluster_overview`（swarm：节点+服务+监控）· `k8s_cluster_overview`（k8s：节点+异常 pod+副本不匹配 deploy+监控）。配 `cluster_health_audit_swarm` / `cluster_health_audit_k8s` runbook，**agent 按用户点名的集群类型自动选对应 runbook**（说 codewave→k8s，说 sws-swarm→swarm）|
 | k8s 写 | **k8s_scale_deployment** · **k8s_restart_deployment** · **k8s_rollout_undo** |
 | 监控 | `zabbix_get_host_overview` · `zabbix_get_host_storage_overview` · `metric_query`（时序：mode=peak 找峰值 / mode=window 取时刻附近）|
-| 主机执行 | **host_run_command**(admin) · **host_run_command_async**(admin，长命令 hybrid 同步/异步) · **host_capture_packets**(admin) · `host_check_task` · `host_list_tasks` · `host_list_nodes` |
-| 网络/内核 | `host_inspect_container_netns`（进容器 netns 看 iptables）· `host_kernel_events`（dmesg + 老节点兼容）|
 | CI/CD | `jenkins_query`（job/build/console/queue/node）|
 | 告警 | `alerts_analyze_payload` |
 | 编排入口 | `platform_get_runbooks` · `platform_run_runbook` |
@@ -360,7 +364,7 @@ DB 默认 TiDB（MySQL 兼容）；本地调试可设 `STORE_BACKEND=memory`，�
 - `platform_prompt_segment` — 5 段 system prompt（admin 后台可编辑、热加载）
 - `platform_runbook` — 图执行剧本定义
 - `platform_runbook_execution` — 每次 runbook 执行的完整轨迹（节点状态 + 信号 + 报告）
-- `platform_async_task` — 异步长命令任务（host_run_command_async）
+- `platform_async_task` — 异步长命令任务（`host_run_command` 传 max_runtime_sec 提交）
 
 ### 并发安全：bootstrap 双重检查锁
 首启空库时，多 chainlit worker / 多容器并发跑 `ensure_bootstrap` 会各自 check-then-act 都看到空 →

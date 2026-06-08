@@ -36,18 +36,18 @@
 
 ## 2. 它能查什么
 
-部署 agent 后，平台多出 8 个 host_* skill：
+部署 agent 后，平台多出**唯一一个** host skill —— `host_run_command`（大道至简）：
 
 | skill code | 类型 | 干啥 |
 |---|---|---|
-| `host_list_nodes` | 读 | 列出已部署 agent 的节点；**先调它拿到 node 名** |
-| `host_socket_overview` | 读 | `ss -tunlp` 宿主机所有监听端口 |
-| `host_iptables_dump` | 读 | iptables-save / nft list ruleset / ipvsadm |
-| `host_route_overview` | 读 | `ip a` + `ip route` + `ip rule` + `ip netns` |
-| `host_kernel_events` | 读 | `dmesg` + 关键词过滤（OOM / conntrack / I/O error 等） |
-| `host_inspect_container_netns` | 读 | 给定容器名，进它自己的网络 namespace 查 socket / 路由 |
-| `host_capture_packets` | **写** | `tcpdump` 抓包 N 秒；进入二次确认流 |
-| `host_run_command` | **写**（admin 审批） | 任意（白名单内）命令逃生口；只有 admin 能确认 |
+| `host_run_command` | **写**（每次弹确认，当前会话用户审批） | 在指定 `node` 上执行**任意** shell 命令（主机层 ss/ip/iptables/dmesg/df…，或 `nsenter` 进容器）。**代码不拼接、不限制、不封装**——模型给什么跑什么；平台按 `node` **自动路由**到所属集群（`find_host_agent_for_node`）；长命令传 `max_runtime_sec` 走异步 `/v1/exec_async`、回传 `task_id` 轮询（**轮询免确认**）|
+
+> 早期版本有一堆 `host_query` / `host_socket_overview` / `host_iptables_dump` /
+> `host_route_overview` / `host_kernel_events` / `host_inspect_container_netns` /
+> `host_capture_packets` / `host_list_*` / `host_run_command_async` —— **已全部删除**，
+> 合并进 `host_run_command`：看监听端口就 `command='ss -ltnup'`、看防火墙就
+> `command='iptables-save'`、内核事件就 `command='dmesg -T | grep -i oom'`、进容器
+> netns 做 DNS/连通性诊断见 `container_netns_diag` runbook（[runbook.md](runbook.md)）。
 
 ---
 
@@ -128,13 +128,11 @@ data: {"exit_code":0,"duration_ms":30001,"timeout":false}
 
 `/etc/ai-ops-agent/allowed.yml` 在镜像里就内置；可读：[`agent/allowed.yml`](../agent/allowed.yml)。
 
-默认放行的全是**取证型只读命令**：`ss / ip / iptables-save / nft / dmesg / lsof / ps / cat / tcpdump / dig / nslookup` 等。
+白名单里有一批取证型只读命令（`ss / ip / iptables-save / nft / dmesg / lsof / ps / cat / df / du / dig / nslookup / getent / crictl …`），**还有 `sh` / `bash`** —— 这条最关键：`host_run_command` 始终以 `sh -c <命令>` 调 agent，**只要 `sh` 在白名单，模型给的任意命令（含 `nc` / `curl` / 写操作 / 嵌套 `nsenter`）都能跑**。
 
-**不放行**的（即便业务需要也不能直接走 agent）：
-
-- 任何写操作（`iptables -A` / `ip route add` / `echo > /proc/sysrq-trigger`）—— 这些走平台的 `host_run_command` skill，强制 admin 审批 + 走 needs_confirmation 流。
-- `curl / wget / nc` —— 防集群内 SSRF 和数据外泄。
-- `nsenter / unshare` —— agent 自己会包一层 nsenter，禁止调用方手动塞防绕过。
+> **真正的安全边界是平台侧的「每次执行弹确认」（当前会话用户点允许/拒绝）+ 全量审计，不是 agent 白名单。** 这是大道至简的有意取舍：与其在 agent 维护一份永远追不全的命令黑/白名单，不如让审批人对每条命令负责。`curl/wget/nc/nsenter` 历史上单列在「不放行」是 v1 时代的约束，现在都经 `sh -c` 放行、靠确认兜底。
+>
+> 早期那批直接传 `ss`/`ip`/`dmesg`（不经 `sh`）的 read-only host skill 已删——所以白名单里除 `sh`/`bash` 外的条目如今基本是历史遗留：模型把它们写在 `sh -c` 串里执行，不再被 agent 单独校验。`docker` 不在白名单（同样经 `sh -c` 跑）。
 
 白名单改动**必须重启 agent 容器**才能生效（启动时一次性加载）。
 
@@ -277,12 +275,16 @@ curl -N -H "Authorization: Bearer devtoken" -H "Content-Type: application/json" 
 
 注意：`sh` 不在白名单里，所以这条 dev 例子会 403。要本地测，临时往 `agent/allowed.yml` 加 `- sh`。
 
-### 6.3 K8s containerd 集群的 crictl 缺失
+### 6.3 K8s containerd 集群的 crictl
 
-alpine 默认源没有 crictl 包。如要 `host_inspect_container_netns` 在 containerd 集群可用，两条路：
+alpine 默认源没有 crictl 包，所以 `Dockerfile.agent` 里**已内置**：build 期从镜像站下 crictl
+静态 binary（`ARG CRICTL_MIRROR` 可换源/直连 GitHub）。crictl 读 `CONTAINER_RUNTIME_ENDPOINT`
+环境变量连 containerd.sock（`deploy/ai-ops-agent-k8s.yaml` 已设该 env + 挂
+`/run/containerd/containerd.sock`）。
 
-1. 在 `Dockerfile.agent` 末尾加一行从 GitHub releases 下 crictl 静态 binary（需要 build 期能联外网）。
-2. K8s DaemonSet 加 initContainer 启动时拉 crictl 装到 emptyDir 共享卷。
+containerd 集群进容器 netns：模型用 `host_run_command` 跑
+`crictl pods -q --name <Pod名>` → `crictl ps -q --pod <PodID>` → `crictl inspect …` 拿宿主机
+PID，再 `nsenter -t <PID> -n …`（完整套路见 `container_netns_diag` runbook）。
 
 ---
 

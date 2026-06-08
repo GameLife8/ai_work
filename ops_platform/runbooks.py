@@ -249,7 +249,7 @@ RUNBOOKS: dict[str, dict[str, Any]] = {
                     "$(docker ps -q --filter name=<服务>.<副本> | head -1)); echo PID=$PID; "
                     "nsenter -t $PID -n getent hosts oss.chinasws.com\"\n"
                     "K8s(containerd): node=<那个节点>, command=\"PID=$(crictl inspect --output go-template "
-                    "--template '{{.info.pid}}' $(crictl ps -q --name <容器名片段> | head -1)); "
+                    "--template '{{.info.pid}}' $(crictl ps -q --pod $(crictl pods -q --name <Pod名> | head -1) | head -1)); "
                     "echo PID=$PID; nsenter -t $PID -n getent hosts oss.chinasws.com\""
                 ),
                 "why": (

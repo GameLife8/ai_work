@@ -28,20 +28,15 @@ MANIFEST = {
     "code": "swarm_query",
     "name": "Swarm 通用查询",
     "description": (
-        "**Swarm 只读查询的唯一入口**——任意 ``docker <category> <verb>``。"
-        "示例："
-        "  - 列所有服务：``category=service, verb=ls``"
-        "  - 服务详情：``category=service, verb=inspect, name=mysvc``"
-        "  - 失败任务：``category=service, verb=ps, name=mysvc, filters={'desired-state':'failed'}``"
-        "  - 服务日志（带关键字过滤）：``category=service, verb=logs, name=mysvc, filters={'grep':'error','tail':500}``"
-        "  - 列节点：``category=node, verb=ls``  /  节点详情：``category=node, verb=inspect, name=hostA``"
-        "  - 看 stack：``category=stack, verb=ls`` / ``category=stack, verb=services, name=ai-ops``"
-        "**关于 stack 原始 compose.yml**：Docker Swarm **不保存**用户 ``docker stack deploy`` 时用的"
-        "compose.yml 原文——部署后只剩翻译过的 Service Spec。所以"
-        "**用户问 'stack 原始配置 / compose.yml'** 时，最接近的能拿到的是 ``service inspect`` 的输出，"
-        "本 skill 在返回里会**附一段 compose 风格的 YAML 重建**（``compose_yaml`` 字段），那是从 Spec 反推出来的、"
-        "**用户最熟悉的格式**——优先贴这段。明确告诉用户「Swarm 不存原始 compose.yml，下面是从运行时配置反推的等价 YAML」。"
-        "**写操作请走专用 skill**（swarm_scale_service / swarm_update_service_image / swarm_rollback_service / swarm_remove_service）。"
+        "**Swarm 只读查询的唯一入口**——任意 ``docker <category> <verb>``。示例：\n"
+        "  - 列服务 ``category=service, verb=ls``；详情 ``verb=inspect, name=mysvc``\n"
+        "  - 失败任务 ``verb=ps, name=mysvc, filters={'desired-state':'failed'}``\n"
+        "  - 服务日志 ``verb=logs, name=mysvc, filters={'grep':'error','tail':500}``\n"
+        "  - 节点 ``category=node, verb=ls/inspect``；stack ``category=stack, verb=ls/services``\n"
+        "注：Swarm 不存原始 compose.yml，问『stack 配置 / compose』时返回里有从 Spec 反推的 "
+        "``compose_yaml`` 字段（优先贴，并说明是反推的等价 YAML）。"
+        "**写操作请走专用 skill**（swarm_scale_service / swarm_update_service_image / "
+        "swarm_rollback_service / swarm_remove_service）。"
     ),
     "category": "swarm",
     "required_connection_type": "swarm",

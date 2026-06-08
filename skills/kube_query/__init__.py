@@ -62,20 +62,14 @@ MANIFEST = {
     "code": "kube_query",
     "name": "K8s 通用查询",
     "description": (
-        "**K8s 只读查询的唯一入口**——任意 ``kubectl get/describe/logs/top/api-resources/explain/events``。"
-        "示例："
-        "  - 看 pod 列表：``verb=get, resource=pods, namespace=default``"
-        "  - 看 pod 详情：``verb=describe, resource=pod, name=xxx``"
-        "  - 看 coredns 配置：``verb=get, resource=configmap, name=coredns, namespace=kube-system``"
-        "  - 看 logs：``verb=logs, name=xxx``（含 container/tail/since）。"
-        "    **CrashLoopBackOff 必须带 ``previous=True``**——否则只看到刚重启还没崩的日志；"
-        "    多容器 pod 必须用 ``container`` 指定，否则可能拉到不相关 sidecar；"
-        "    日志正常但 pod 仍异常 → 回去 ``verb=describe`` 看系统层（OOM/调度/资源）。"
-        "  - 看节点资源占用：``verb=top, resource=nodes``"
-        "  - 探索集群有哪些资源类型：``verb=api-resources``"
+        "**K8s 只读查询的唯一入口**——任意 ``kubectl get/describe/logs/top/api-resources/events``。示例：\n"
+        "  - pod 列表 ``verb=get, resource=pods, namespace=default``；详情 ``verb=describe, resource=pod, name=xxx``\n"
+        "  - 配置 ``verb=get, resource=configmap, name=coredns, namespace=kube-system``\n"
+        "  - 日志 ``verb=logs, name=xxx``（**CrashLoopBackOff 必须带 ``previous=True``**；多容器用 ``container`` 指定）\n"
+        "  - 节点占用 ``verb=top, resource=nodes``；资源类型 ``verb=api-resources``\n"
+        "日志正常但 pod 仍异常 → 回 ``verb=describe`` 看系统层（OOM/调度/资源）。"
         "**写操作请走专用 skill**（k8s_scale_deployment / k8s_restart_deployment / k8s_rollout_undo）；"
-        "**进容器执行命令**目前未提供——若真的需要看容器内文件，先 ``verb=get, resource=configmap`` 看挂载的 ConfigMap，"
-        "或通过 host_run_command（admin 审批）+ ``kubectl exec`` 兜底。"
+        "看容器内文件优先 ``verb=get, resource=configmap`` 看挂载的 ConfigMap。"
     ),
     "category": "k8s",
     "required_connection_type": "k8s",

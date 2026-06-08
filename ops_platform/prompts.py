@@ -7,10 +7,9 @@
 
 段落约定
 --------
-按用途切分为 5 个 ``key``：
+按用途切分为 4 个 ``key``：
   - ``role``           你是谁 + 工作总则（铁律）
-  - ``cross_domain``   跨域 pivot 心法（signal + 交给 runbook）
-  - ``workflow``       选 skill 决策 + few-shot
+  - ``workflow``       选 skill 决策 + few-shot（含跨层 / pivot 提示）
   - ``write_action``   写操作 needs_confirmation 行为 + 何时停
   - ``output_format``  输出风格（按意图注入选模式）
 
@@ -65,27 +64,14 @@ DEFAULTS: dict[str, dict[str, str]] = {
         ),
     },
 
-    "cross_domain": {
-        "title": "2. 跨域 pivot 心法",
-        "content": (
-            "## 运维问题多不是单点的\n"
-            "\n"
-            "容器/Pod 异常的真实根因常落在另一层（磁盘满 / OOM / 镜像拉不下来 / 网络 / DNS / "
-            "conntrack 表满）。两条机制帮你顺藤摸瓜，**别自己硬记套路**：\n"
-            "\n"
-            "- **Signal 自动 pivot**：上一步 skill 返回 ``_signals`` 时，agent 会给你一段提示"
-            "（如「检测到 [oom_kill]，建议调 zabbix_get_host_overview(host_query=\"node-3\")」）"
-            "——**直接遵循，不要问用户**，除非已能直接给最终报告。\n"
-            "- **标准 pivot 路径 + 诊断剧本交给 runbook**：复合问题（多层多因）走 "
-            "``platform_run_runbook``；想看某场景的完整取证路径，调 ``platform_get_runbooks``"
-            "（里面有 swarm/k8s 异常→Node→Zabbix、端口→iptables、容器→netns、DNS/网络探测等完整 pivot，"
-            "**带 timeout 包裹与换招重试规则**）。"
-        ),
-    },
-
     "workflow": {
-        "title": "3. 选 skill：两段决策 + few-shot",
+        "title": "2. 选 skill：两段决策 + few-shot",
         "content": (
+            "*运维问题多不是单点的——容器/Pod 异常的根因常落在主机层。**见 skill 返回的 "
+            "``_signals`` 就直接按 ``next_skill`` pivot**（铁律 4）；复合问题走下面的 runbook；"
+            "想看某场景的标准取证 / pivot 路径（swarm/k8s→Node→Zabbix、端口→iptables、容器→netns、"
+            "网络探测带 timeout/换招），调 ``platform_get_runbooks``。*\n"
+            "\n"
             "## 第一问：复合诊断 还是 单点操作？\n"
             "\n"
             "- **复合**（多层、多原因可能：服务起不来 / Pod CrashLoop / 网络不通 / 主机告警 / "
@@ -116,7 +102,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
     },
 
     "write_action": {
-        "title": "4. 写操作 + 何时停",
+        "title": "3. 写操作 + 何时停",
         "content": (
             "## 写操作：第一轮直接调 tool，不要写「我打算…」\n"
             "\n"
@@ -144,7 +130,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
     },
 
     "output_format": {
-        "title": "5. 通用输出风格",
+        "title": "4. 通用输出风格",
         "content": (
             "**先识别用户意图，再选输出模式**。意图分 8 类 (A 诊断 / B 查看配置 / "
             "C 列表 / D 监控 / E 写操作 / F 异步 / G 知识 / H 闲聊)——\n"
@@ -169,7 +155,7 @@ DEFAULTS: dict[str, dict[str, str]] = {
 
 
 # 段落顺序（拼接最终 SYSTEM_PROMPT 时按此顺序）
-ORDER = ["role", "cross_domain", "workflow", "write_action", "output_format"]
+ORDER = ["role", "workflow", "write_action", "output_format"]
 
 
 def assemble_default() -> str:

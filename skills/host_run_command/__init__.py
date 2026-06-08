@@ -29,16 +29,14 @@ MANIFEST = {
     "code": "host_run_command",
     "name": "节点任意命令",
     "description": (
-        "在指定节点上执行**任意 shell 命令**——**平台唯一的命令执行口**,主机排障、"
-        "看容器、Swarm/K8s 写操作(docker/kubectl)、临时取证,全走这一个。"
-        "**代码不限制命令内容**,模型给什么跑什么(原样 ``sh -c``),"
-        "**每次执行都会弹确认(当前会话用户点允许/拒绝)**,全量审计兜底。"
-        "默认在**宿主机 namespace**(nsenter -t 1)里**同步**跑(60s 超时);要从**某容器网络视角**"
-        "查 DNS/连通性,在命令里自己 nsenter 进容器(套路见 ``platform_get_runbooks(name='container_netns_diag')``)。"
-        "**长命令**(du 全盘 / find / 大窗口 journalctl / tcpdump 抓几分钟)传 ``max_runtime_sec`` → 改走**异步**,"
-        "立即返回 ``task_id`` 不阻塞;之后调 ``host_run_command(task_id=...)`` 查结果(**查结果免确认**)。"
-        "传 ``node`` 即可——平台按节点名自动路由到它所属集群。"
-        "**只读查 K8s/Swarm 请用 kube_query / swarm_query**(更结构化、省 token);这个口留给主机命令、写操作。"
+        "**平台唯一的命令执行口**——在指定 ``node`` 上执行**任意 shell 命令**(主机排障 / 看容器 / "
+        "Swarm/K8s 写命令 / 临时取证)。代码不限制,模型给什么跑什么(原样 ``sh -c``),**每次执行弹确认**。"
+        "默认在宿主机 namespace 同步跑(60s 超时);进容器看 DNS/连通性的套路见 "
+        "``platform_get_runbooks(name='container_netns_diag')``。"
+        "**长命令**(du 全盘 / find / tcpdump 几分钟)传 ``max_runtime_sec`` 走异步、返回 ``task_id``,"
+        "再用 ``host_run_command(task_id=...)`` 查结果(查结果免确认)。"
+        "传 ``node`` 即可,平台按节点名自动路由集群。"
+        "**只读查 K8s/Swarm 请用 kube_query / swarm_query**(更结构化省 token)。"
     ),
     "category": "host",
     "required_connection_type": "host_agent",

@@ -44,8 +44,8 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
         </div>
         <div class="stat-meta">
-          <div class="stat-label">近 200 次调用</div>
-          <div class="stat-value">{{ stats.calls }}</div>
+          <div class="stat-label">Token 总用量</div>
+          <div class="stat-value" :title="tokenTitle">{{ formatTokens(stats.tokens) }}</div>
         </div>
       </div>
     </div>
@@ -95,7 +95,16 @@ import { useAuthStore } from '../store/auth'
 import api from '../api'
 
 const auth = useAuthStore()
-const stats = ref({ connections: 0, models: 0, skills: 0, calls: 0 })
+const stats = ref({ connections: 0, models: 0, skills: 0, tokens: 0, tokenInfo: null })
+
+function formatTokens(n) {
+  n = Number(n) || 0
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B'
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M'
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
+  return String(n)
+}
+const tokenTitle = ref('')
 
 // onMounted 里之前没 try/catch；任一接口 500 就让整页 stats 永远 0、
 // 用户看不到任何"加载失败"提示。现在让每段独立失败，单项 0 而不是全 0，
@@ -108,14 +117,21 @@ onMounted(async () => {
 
   if (!auth.isAdmin) return
 
-  const [c, m, calls] = await Promise.allSettled([
+  const [c, m, tok] = await Promise.allSettled([
     api.get('/connections'),
     api.get('/models'),
-    api.get('/skill-calls?limit=200'),
+    api.get('/token-usage'),
   ])
   if (c.status === 'fulfilled') stats.value.connections = c.value.data.length
   if (m.status === 'fulfilled') stats.value.models = m.value.data.length
-  if (calls.status === 'fulfilled') stats.value.calls = calls.value.data.length
+  if (tok.status === 'fulfilled') {
+    const u = tok.value.data || {}
+    stats.value.tokens = u.total_tokens || 0
+    stats.value.tokenInfo = u
+    tokenTitle.value = `输入 ${(u.prompt_tokens || 0).toLocaleString()} · `
+      + `输出 ${(u.completion_tokens || 0).toLocaleString()} · `
+      + `共 ${u.counted_messages || 0} 次回答累计`
+  }
 })
 </script>
 

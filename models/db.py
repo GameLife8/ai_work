@@ -330,6 +330,19 @@ class InMemoryStore:
             return None
         return deepcopy(summaries[-1])
 
+    def sum_token_usage(self) -> dict:
+        """累计所有 chat_message 的 ``metadata.usage`` —— 平台总 token 消耗。"""
+        p = c = t = n = 0
+        for m in self.chat_messages:
+            u = (m.get("metadata_json") or {}).get("usage") or {}
+            if u:
+                p += int(u.get("prompt_tokens") or 0)
+                c += int(u.get("completion_tokens") or 0)
+                t += int(u.get("total_tokens") or 0)
+                n += 1
+        return {"prompt_tokens": p, "completion_tokens": c,
+                "total_tokens": t, "counted_messages": n}
+
     @staticmethod
     def _build_root_key(alert: dict) -> str:
         service = alert.get("tags", {}).get("service", "")
@@ -1321,6 +1334,30 @@ class SQLStore:
         except (ValueError, TypeError):
             d["metadata_json"] = {}
         return d
+
+    def sum_token_usage(self) -> dict:
+        """累计所有 chat_message 的 ``metadata.usage`` —— 平台总 token 消耗。
+
+        usage 由 chainlit_app 落在 ``chat_message.metadata_json.usage``。``json_extract``
+        在 MySQL / SQLite 都支持(MySQL 函数名大小写不敏感),所以一条 SQL 两边通用。
+        """
+        from sqlalchemy import text
+        sql = text(
+            "SELECT "
+            "COALESCE(SUM(json_extract(metadata_json,'$.usage.prompt_tokens')),0) AS prompt_tokens, "
+            "COALESCE(SUM(json_extract(metadata_json,'$.usage.completion_tokens')),0) AS completion_tokens, "
+            "COALESCE(SUM(json_extract(metadata_json,'$.usage.total_tokens')),0) AS total_tokens, "
+            "COUNT(json_extract(metadata_json,'$.usage.total_tokens')) AS counted_messages "
+            "FROM chat_message"
+        )
+        with self.engine.begin() as conn:
+            row = conn.execute(sql).mappings().first() or {}
+        return {
+            "prompt_tokens": int(row.get("prompt_tokens") or 0),
+            "completion_tokens": int(row.get("completion_tokens") or 0),
+            "total_tokens": int(row.get("total_tokens") or 0),
+            "counted_messages": int(row.get("counted_messages") or 0),
+        }
 
     @staticmethod
     def _generate_incident_no(conn: Any) -> str:

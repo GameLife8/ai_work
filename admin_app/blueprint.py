@@ -441,6 +441,13 @@ def skill_calls():
     return jsonify(_store().list_skill_calls(limit=limit))
 
 
+@admin_bp.get("/token-usage")
+@_login_required("admin")
+def token_usage():
+    """平台累计 token 消耗（汇总 chat_message.metadata.usage）。"""
+    return jsonify(_store().sum_token_usage())
+
+
 # ---------- runbooks（图执行剧本管理）----------
 
 @admin_bp.get("/runbooks")

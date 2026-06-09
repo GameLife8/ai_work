@@ -58,7 +58,7 @@
           <el-tag :type="statusTag(row.status)" size="small">{{ row.status || 'unknown' }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="260" align="right">
+      <el-table-column label="操作" width="260" align="right" fixed="right">
         <template #default="{ row }">
           <el-button size="small" link @click="onValidate(row)">验证</el-button>
           <el-button size="small" link @click="openEdit(row)">编辑</el-button>

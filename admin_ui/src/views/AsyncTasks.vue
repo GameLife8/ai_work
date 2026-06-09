@@ -73,7 +73,7 @@
           <span v-else :class="row.exit_code === 0 ? 'text-success' : 'text-danger'">{{ row.exit_code }}</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="160" align="right">
+      <el-table-column label="操作" width="120" align="center" fixed="right">
         <template #default="{ row }">
           <el-button size="small" link @click="openDetail(row)">详情</el-button>
           <el-button

@@ -20,7 +20,7 @@
           <span v-else class="text-muted">auto</span>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="180">
+      <el-table-column label="操作" width="180" fixed="right">
         <template #default="{ row }">
           <el-button size="small" @click="openEdit(row)">编辑</el-button>
           <el-button size="small" type="danger" @click="onDelete(row)">删除</el-button>

@@ -43,7 +43,7 @@
           <el-tag :type="tagType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
         </template>
       </el-table-column>
-      <el-table-column label="操作" width="240" align="right">
+      <el-table-column label="操作" width="240" align="right" fixed="right">
         <template #default="{ row }">
           <template v-if="row.status === 'pending'">
             <el-button size="small" type="primary" @click="onConfirm(row)">确认</el-button>

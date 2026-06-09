@@ -868,6 +868,35 @@ class UnifiedOpsAgent:
         # 仅首轮(step==0)强制;后续轮次还原 ``auto``,让模型基于 tool 结果自主决策。
         first_round_tool_choice = "required" if intent == "write_action" else "auto"
 
+        return self._run_loop(
+            messages=messages, tools=tools, full_tools=full_tools, ctx=ctx,
+            intent=intent, user_message=user_message, trace=trace,
+            pending_actions=pending_actions, total_usage=total_usage,
+            seen_signal_keys=seen_signal_keys,
+            first_round_tool_choice=first_round_tool_choice,
+        )
+
+    def _run_loop(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        full_tools: list[dict[str, Any]],
+        ctx: "SkillContext",
+        intent: str | None,
+        user_message: str,
+        trace: list[dict[str, Any]],
+        pending_actions: list[dict[str, Any]],
+        total_usage: dict[str, Any],
+        seen_signal_keys: set[tuple],
+        first_round_tool_choice: str,
+    ) -> AgentOutcome:
+        """ask() 的工具循环主体。
+
+        抽出来是为了让「确认后续跑」(resume) 能复用同一段循环——确认完把结果注回
+        ``messages`` 再调本方法即可接着跑。本方法行为与原 ask() 内联循环**完全一致**
+        (纯重构,先不引入 resume 语义)。
+        """
         for step in range(self.max_steps):
             # ⏬ 调用 LLM 前先压缩 messages，防止 8 步循环里上下文越积越多撑爆窗口
             messages = _maybe_compress(messages)

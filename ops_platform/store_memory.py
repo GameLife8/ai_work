@@ -175,7 +175,7 @@ class InMemoryPlatformStore:
                 "base_url": base_url,
                 "api_key": api_key,
                 "model": model,
-                "timeout_seconds": 120,
+                "timeout_seconds": 1200,
                 "is_default": bool(is_default),
                 "enabled": True,
                 "created_by": created_by,

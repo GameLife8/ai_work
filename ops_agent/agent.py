@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -137,6 +138,8 @@ _INTENT_KEYWORDS: dict[str, list[str]] = {
         "为什么", "为啥", "起不来", "启动失败", "失败", "异常", "报错", "出错",
         "crashloop", "CrashLoop", "OOM", "oomkilled", "evicted",
         "连不上", "不通", "丢包", "502", "504", "卡顿", "慢",
+        "能否访问", "能够访问", "能不能访问", "是否能访问", "可达", "连通性",
+        "端口可达", "接口可达",
         "排查", "诊断", "分析下", "看看怎么回事",
         # 高频变体:
         "怎么回事", "啥情况", "什么情况", "咋回事", "为何", "查一查",
@@ -273,6 +276,70 @@ def _classify_intent_hint(user_message: str) -> str | None:
     """根据用户消息返回对应输出模式的强化提示（注入到 system role）。"""
     intent = _classify_intent(user_message)
     return _INTENT_HINTS.get(intent) if intent else None
+
+
+_CONNECTIVITY_ENDPOINT_RE = re.compile(
+    r"\b\d{1,3}(?:\.\d{1,3}){3}\b[\s:：,，]+(?:tcp/)?\d{2,5}\b",
+    re.I,
+)
+_CONNECTIVITY_PHRASES = (
+    "能否访问", "能够访问", "能不能访问", "是否能访问", "是否可以访问",
+    "可不可以访问", "连得通", "连通性", "可达", "端口通", "端口可达",
+)
+_CONNECTIVITY_FORCE_HOST_HINT = (
+    "## 平台保护:容器/服务连通性探测必须进入 host_run_command 确认流\n\n"
+    "当前用户问题是在验证服务/容器到目标地址的真实连通性。只读 swarm/k8s 查询只能定位"
+    "服务和 Node,不能证明容器网络 namespace 内能否访问目标。\n"
+    "你已经拿到运行中的服务任务/Node 后,下一步必须调用 `host_run_command` 生成待确认操作:"
+    "按 `container_netns_diag` 剧本在目标 Node 上用 `docker ps --filter name=<服务>.<副本>`"
+    " 找真实容器 ID,再 `docker inspect` 取 PID,最后 `nsenter -t $PID -n` 做带 timeout 的 DNS/TCP"
+    " 探测。不要继续重复 `swarm_query`。如果有多个候选服务,可以分别发起待确认命令。"
+)
+
+
+def _is_connectivity_probe(user_message: str) -> bool:
+    """识别「服务/容器能否访问 IP:PORT」这类需要容器视角命令确认的问题。"""
+    text = (user_message or "").lower()
+    if not text:
+        return False
+    if any(p.lower() in text for p in _CONNECTIVITY_PHRASES):
+        return True
+    has_workload_noun = any(k in text for k in ("服务", "容器", "pod", "接口", "端口"))
+    return bool(has_workload_noun and _CONNECTIVITY_ENDPOINT_RE.search(text))
+
+
+def _trace_has_tool(trace: list[dict[str, Any]], tool_name: str) -> bool:
+    return any((item.get("tool_name") == tool_name) for item in (trace or []))
+
+
+def _trace_has_swarm_runtime_location(trace: list[dict[str, Any]]) -> bool:
+    """是否已通过 swarm service ps 看到运行任务所在 Node。"""
+    for item in trace or []:
+        if item.get("tool_name") != "swarm_query":
+            continue
+        args = item.get("tool_args") or {}
+        if args.get("category") != "service" or args.get("verb") != "ps":
+            continue
+        result = item.get("tool_result")
+        if isinstance(result, dict):
+            haystack = json.dumps(
+                result.get("parsed") or result.get("stdout") or result,
+                ensure_ascii=False,
+                default=str,
+            )
+        else:
+            haystack = str(result or "")
+        lowered = haystack.lower()
+        if "node" in lowered and "running" in lowered:
+            return True
+    return False
+
+
+def _tools_named(tools: list[dict[str, Any]], names: set[str]) -> list[dict[str, Any]]:
+    return [
+        t for t in (tools or [])
+        if t.get("function", {}).get("name") in names
+    ]
 
 
 # ====================================================================
@@ -527,6 +594,16 @@ class AgentOutcome:
     # 单独的 platform_token_usage 表）。空 dict 表示模型未返回 usage 字段（部分
     # 国产模型早期版本可能漏返）。
     usage: dict[str, Any] = field(default_factory=dict)
+    # 「确认后续跑」用:had_pending 退出时,把在飞循环状态(当前问题断点 messages/
+    # trace/usage/signals/已加载工具/intent/原始问题 + pending_token→tool_call_id
+    # 映射)序列化到这里。
+    #
+    # 注意:resume_state.messages 是**瘦身后的当前任务上下文**，不会携带会话最近
+    # 20 条历史。分开问的新消息仍由 ask() 注入历史；同一问题里的确认恢复只需要
+    # 当前 user message + 本轮 tool_calls/tool results + 确认结果。
+    # 入口层(chainlit/API)把它跟 pending 一起暂存;用户确认后调 agent.resume(resume_state,
+    # [(token,result)]) 复用同一段 _run_loop 接着跑。None = 本轮不是写操作待确认。
+    resume_state: dict[str, Any] | None = None
 
 
 def _accumulate_usage(total: dict[str, Any], step_usage: dict[str, Any]) -> None:
@@ -897,13 +974,32 @@ class UnifiedOpsAgent:
         ``messages`` 再调本方法即可接着跑。本方法行为与原 ask() 内联循环**完全一致**
         (纯重构,先不引入 resume 语义)。
         """
+        connectivity_hint_added = False
         for step in range(self.max_steps):
             # ⏬ 调用 LLM 前先压缩 messages，防止 8 步循环里上下文越积越多撑爆窗口
             messages = _maybe_compress(messages)
 
-            tc = first_round_tool_choice if step == 0 else "auto"
+            force_connectivity_host = (
+                _is_connectivity_probe(user_message)
+                and not _trace_has_tool(trace, "host_run_command")
+                and _trace_has_swarm_runtime_location(trace)
+            )
+            call_tools = tools
+            force_host_call = False
+            if force_connectivity_host:
+                host_tools = _tools_named(tools, {"host_run_command"})
+                if host_tools:
+                    call_tools = host_tools
+                    force_host_call = True
+                    if not connectivity_hint_added:
+                        messages.append({"role": "system", "content": _CONNECTIVITY_FORCE_HOST_HINT})
+                        connectivity_hint_added = True
+
+            tc = "required" if force_host_call else (
+                first_round_tool_choice if step == 0 else "auto"
+            )
             message = self.model.create_completion(
-                messages=messages, tools=tools, tool_choice=tc,
+                messages=messages, tools=call_tools, tool_choice=tc,
             )
             _accumulate_usage(total_usage, message.pop("_usage", {}))
             tool_calls = message.get("tool_calls") or []
@@ -1003,8 +1099,20 @@ class UnifiedOpsAgent:
                     turn_call_cache[dedup_key] = envelope
                 trace.append(self._to_trace_item(name, args, envelope))
                 if envelope.get("status") == "needs_confirmation":
-                    pending_actions.append(envelope)
-                    had_pending = True
+                    # 记下这条 pending 对应的所有 tool_call_id —— resume 时把已确认结果
+                    # 注回每个 tool 消息槽。envelope 可能是 turn_call_cache 命中的同一对象
+                    # (模型同轮重复请求同 skill+args),因此一个 pending_token 可以对应多个
+                    # tool_call_id；确认卡片仍只展示一次。
+                    ids = envelope.setdefault("_tool_call_ids", [])
+                    if tool_call["id"] not in ids:
+                        ids.append(tool_call["id"])
+                    envelope.setdefault("_tool_call_id", tool_call["id"])  # 兼容旧入口/测试
+                    token = envelope.get("pending_token")
+                    if token and any(p.get("pending_token") == token for p in pending_actions):
+                        had_pending = True
+                    else:
+                        pending_actions.append(envelope)
+                        had_pending = True
                 # 提取本次结果里的结构化 signals，去重后留作下一轮 system 提示
                 # 命中缓存的 envelope 已经在第一次执行时贡献过 signal，这里 signal_dedup
                 # 会过滤掉，不会重复挂 hint。
@@ -1072,6 +1180,12 @@ class UnifiedOpsAgent:
                     trace=trace,
                     pending_actions=pending_actions,
                     usage=total_usage,
+                    resume_state=self._build_resume_state(
+                        messages=messages, tools=tools, trace=trace,
+                        total_usage=total_usage, seen_signal_keys=seen_signal_keys,
+                        intent=intent, user_message=user_message, ctx=ctx,
+                        pending_actions=pending_actions,
+                    ),
                 )
 
         summary = self.model.create_completion(
@@ -1092,6 +1206,226 @@ class UnifiedOpsAgent:
             trace=trace,
             pending_actions=pending_actions,
             usage=total_usage,
+        )
+
+    # ---------- 确认后续跑(可恢复循环)---------- #
+
+    def _build_resume_state(
+        self, *, messages, tools, trace, total_usage, seen_signal_keys,
+        intent, user_message, ctx, pending_actions,
+    ) -> dict[str, Any]:
+        """had_pending 退出时,把在飞循环状态打包成**可 JSON 序列化**的 dict。
+
+        ctx 不直接存(含 runtime),只存 user/session/selected_connections,resume 时重建。
+        messages 不原样存 ask() 的完整 prompt,而是瘦身成当前任务断点:去掉会话最近
+        20 条历史和全量集群路由表,只保留当前 user message 之后的本轮 tool 链路。
+        tools 只存 skill code 列表(``tool_codes``),resume 时用 build_core_tools + expand_tools
+        重建——省体积、也避开存整份 schema。seen_signal_keys 的 tuple 转 list 方便 JSON。
+        """
+        resume_messages = self._build_resume_messages(
+            messages=messages,
+            user_message=user_message,
+            selected_connections=dict(ctx.selected_connections or {}),
+        )
+        return {
+            "messages": resume_messages,
+            "trace": trace,
+            "total_usage": total_usage,
+            "seen_signal_keys": [list(k) for k in seen_signal_keys],
+            "tool_codes": [t.get("function", {}).get("name") for t in tools],
+            "intent": intent,
+            "user_message": user_message,
+            "user": ctx.user,
+            "session_id": ctx.session_id,
+            "selected_connections": dict(ctx.selected_connections or {}),
+            # pending_token → [tool_call_id...]:resume 时把已确认结果注回对应 tool 消息槽
+            "pending_map": self._pending_tool_call_map(pending_actions),
+            "resume_slimmed": True,
+            "original_message_chars": _messages_size_chars(messages),
+            "resume_message_chars": _messages_size_chars(resume_messages),
+        }
+
+    def _build_resume_messages(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        user_message: str,
+        selected_connections: dict[str, str],
+    ) -> list[dict[str, Any]]:
+        """构建确认后续跑专用的短上下文。
+
+        ask() 的完整 messages 需要会话历史和全量集群路由表;resume 是同一个用户问题
+        内部的断点恢复,这些旧历史已经在前半段推理里发挥过作用。这里从当前 user
+        message 开始保留本轮 tool 链路,并补一段短 system 说明 + 已选接入摘要。
+        """
+        start = self._current_user_message_index(messages, user_message)
+        if start is None:
+            return copy.deepcopy(messages)
+        task_messages = copy.deepcopy(messages[start:])
+        return [
+            {
+                "role": "system",
+                "content": (
+                    "你正在从同一用户问题的写操作确认点恢复。下面只包含本轮问题、"
+                    "本轮工具调用/结果以及确认后的真实执行结果；不要假设还有额外会话历史。"
+                    "如果证据已经足够,直接用中文给出结论和关键证据；只有确实缺少必要证据时才继续调用工具。"
+                ),
+            },
+            {
+                "role": "system",
+                "content": self._build_resume_connection_prompt(selected_connections),
+            },
+            *task_messages,
+        ]
+
+    @staticmethod
+    def _current_user_message_index(
+        messages: list[dict[str, Any]],
+        user_message: str,
+    ) -> int | None:
+        """找到当前轮 user message 的位置;找不到精确匹配时退到最后一条 user。"""
+        wanted = (user_message or "").strip()
+        fallback: int | None = None
+        for idx in range(len(messages) - 1, -1, -1):
+            msg = messages[idx]
+            if msg.get("role") != "user":
+                continue
+            if fallback is None:
+                fallback = idx
+            if wanted and (msg.get("content") or "").strip() == wanted:
+                return idx
+        return fallback
+
+    def _build_resume_connection_prompt(self, selected_connections: dict[str, str]) -> str:
+        """resume 用短接入摘要,替代 ask() 的全量集群名录。"""
+        if not selected_connections:
+            return "## 本轮已选接入\n\n（本轮没有显式 selected_connections;需要调用工具时按参数或平台默认解析。）"
+
+        lines = [
+            "## 本轮已选接入（精简）",
+            "",
+            "这些 connection 是本轮 ask() 已解析出的路由结果。resume 阶段不要重新展开全量集群名录。",
+        ]
+        cm = getattr(self.runtime, "connection_manager", None)
+        for type_code, cid in selected_connections.items():
+            conn = None
+            if cm is not None and cid:
+                try:
+                    conn = cm.get(cid)
+                except Exception:  # noqa: BLE001
+                    conn = None
+            label = ""
+            if conn:
+                label = conn.get("alias") or conn.get("name") or ""
+            suffix = f" ({label})" if label else ""
+            lines.append(f"- {type_code}: connection_id={cid}{suffix}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _pending_tool_call_map(pending_actions: list[dict[str, Any]]) -> dict[str, list[str]]:
+        """把 pending action 列表压成 token -> tool_call_ids。
+
+        兼容历史状态里的 ``_tool_call_id``，同时支持同一 pending 被同轮重复
+        tool_call 复用时产生的多个 ``_tool_call_ids``。
+        """
+        out: dict[str, list[str]] = {}
+        for pending in pending_actions or []:
+            token = pending.get("pending_token")
+            if not token:
+                continue
+            raw_ids = pending.get("_tool_call_ids") or []
+            if isinstance(raw_ids, str):
+                raw_ids = [raw_ids]
+            ids = [tcid for tcid in raw_ids if tcid]
+            legacy = pending.get("_tool_call_id")
+            if legacy:
+                ids.append(legacy)
+            bucket = out.setdefault(token, [])
+            for tcid in ids:
+                if tcid not in bucket:
+                    bucket.append(tcid)
+        return out
+
+    def resume(
+        self,
+        resume_state: dict[str, Any],
+        confirmed_results: list[tuple[str, dict[str, Any]]],
+        *,
+        user: dict[str, Any] | None = None,
+    ) -> AgentOutcome:
+        """用户确认/拒绝后**接着同一条推理链跑**(复用 _run_loop)。
+
+        Args:
+            resume_state: ``AgentOutcome.resume_state``(had_pending 时产出)。
+            confirmed_results: ``[(pending_token, result_envelope), ...]``——本轮每个
+                pending 执行(或拒绝)后的结果。
+        Returns:
+            新的 AgentOutcome;若续跑里模型又发起写操作,会再带 pending_actions +
+            新的 resume_state(嵌套确认,由入口层循环处理)。
+        """
+        rs = resume_state or {}
+        messages = copy.deepcopy(rs.get("messages") or [])
+        if not messages:
+            # 状态缺失(重启/过期):退化成「无总结」,让入口层 fallback 到旧路径。
+            return AgentOutcome(message="", trace=rs.get("trace") or [],
+                                usage=rs.get("total_usage") or {})
+
+        # 1) 把每个确认结果注回对应 tool 消息槽(by tool_call_id)
+        pending_map = rs.get("pending_map") or {}
+        by_id: dict[str, dict] = {}
+        for token, result in confirmed_results or []:
+            tcids = pending_map.get(token)
+            if isinstance(tcids, str):  # 兼容旧 resume_state
+                tcids = [tcids]
+            for tcid in tcids or []:
+                by_id[tcid] = result
+        if by_id:
+            for m in messages:
+                if m.get("role") == "tool" and m.get("tool_call_id") in by_id:
+                    m["content"] = self.invoker.serialize_for_model(by_id[m["tool_call_id"]])
+        trace = copy.deepcopy(rs.get("trace") or [])
+        by_token = {token: result for token, result in (confirmed_results or [])}
+        if by_token:
+            for item in trace:
+                token = item.get("pending_token")
+                result = by_token.get(token)
+                if not result:
+                    continue
+                item["tool_result"] = result.get("result")
+                item["status"] = result.get("status")
+                item["latency_ms"] = result.get("latency_ms", item.get("latency_ms"))
+                item["signals"] = collect_signals(result)
+                item["resolved_pending_token"] = token
+                item["pending_token"] = None
+
+        # 2) 重建 ctx / tools / signals(ctx 含活的 runtime,不能从 state 反序列化)
+        # 外部入口(Admin API)会把 resume_state 交给客户端暂存；恢复时必须以
+        # 当前已认证 user 为准，不能信任客户端带回来的 rs["user"]。
+        rs_user = user if user is not None else rs.get("user")
+        ctx = SkillContext(
+            runtime=self.runtime, user=rs_user,
+            session_id=rs.get("session_id"),
+            selected_connections=rs.get("selected_connections") or {},
+        )
+        visibility = "user" if (rs_user and rs_user.get("role") != "admin") else None
+        full_tools = self.registry.openai_tools(visibility=visibility)
+        tools = build_core_tools(full_tools)
+        loaded = {t.get("function", {}).get("name") for t in tools}
+        extra = [c for c in (rs.get("tool_codes") or []) if c and c not in loaded]
+        if extra:
+            tools, _ = expand_tools(full_tools, tools, extra)
+        seen = {tuple(k) for k in (rs.get("seen_signal_keys") or [])}
+
+        # 3) 续跑同一段循环。不强制首轮 tool;max_steps 预算重新给满——用户逐次确认
+        # 天然就是上限,不会失控。
+        return self._run_loop(
+            messages=messages, tools=tools, full_tools=full_tools, ctx=ctx,
+            intent=rs.get("intent"), user_message=rs.get("user_message") or "",
+            trace=trace,
+            pending_actions=[],
+            total_usage=rs.get("total_usage") or {},
+            seen_signal_keys=seen,
+            first_round_tool_choice="auto",
         )
 
     def follow_up_after_action(

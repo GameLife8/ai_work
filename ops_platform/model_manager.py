@@ -128,7 +128,7 @@ class ModelManager:
                 base_url=record["base_url"],
                 api_key=record["api_key"],
                 model=record["model"],
-                timeout_seconds=int(record.get("timeout_seconds") or 120),
+                timeout_seconds=int(record.get("timeout_seconds") or 1200),
                 # tool_choice_preference 默认 None → OpsModelClient 用 "auto"
                 # admin 在管理后台按"模型实测行为"调:
                 # - 'required' 强制每轮必调 tool（qwen3-thinking 类"过度调用"模型不需要,

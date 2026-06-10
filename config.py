@@ -49,7 +49,7 @@ class Config:
     AI_BASE_URL = os.getenv("AI_BASE_URL", "https://ark.cn-beijing.volces.com/api/coding/v3")
     AI_API_KEY = os.getenv("AI_API_KEY", "")
     AI_MODEL = os.getenv("AI_MODEL", "ark-code-latest")
-    AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "10"))
+    AI_TIMEOUT_SECONDS = int(os.getenv("AI_TIMEOUT_SECONDS", "1200"))
 
     DEFAULT_CONTEXT_NEEDS = ["metric_summary", "topology", "related_incidents"]
     # ⚠️ 默认 false：必须配真实 AI key 才工作。CI/单元测试再显式开 stub。

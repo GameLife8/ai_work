@@ -418,7 +418,118 @@ def agent_ask():
         "message": outcome.message,
         "trace": outcome.trace,
         "pending_actions": outcome.pending_actions,
+        "resume_state": getattr(outcome, "resume_state", None),
         # token usage（本次 ask 累计），方便 admin 测试时观测成本
+        "usage": getattr(outcome, "usage", {}) or {},
+        "trace_summary": [
+            {
+                "tool": t.get("tool_name"),
+                "args": t.get("tool_args"),
+                "status": t.get("status"),
+                "latency_ms": t.get("latency_ms"),
+            }
+            for t in outcome.trace
+        ],
+    })
+
+
+@admin_bp.post("/agent/resume")
+@_login_required()
+def agent_resume():
+    """确认/拒绝写操作后，从 ``resume_state`` 断点继续 agent tool-loop。
+
+    Request body::
+        {
+          "resume_state": { ... /agent/ask 返回的 resume_state ... },
+          "decisions": [
+            {"token": "pending-token", "action": "confirm"},
+            {"token": "pending-token-2", "action": "reject", "reason": "..."}
+          ],
+          "max_steps": 8
+        }
+
+    注意：客户端只传 token + 决策，执行结果由后端 confirm/reject 生成，避免伪造
+    envelope 注入模型上下文。
+    """
+    body = request.get_json(silent=True) or {}
+    resume_state = body.get("resume_state") or {}
+    decisions = body.get("decisions") or []
+    if not resume_state:
+        return jsonify({"error": "resume_state_required"}), 400
+    if not isinstance(decisions, list) or not decisions:
+        return jsonify({"error": "decisions_required"}), 400
+    expected_tokens = set((resume_state.get("pending_map") or {}).keys())
+    provided_tokens = {
+        (decision or {}).get("token")
+        for decision in decisions
+        if (decision or {}).get("token")
+    }
+    missing_tokens = sorted(expected_tokens - provided_tokens)
+    if missing_tokens:
+        return jsonify({
+            "error": "decisions_incomplete",
+            "missing_tokens": missing_tokens,
+        }), 400
+
+    from ops_agent import UnifiedOpsAgent
+    from ops_platform.context import SkillContext
+
+    try:
+        agent = UnifiedOpsAgent(
+            _runtime(),
+            max_steps=int(body.get("max_steps") or 8),
+        )
+    except Exception as exc:    # noqa: BLE001
+        return jsonify({"error": "agent_init_failed", "message": str(exc)}), 500
+
+    ctx = SkillContext(
+        runtime=_runtime(),
+        user=g.current_user,
+        session_id=body.get("session_id") or resume_state.get("session_id"),
+        selected_connections=(
+            body.get("selected_connections")
+            or resume_state.get("selected_connections")
+            or {}
+        ),
+    )
+    confirmed_results: list[tuple[str, dict]] = []
+    decision_results: list[dict] = []
+    try:
+        for decision in decisions:
+            token = (decision or {}).get("token")
+            if not token:
+                return jsonify({"error": "decision_token_required"}), 400
+            action = ((decision or {}).get("action") or "confirm").lower()
+            if action == "confirm":
+                envelope = _runtime().skill_invoker.confirm(token, ctx)
+            elif action in {"reject", "cancel", "timeout"}:
+                reason = (decision or {}).get("reason") or f"agent_resume_{action}"
+                envelope = _runtime().skill_invoker.reject(token, ctx, reason=reason)
+            else:
+                return jsonify({"error": "invalid_decision_action", "action": action}), 400
+            confirmed_results.append((token, envelope))
+            decision_results.append({
+                "token": token,
+                "action": action,
+                "status": envelope.get("status"),
+                "envelope": envelope,
+            })
+
+        outcome = agent.resume(
+            resume_state,
+            confirmed_results,
+            user=g.current_user,
+        )
+    except Exception as exc:    # noqa: BLE001
+        logger.exception("agent.resume 失败")
+        return jsonify({"error": "agent_resume_failed", "message": str(exc)}), 500
+
+    return jsonify({
+        "message": outcome.message,
+        "trace": outcome.trace,
+        "pending_actions": outcome.pending_actions,
+        "resume_state": getattr(outcome, "resume_state", None),
+        "decision_results": decision_results,
         "usage": getattr(outcome, "usage", {}) or {},
         "trace_summary": [
             {

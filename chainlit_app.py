@@ -676,30 +676,7 @@ async def on_message(message: cl.Message) -> None:
             f"待确认 {len(outcome.pending_actions)} 个写操作。"
         )
 
-    # ---- 把每次 skill 调用以原生 cl.Step 形式渲染（默认折叠 + 自带耗时） ----
-    for item in outcome.trace:
-        sigs = item.get("signals") or []
-        sig_chip = (
-            "  📡 " + ", ".join(s.get("type", "") for s in sigs) if sigs else ""
-        )
-        step_name = (
-            f"🔧 {item.get('tool_name')}"
-            f"  ·  {item.get('status')}"
-            f"  ·  {item.get('latency_ms', 0)}ms"
-            f"{sig_chip}"
-        )
-        async with cl.Step(name=step_name, type="tool", language="json") as s:
-            # language='json' 让 input / output 渲染成代码块（带语法高亮 + 边框）
-            # 而不是裸文本
-            s.input = json.dumps(item.get("tool_args") or {}, ensure_ascii=False, indent=2)
-            s.output = json.dumps(
-                {
-                    "status": item.get("status"),
-                    "signals": sigs,
-                    "result": item.get("tool_result"),
-                },
-                ensure_ascii=False, indent=2, default=str,
-            )
+    await _render_trace_steps(outcome.trace)
 
     # ---- 最终中文报告 ----
     if runtime and session_id:
@@ -715,12 +692,256 @@ async def on_message(message: cl.Message) -> None:
         )
     await cl.Message(content=outcome.message).send()
 
-    # ---- 写操作待确认：每个 pending action 都弹一张确认卡 ----
-    for pending in outcome.pending_actions:
-        await _ask_confirmation(pending, agent=agent, user=user, session_id=session_id, runtime=runtime)
+    await _continue_after_pending_actions(
+        outcome,
+        agent=agent,
+        user=user,
+        session_id=session_id,
+        runtime=runtime,
+    )
 
 
-async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, session_id, runtime) -> None:
+async def _render_trace_steps(trace: list[dict]) -> None:
+    """把 skill trace 渲染成 Chainlit Step。"""
+    for item in trace or []:
+        sigs = item.get("signals") or []
+        sig_chip = (
+            "  📡 " + ", ".join(s.get("type", "") for s in sigs) if sigs else ""
+        )
+        step_name = (
+            f"🔧 {item.get('tool_name')}"
+            f"  ·  {item.get('status')}"
+            f"  ·  {item.get('latency_ms', 0)}ms"
+            f"{sig_chip}"
+        )
+        async with cl.Step(name=step_name, type="tool", language="json") as s:
+            s.input = json.dumps(item.get("tool_args") or {}, ensure_ascii=False, indent=2)
+            s.output = json.dumps(
+                {
+                    "status": item.get("status"),
+                    "signals": sigs,
+                    "result": item.get("tool_result"),
+                },
+                ensure_ascii=False, indent=2, default=str,
+            )
+
+
+def _usage_delta(after: dict | None, before: dict | None) -> dict:
+    """resume 的 usage 是累计值，落库时只保存本段新增，避免成本统计重复。"""
+    after = after or {}
+    before = before or {}
+    out: dict = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "calls"):
+        delta = int(after.get(key) or 0) - int(before.get(key) or 0)
+        if delta:
+            out[key] = delta
+    if out:
+        out["model"] = after.get("model") or before.get("model") or "unknown"
+    return out
+
+
+async def _save_and_send_resume_outcome(outcome, *, runtime, session_id, trace, usage_delta) -> None:
+    if runtime and session_id:
+        meta: dict = {"trace_count": len(trace), "resumed_from_confirmation": True}
+        if usage_delta:
+            meta["usage"] = usage_delta
+        try:
+            runtime.store.save_chat_message(
+                session_id, "assistant", outcome.message,
+                trace=trace,
+                metadata=meta,
+            )
+        except Exception as exc:    # noqa: BLE001
+            print(f"[chainlit] save resumed outcome failed: {exc}")
+    await cl.Message(content=outcome.message).send()
+
+
+def _clip_text(value, limit: int = 2000) -> str:
+    text = "" if value is None else str(value)
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "\n...（已截断，完整内容见调用 trace）"
+
+
+def _format_action_result_fallback(decisions: list[dict], *, error: Exception | None = None) -> str:
+    """模型续跑失败时的确定性兜底，不再二次请求模型。"""
+    lines: list[str] = []
+    if error is not None:
+        lines.extend([
+            "⚠️ 写操作已经处理，但确认后继续分析时模型请求超时/失败。",
+            "",
+            f"- 错误：`{_clip_text(error, 500)}`",
+            "- 下面是平台拿到的执行结果；如需继续分析，可以直接发送“继续根据上面的执行结果分析”。",
+            "",
+        ])
+    else:
+        lines.append("写操作已经处理，平台返回如下：")
+        lines.append("")
+
+    for idx, decision in enumerate(decisions or [], start=1):
+        envelope = decision.get("envelope") or {}
+        result = envelope.get("result") or {}
+        preview = decision.get("preview") or {}
+        skill = preview.get("skill_code") or envelope.get("skill") or "unknown"
+        action = decision.get("action") or "unknown"
+        lines.append(f"### 写操作 {idx}")
+        lines.append(f"- 决策：`{action}`")
+        lines.append(f"- Skill：`{skill}`")
+        lines.append(f"- 状态：`{envelope.get('status')}`")
+
+        if isinstance(result, dict):
+            for key in ("node", "command", "returncode", "exit_code", "task_id", "status", "ok"):
+                if result.get(key) is not None:
+                    lines.append(f"- {key}：`{_clip_text(result.get(key), 300)}`")
+            stdout = result.get("stdout")
+            stderr = result.get("stderr")
+            if stdout:
+                lines.append(f"\nstdout:\n```text\n{_clip_text(stdout)}\n```")
+            if stderr:
+                lines.append(f"\nstderr:\n```text\n{_clip_text(stderr)}\n```")
+            if not stdout and not stderr and result:
+                lines.append(
+                    "\nresult:\n```json\n"
+                    + _clip_text(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+                    + "\n```"
+                )
+        elif result:
+            lines.append(f"\nresult:\n```text\n{_clip_text(result)}\n```")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+async def _continue_after_pending_actions(
+    outcome,
+    *,
+    agent: UnifiedOpsAgent,
+    user,
+    session_id,
+    runtime,
+) -> None:
+    """同一 checkpoint 批量确认后再 resume，避免逐个确认逐个烧 token。"""
+    current = outcome
+    max_resume_rounds = 4
+
+    for _round in range(max_resume_rounds):
+        pending_actions = current.pending_actions or []
+        if not pending_actions:
+            return
+
+        decisions: list[dict] = []
+        for pending in pending_actions:
+            decision = await _ask_confirmation(
+                pending, agent=agent, user=user, session_id=session_id, runtime=runtime,
+            )
+            if decision:
+                decisions.append(decision)
+
+        if not decisions:
+            return
+
+        # 老状态/异常状态没有 resume_state 时，退回旧的“单次执行结果总结”路径。
+        if not getattr(current, "resume_state", None):
+            for decision in decisions:
+                envelope = decision["envelope"]
+                async with cl.Step(name="📝 模型整理执行结果…", type="llm"):
+                    try:
+                        follow_up = await asyncio.to_thread(
+                            agent.follow_up_after_action, envelope, user=user, session_id=session_id,
+                        )
+                    except Exception as exc:    # noqa: BLE001
+                        follow_up = _format_action_result_fallback([decision], error=exc)
+                if runtime and session_id:
+                    try:
+                        runtime.store.save_chat_message(
+                            session_id, "assistant", follow_up,
+                            trace=[{
+                                "tool_name": f"confirm:{decision.get('action')}",
+                                "tool_result": envelope,
+                                "status": envelope.get("status"),
+                            }],
+                            metadata={
+                                "action_decision": decision.get("action"),
+                                "token": decision.get("token"),
+                                "resume_fallback": True,
+                            },
+                        )
+                    except Exception as exc:    # noqa: BLE001
+                        print(f"[chainlit] save follow-up failed: {exc}")
+                await cl.Message(content=follow_up).send()
+            return
+
+        prev_trace_len = len(current.trace or [])
+        usage_before = dict(current.usage or {})
+        confirmed_results = [
+            (decision["token"], decision["envelope"])
+            for decision in decisions
+            if decision.get("token")
+        ]
+        async with cl.Step(name="🤖 确认后继续分析…", type="llm") as step:
+            try:
+                resumed = await asyncio.to_thread(
+                    agent.resume,
+                    current.resume_state,
+                    confirmed_results,
+                    user=user,
+                )
+            except Exception as exc:    # noqa: BLE001
+                step.output = f"确认后的模型续跑失败：{exc}"
+                fallback = _format_action_result_fallback(decisions, error=exc)
+                decision_trace = [
+                    {
+                        "tool_name": f"confirm:{decision.get('action')}",
+                        "tool_result": decision.get("envelope"),
+                        "status": (decision.get("envelope") or {}).get("status"),
+                        "pending_token": decision.get("token"),
+                    }
+                    for decision in decisions
+                ]
+                if runtime and session_id:
+                    try:
+                        runtime.store.save_chat_message(
+                            session_id, "assistant", fallback,
+                            trace=decision_trace,
+                            metadata={
+                                "resumed_from_confirmation": True,
+                                "resume_failed": True,
+                                "error": str(exc),
+                            },
+                        )
+                    except Exception as save_exc:    # noqa: BLE001
+                        print(f"[chainlit] save resume fallback failed: {save_exc}")
+                await cl.Message(content=fallback).send()
+                return
+            step.output = (
+                f"续跑新增 {max(len(resumed.trace or []) - prev_trace_len, 0)} 个 skill；"
+                f"待确认 {len(resumed.pending_actions or [])} 个写操作。"
+            )
+
+        new_trace = (resumed.trace or [])[prev_trace_len:]
+        await _render_trace_steps(new_trace)
+        decision_trace = [
+            {
+                "tool_name": f"confirm:{decision.get('action')}",
+                "tool_result": decision.get("envelope"),
+                "status": (decision.get("envelope") or {}).get("status"),
+                "pending_token": decision.get("token"),
+            }
+            for decision in decisions
+        ]
+        await _save_and_send_resume_outcome(
+            resumed,
+            runtime=runtime,
+            session_id=session_id,
+            trace=decision_trace + new_trace,
+            usage_delta=_usage_delta(resumed.usage, usage_before),
+        )
+        current = resumed
+
+    if current.pending_actions:
+        await cl.Message(content="写操作确认链路已达到本轮续跑上限，请发送下一条消息继续。").send()
+
+
+async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, session_id, runtime) -> dict | None:
     preview = pending.get("preview") or {}
     token = pending.get("pending_token")
     args_pretty = json.dumps(preview.get("args") or {}, ensure_ascii=False, indent=2)
@@ -746,14 +967,19 @@ async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, sess
     # timeout 1800s = 30 分钟。300s(5 分钟)实测太短——模型生成的说明往往拖一段,
     # 等到用户看完往下滚到按钮可能已超过 5 分钟。
     res = await cl.AskActionMessage(content=body, actions=actions, timeout=1800).send()
-    if not res:
-        await cl.Message(content="（已超时未操作，本次写操作不会执行）").send()
-        return
-
     ctx = SkillContext(
         runtime=runtime, user=user, session_id=session_id,
         selected_connections=cl.user_session.get("selected_connections") or {},
     )
+    if not res:
+        await cl.Message(content="（已超时未操作，本次写操作不会执行）").send()
+        async with cl.Step(name="⚙️ 平台正在放弃超时写操作…", type="tool", language="json") as step:
+            envelope = await asyncio.to_thread(
+                runtime.skill_invoker.reject, token, ctx, "timeout_in_chainlit",
+            )
+            step.output = json.dumps(envelope, ensure_ascii=False, indent=2, default=str)
+        return {"token": token, "envelope": envelope, "action": "timeout", "preview": preview}
+
     action_name = "执行" if res.get("name") == "confirm_action" else "拒绝"
     async with cl.Step(name=f"⚙️ 平台正在{action_name}写操作…", type="tool", language="json") as step:
         if res.get("name") == "confirm_action":
@@ -763,26 +989,4 @@ async def _ask_confirmation(pending: dict, *, agent: UnifiedOpsAgent, user, sess
                 runtime.skill_invoker.reject, token, ctx, "user_rejected_in_chainlit",
             )
         step.output = json.dumps(envelope, ensure_ascii=False, indent=2, default=str)
-
-    async with cl.Step(name="📝 模型整理执行结果…", type="llm"):
-        follow_up = await asyncio.to_thread(
-            agent.follow_up_after_action, envelope, user=user, session_id=session_id,
-        )
-
-    # 落库:assistant 正文 = 模型的执行总结(resume 时能重放——修"确认/拒绝后内容被截断"的根因:
-    # 这段 follow_up 以前只发 UI、从不入库,一 resume 就没了)。原始 envelope 挂在 ``trace``
-    # 里(admin 可回放),**不再当正文存**——否则 resume 重放历史会冒出一坨生 JSON。
-    if runtime and session_id:
-        try:
-            runtime.store.save_chat_message(
-                session_id, "assistant", follow_up,
-                trace=[{
-                    "tool_name": f"confirm:{res.get('name')}",
-                    "tool_result": envelope,
-                    "status": envelope.get("status"),
-                }],
-                metadata={"action_decision": res.get("name"), "token": token},
-            )
-        except Exception as exc:    # noqa: BLE001
-            print(f"[chainlit] save follow-up failed: {exc}")
-    await cl.Message(content=follow_up).send()
+    return {"token": token, "envelope": envelope, "action": res.get("name"), "preview": preview}

@@ -65,7 +65,7 @@ class OpsModelClient:
         base_url: str,
         api_key: str,
         model: str,
-        timeout_seconds: int = 120,
+        timeout_seconds: int = 1200,
         tool_choice_default: str | None = None,
     ) -> None:
         self.base_url = self._normalize_base_url(base_url)

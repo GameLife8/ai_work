@@ -72,3 +72,42 @@ def test_agent_pending_path_avoids_redundant_card_content() -> None:
             or "✅" in pending_block), (
         "prompt 应强制模型结尾提示「请在下方点击 ✅/❌」"
     )
+
+
+def test_ask_confirmation_only_returns_decision_not_followup() -> None:
+    """确认卡片只负责产出执行/拒绝 envelope,不能在这里单独总结。"""
+    src = open(chainlit_app.__file__, encoding="utf-8").read()
+    m = re.search(r"async def _ask_confirmation\(.*?(?=\nasync def |\Z)", src, re.S)
+    assert m, "找不到 _ask_confirmation 函数"
+    body = m.group(0)
+    assert "follow_up_after_action" not in body, (
+        "_ask_confirmation 又直接调用 follow_up_after_action 了——"
+        "这会让确认后的写操作脱离原 tool-loop"
+    )
+    assert '"envelope"' in body and '"token"' in body, (
+        "_ask_confirmation 应返回 token + envelope 给上层批量 resume"
+    )
+
+
+def test_chainlit_batches_decisions_before_agent_resume() -> None:
+    """同一 checkpoint 的 pending 应批量确认后只 resume 一次。"""
+    src = open(chainlit_app.__file__, encoding="utf-8").read()
+    m = re.search(r"async def _continue_after_pending_actions\(.*?(?=\nasync def |\Z)", src, re.S)
+    assert m, "找不到 _continue_after_pending_actions 函数"
+    body = m.group(0)
+    assert "confirmed_results" in body and "agent.resume" in body
+    assert body.find("for pending in pending_actions") < body.find("agent.resume"), (
+        "应先收集本 checkpoint 所有 pending 决策，再调用 agent.resume"
+    )
+
+
+def test_chainlit_resume_failure_has_deterministic_fallback() -> None:
+    """确认后的模型续跑可能因外部模型超时失败，UI 不能直接冒异常。"""
+    src = open(chainlit_app.__file__, encoding="utf-8").read()
+    m = re.search(r"async def _continue_after_pending_actions\(.*?(?=\nasync def |\Z)", src, re.S)
+    assert m, "找不到 _continue_after_pending_actions 函数"
+    body = m.group(0)
+    assert "except Exception as exc" in body
+    assert "_format_action_result_fallback" in body
+    assert "resume_failed" in body
+    assert "await cl.Message(content=fallback).send()" in body

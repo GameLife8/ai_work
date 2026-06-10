@@ -304,7 +304,7 @@ def _build_legacy_clients(runtime, config_cls) -> None:
             base_url=m_default["base_url"],
             api_key=m_default["api_key"],
             model=m_default.get("model", ""),
-            timeout_seconds=int(m_default.get("timeout_seconds") or 120),
+            timeout_seconds=int(m_default.get("timeout_seconds") or 1200),
             use_stub=False,
         )
     else:

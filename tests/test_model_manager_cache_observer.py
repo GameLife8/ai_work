@@ -56,7 +56,7 @@ class _FakeStore:
         rec = {
             "id": self._next_id(),
             "enabled": True,
-            "timeout_seconds": 120,
+            "timeout_seconds": 1200,
             **kwargs,
         }
         self._rows[rec["id"]] = rec

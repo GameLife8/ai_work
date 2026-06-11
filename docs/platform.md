@@ -66,7 +66,7 @@ docker compose up -d
 ## 3. 维度一：Connection（接入）
 
 每个 Connection 是某种 type 的具体连接配置（凭证 + 地址）。同类型可存多份。
-当前内置 8 种 type：
+当前内置 7 种 type：
 
 | type | 说明 | 典型字段 |
 |---|---|---|
@@ -132,6 +132,19 @@ agent 在 tool 循环里看到信号 → 自动渲染中文 hint 注入下一轮
 
 **实测 5585 字节 envelope 压到 2631 字节，节省 53%**。模型上下文用得久，注意力不被刷屏。
 
+### 确认后续跑：resume_state
+
+写操作确认不是“执行完再开一轮新问题”，而是同一条 agent tool-loop 的可恢复断点：
+
+1. agent 调到 `needs_confirmation` 后，返回 `pending_actions` 和 `resume_state`。
+2. Chainlit / Admin 先批量收集同一 checkpoint 的确认/拒绝结果，再调用 `agent.resume(...)`。
+3. `resume()` 把确认后的真实执行结果注回原来的 tool message 槽，继续 `_run_loop`。
+4. 若续跑里再次出现写操作，会生成新的 `pending_actions + resume_state`，入口层继续同样的闭环。
+
+`resume_state` 是瘦身上下文：不携带最近 20 条会话历史，不保存整份 tools schema，只保留当前用户问题、
+本轮 tool_calls/tool results、trace、usage、已加载 tool code 和 `pending_token → tool_call_id` 映射。
+新的一轮用户消息仍会正常加载历史；同一问题里的确认恢复只带当前任务断点，避免 token 暴涨。
+
 ---
 
 ## 4. 维度二：Skill（技能）
@@ -177,17 +190,21 @@ skills/
 
 ### 工具加载：渐进披露（progressive disclosure）
 
-27 个 skill 的 schema 全发给模型约 22K 字符。以前按关键词意图静态过滤，两个毛病：① 关键词脆，
+20 个 skill 的 schema 全发给模型仍会带来不必要的请求体和注意力成本。以前按关键词意图静态过滤，两个毛病：① 关键词脆，
 还会**挡掉 signal 想调的 skill**；② 工具集随 query 变 → 破坏 prompt cache。现在换成
 [`ops_agent/skill_domains.py`](../ops_agent/skill_domains.py) 的两层架构：
 
-- **Layer 0 常驻（~7K，固定 → 缓存友好）**：三把通用查询口 + `zabbix_get_host_overview` +
-  runbook 入口 + `load_skills` meta-tool。覆盖 ~80% 的问题。
+- **Layer 0 常驻（固定 → 缓存友好）**：`kube_query` / `swarm_query` / `host_run_command` +
+  `zabbix_get_host_overview` + runbook 入口 + `load_skills` meta-tool。覆盖高频查询、命令确认和 runbook 发现。
 - **Layer 1 按域懒加载**：模型要专科能力时调 `load_skills(domains=["swarm_write","monitoring"…])`，
   平台把那个域的 skill schema 加进工具集，**下一轮**即可调用。域有 `swarm_write` / `k8s_write` /
-  `host_exec` / `monitoring` / `network_diag` / `cicd` / `alerts` 7 个。
+  `monitoring` / `cicd` / `alerts` 5 个。
 - **signal 驱动自动加载**：scanner 发的 `next_skill` 若在某个域里，平台**自动**把该域加载进来——
   模型立刻能遵循 signal，不用先 load（彻底解决静态过滤"挡 signal"的硬伤）。
+
+服务/容器到 `IP:PORT` 的连通性探测还有一条保护规则：当 trace 已通过 `swarm_query service ps`
+定位到运行中的任务和 Node，但还没进入 `host_run_command` 时，agent 会临时只暴露 `host_run_command`
+并使用 `tool_choice=required`，确保下一步生成 `needs_confirmation`，而不是继续重复只读查询。
 
 > 意图分类（`_classify_intent`）现在**只**用于注入"输出模式提示"（如 list_state 场景的 raw-first
 > 展示），跟工具加载**完全解耦**。
@@ -215,26 +232,6 @@ def run(ctx, *, service_name: str, connection_id: str | None = None) -> dict:
 > **质量门禁**：[`tests/test_skill_manifest_quality.py`](../tests/test_skill_manifest_quality.py) lint
 > 每个 manifest——描述长度、长描述必带示例、易混淆 skill 必须互指。新 skill 自动强制走规范。
 
-### Skill manifest 字段
-
-```python
-MANIFEST = {
-    "code":                       "swarm_force_update_service",  # 全局唯一
-    "name":                       "强制更新 Swarm 服务",
-    "description":                "...给模型看的何时使用 + 信号→下一步...",
-    "category":                   "swarm",
-    "required_connection_type":   "swarm",
-    "read_only":                  False,
-    "requires_admin_approval":    False,    # True 则只有 admin 能 confirm
-    "visibility":                 "all",    # 'all' / 'admin'
-    "confirmation_ttl_seconds":   300,
-    "params_schema":              { ...JSON Schema... },
-}
-
-def run(ctx, *, service_name: str, connection_id: str | None = None) -> dict:
-    return ctx.connection_for("swarm", connection_id).run(...)
-```
-
 ### 写操作二次确认
 
 `read_only=False` 的 skill 调用流程：
@@ -245,12 +242,16 @@ def run(ctx, *, service_name: str, connection_id: str | None = None) -> dict:
     → 因为 read_only=False，不立即执行
     → 落 pending_action 表（记 session_id），返回 needs_confirmation + token
 模型 → 出"提议+风险"中文说明，停止 tool 循环
-chainlit / 后台 → 渲染 ✅/❌ 卡片
-用户点 ✅
+Chainlit / Admin → 渲染 ✅/❌ 卡片（Chainlit 等待 30 分钟）
+用户点 ✅ / ❌
     → invoker.confirm(token, ctx)
     → 校验状态 / TTL / 会话绑定 / 权限 → 真正执行 → pending 改 executed
-模型 → follow_up_after_action() 给最终中文总结
+入口层 → agent.resume(resume_state, [(token, result)]) 注回真实结果
+agent → 接着同一条 tool-loop 继续分析；必要时再次返回 pending_actions
 ```
+
+旧状态或模型续跑异常时才退回 `follow_up_after_action()` / deterministic fallback；正常路径都走
+`resume_state`，因此确认后不会重新发送完整会话历史和全量 tools schema。
 
 **安全要点**（[`ops_platform/invoker.py`](../ops_platform/invoker.py)）：
 - **会话绑定**：token 记录创建时的 `session_id`。**非 admin** 必须从同一会话确认——
@@ -314,6 +315,10 @@ model:     ep-xxx / qwen-plus / glm-4 / deepseek-chat / moonshot-v1-32k / ...
 
 当前的 agent 默认拿 `is_default=true` 那条；future：会话级允许切换模型。
 
+模型 HTTP read timeout 默认 1200 秒（20 分钟），运行期以 `platform_model_config.timeout_seconds`
+为准；`.env` / `config.py` 只是空库 bootstrap 或内存 store 的种子。确认卡片自身的等待时间由 Chainlit
+控制，当前为 1800 秒（30 分钟）。
+
 ---
 
 ## 6. 维度四：用户（User）
@@ -361,7 +366,7 @@ DB 默认 TiDB（MySQL 兼容）；本地调试可设 `STORE_BACKEND=memory`，�
 - `platform_model_config` — 模型配置；``api_key`` **Fernet 加密** + `tool_choice_preference`（auto/required/none，admin 按模型实测配）
 - `platform_skill_call` — 所有 skill 调用审计（敏感参数落库前脱敏）
 - `platform_pending_action` — 写操作待确认队列（记 session_id 做会话绑定）
-- `platform_prompt_segment` — 5 段 system prompt（admin 后台可编辑、热加载）
+- `platform_prompt_segment` — 4 段 system prompt（admin 后台可编辑、热加载）
 - `platform_runbook` — 图执行剧本定义
 - `platform_runbook_execution` — 每次 runbook 执行的完整轨迹（节点状态 + 信号 + 报告）
 - `platform_async_task` — 异步长命令任务（`host_run_command` 传 max_runtime_sec 提交）
@@ -512,16 +517,16 @@ ai_work/
 
 | 状态 | 项 |
 |---|---|
-| ✅ | 平台 kernel · skill 插件机制 · 7 driver · 28 skill · 6 graph runbook |
+| ✅ | 平台 kernel · skill 插件机制 · 7 driver · 20 skill · 5 graph runbook |
 | ✅ | 三入口（Chainlit / Admin / MCP） |
-| ✅ | 写操作二次确认链 + 入口 RBAC + 会话绑定（admin 可跨会话审批）|
+| ✅ | 写操作二次确认链 + `resume_state` 续跑 + 入口 RBAC + 会话绑定（admin 可跨会话审批）|
 | ✅ | 火山方舟（Code Plan）+ 国产模型兼容 + 模型级 tool_choice 偏好 |
 | ✅ | host_agent 替代 SSH（K8s + Swarm，containerd/docker 双适配） |
 | ✅ | Connection 凭证 Fernet 加密 + 自动迁移 + `STRICT_ENCRYPTION` 生产强制 |
 | ✅ | **结构化 Signals + agent 自动 hint 注入**（跨域 pivot 从软变硬） |
 | ✅ | **渐进披露工具加载**（core 常驻 + load_skills 按域懒加载 + signal 自动加载）|
-| ✅ | **Tool-loop digest**（自动压缩节省 token） · **token usage 监控** |
-| ✅ | **DB-backed prompt 段落库 + admin UI 编辑**（5 段 + CodeMirror） |
+| ✅ | **Tool-loop digest + resume 瘦身**（自动压缩、确认后不重带历史） · **token usage 监控** |
+| ✅ | **DB-backed prompt 段落库 + admin UI 编辑**（4 段 + CodeMirror） |
 | ✅ | **诊断剧本图执行引擎**（DAG + DSL + 信号驱动 + admin 编辑 + 执行回放） |
 | ✅ | **Jenkins CI/CD 接入** — jenkins driver + jenkins_query skill |
 | ✅ | **审计脱敏**（凭证不落明文）· **bootstrap 并发安全**（双重检查锁）· **优雅停机** |

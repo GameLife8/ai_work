@@ -1,5 +1,9 @@
 # 告警智能研判系统设计文档（Flask 版 - 第一阶段）
 
+> 历史文档：本文记录的是告警研判系统第一阶段的 Flask 设计稿。当前仓库已经演进为统一 AI 运维平台，
+> 运行期架构、skill、runbook、确认续跑、Chainlit/Admin/MCP 三入口等请以
+> [`README.md`](README.md) 和 [`docs/platform.md`](docs/platform.md) 为准。
+
 ## 1. 项目概述
 
 本项目目标是构建一个基于 Zabbix 的告警智能研判系统，实现：

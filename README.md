@@ -7,8 +7,9 @@
 
 ## 一句话说明
 
-把"运维老司机"的查问题套路、动作执行能力、跨集群多接入、二次确认审批、统一审计，
-全部沉淀到一个平台里。运维同学和 AI 共用同一份 skill，AI 给思路、人给确认。
+把"运维老司机"的查问题套路、动作执行能力、跨集群多接入、二次确认审批、确认后续跑、
+统一审计，全部沉淀到一个平台里。运维同学和 AI 共用同一份 skill，AI 给思路、人给确认，
+平台把确认后的真实执行结果接回同一条 tool-loop 继续分析。
 
 ---
 
@@ -22,6 +23,7 @@
 | 🌐 网络排障 | "worker-3 节点上 80 端口没人监听，帮我查一下" — 走 host_agent + nsenter，**不需要 SSH** |
 | 📥 告警研判 | 直接粘贴一段 Zabbix payload JSON |
 | ⚡ 执行操作 | "重启 my-app 这个 deployment" — 自动走二次确认 |
+| 🔁 确认后续跑 | "gateway 服务能否访问 169.24.2.45:443" — 定位服务后弹命令确认，确认后继续分析结果 |
 
 ## 三个服务、三个容器
 
@@ -69,8 +71,8 @@ docker compose logs -f backend chat admin-ui
 | **Skill** | 能力。`skills/<name>/__init__.py` 一个目录一个能力，**新增零代码改动** |
 | **Signals** | skill 主动发出结构化信号（OOM / 磁盘满 / 镜像拉不下来…），agent 自动渲染中文 hint 注入下一轮——**跨域 pivot 从软约束变硬约束** |
 | **Runbook（图执行）** | 平台**自动按 DAG 跑一连串 skill**，模型只写最终中文五段式报告。admin 后台 YAML 编辑 + 热加载。详见 [docs/runbook.md](docs/runbook.md) |
-| **写操作二次确认** | `read_only=False` 的 skill 走 pending_action 队列，先弹卡片再执行；admin-only 写 skill 走 visibility + approval 三重锁 |
-| **Prompt 段落库** | system prompt 拆 5 段落 DB，admin 后台 CodeMirror 编辑；**改完即时生效不重启** |
+| **写操作二次确认** | `read_only=False` 的 skill 走 pending_action 队列，先弹卡片再执行；确认后通过 `resume_state` 接回 agent tool-loop |
+| **Prompt 段落库** | system prompt 拆 4 段落 DB，admin 后台 CodeMirror 编辑；**改完即时生效不重启** |
 | **Model** | 火山方舟（Code Plan）/ 通义 / 智谱 / DeepSeek 等任意 OpenAI 兼容模型 |
 | **host_agent** | 每节点一个特权 DaemonSet，**用 nsenter 替代 SSH 排障** |
 | **MCP server** | 平台 skill 暴露成 MCP，Claude Code / Cursor 可直接挂载使用 |
@@ -86,7 +88,7 @@ URL:  http://your-host:8765/mcp
 Auth: Authorization: Bearer <MCP_API_KEYS 之一>
 ```
 
-Claude Code / Cursor 等 MCP 客户端配置后，可以直接调用平台的 28 个 skill 完成排障。详见
+Claude Code / Cursor 等 MCP 客户端配置后，可以直接调用平台的 20 个 skill 完成排障。详见
 [`docs/platform.md`](docs/platform.md) MCP 章节。
 
 ## 部署 host_agent（替代 SSH）
@@ -132,13 +134,13 @@ ai_work/
 │   ├── context.py               # SkillContext (connection_for 路由)
 │   ├── auth.py                  # 简版 JWT + PBKDF2
 │   ├── crypto.py                # Fernet 凭证加密
-│   ├── prompts.py               # 5 段 system prompt 默认值
+│   ├── prompts.py               # 4 段 system prompt 默认值
 │   ├── runbooks.py              # legacy 文档型剧本（给模型读）
 │   ├── store.py                 # 平台表 + ORM 简版
 │   ├── mcp_server.py            # MCP tool 暴露
 │   └── drivers/                 # 接入驱动
 │       ├── zabbix.py · swarm.py · k8s.py · host_agent.py · alert_analysis.py
-├── skills/                      # 28 个 skill 插件（每目录一个）
+├── skills/                      # 20 个 skill 插件（每目录一个）
 ├── services/                    # 底层 client（zabbix / swarm / k8s / host_agent）
 ├── admin_app/                   # Flask 后台蓝图（/admin/api/v1/*）
 ├── admin_ui/                    # Vue 3 + Vite 后台（→ Dockerfile.admin-ui 出 nginx 镜像）
@@ -178,14 +180,16 @@ ai_work/
 ## 当前状态
 
 ✅ 已完成：
-- 平台 kernel（skill 插件机制 / 8 driver / 28 skill / 6 graph runbook）
+- 平台 kernel（skill 插件机制 / 7 driver / 20 skill / 5 graph runbook）
 - 三入口（Chainlit + Admin + MCP）共用 invoker
-- 写操作二次确认链 + 三重锁（visibility + needs_confirmation + admin approval）
+- 写操作二次确认链 + resume_state 续跑 + 三重锁（visibility + needs_confirmation + admin approval）
 - 国产模型兼容（火山方舟 Code Plan 为默认 + 通义/智谱/DeepSeek）
 - host_agent 替代 SSH 排障（K8s + Swarm，含 containerd 适配）
 - Connection 凭证 Fernet 加密 + 自动迁移
 - 结构化 Signals 系统（19 种内置类型，agent 自动注入跨域 pivot hint）
 - Tool-loop digest（每次 skill 返回自动压缩，节省 ~50% token）
+- Resume 瘦身（确认后续跑不再重带最近 20 条历史，只带当前任务断点 + 确认结果）
+- 连通性探测保护（服务/容器访问 IP:PORT 时，定位运行节点后强制进入 `host_run_command` 确认流）
 - DB-backed prompt 段落库（admin 后台 CodeMirror 编辑、热加载）
 - **诊断剧本图执行引擎**（DAG + 引用 DSL + 9 种条件 + 信号驱动 + 执行回放）
 - Vue 后台 UI 清新简约风格 + CodeMirror 编辑器

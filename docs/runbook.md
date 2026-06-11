@@ -246,6 +246,8 @@ DAG 加载时跑 DFS 染色法找环，发现立即拒绝并报错路径 `a → 
 **admin 改过的剧本不会被 seed 覆盖**——只在表为空时 seed。
 
 > **可执行 DAG 只能编排只读 skill**——写 skill（`host_run_command` 等）一旦泄进自动执行，引擎会硬拦（见 [`runbook_engine.py`](../ops_platform/runbook_engine.py) `needs_confirmation` 检查）。所以「进容器 `nsenter` 做 DNS/连通性诊断」这类必须走 `host_run_command`(写) 的场景**不做成 DAG**，而是写成**文本剧本**（`container_netns_diag` / `network_troubleshooting` / `node_health_audit`，在 [`ops_platform/runbooks.py`](../ops_platform/runbooks.py)），由 `platform_get_runbooks` 返回，模型读着用 `host_run_command` 自己一步步跑。
+>
+> 为了防止模型读完文本剧本后仍反复 `swarm_query`，agent 对“服务/容器能否访问 IP:PORT”类问题加了保护：只要 trace 已通过 `swarm_query(category=service, verb=ps)` 找到运行中的任务和 Node，下一轮会临时只暴露 `host_run_command` 并强制 tool call，确保进入 `needs_confirmation` 确认流。
 
 ---
 
@@ -261,9 +263,9 @@ DAG 加载时跑 DFS 染色法找环，发现立即拒绝并报错路径 `a → 
 >
 > 简单单点查询：直接挑对应 skill。
 
-### 8.2 真实模型实测（2026-05-02）
+### 8.2 真实模型实测（历史样例，2026-05-02）
 
-火山方舟 Code Plan + `ark-code-latest`（control 台后台决定底层模型，本次解析为 doubao-seed-1.8）：
+火山方舟 Code Plan + `ark-code-latest`（control 台后台决定底层模型，本次解析为 doubao-seed-1.8）。下面是图执行设计早期的真实输出样例，部分 skill 名称已在后续版本收口到 `swarm_query` / `kube_query` / `host_run_command`，但流程语义不变：
 
 ```
 user: iiot-haitu_seatable 这个服务最近一直起不来，帮我看看根因
@@ -321,6 +323,7 @@ user: iiot-haitu_seatable 这个服务最近一直起不来，帮我看看根因
 | Runbook 跑了但全局 status=failed | 看 abort_reason；多半是某节点 on_error=fail 触发 |
 | 节点 status=skipped | if_when 守卫不满足；多半是 $user.X 没传 |
 | 跨域 pivot 没触发 | 检查上游 skill 是否真的 emit 了对应 signal；signal 类型大小写要对 |
+| 连通性问题只看到 swarm_query、不弹确认 | 确认用户问题里有服务/容器 + IP:PORT；trace 必须先查到 `service ps` 的 Running Node，之后 agent 才会强制进入 `host_run_command` 确认流 |
 | YAML 保存失败 | 后端返回 `errors` 数组里有具体哪条 |
 
 ---

@@ -5,7 +5,7 @@
 
 ---
 
-## 1. 当前真实环境（截至 2026-05）
+## 1. 当前真实环境（截至 2026-06）
 
 | 资源 | 地址 | 凭证 |
 |---|---|---|
@@ -53,7 +53,7 @@ AI_PROVIDER=volcengine_ark
 AI_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
 AI_API_KEY=<你的 Code Plan API Key>
 AI_MODEL=ark-code-latest
-AI_TIMEOUT_SECONDS=240
+AI_TIMEOUT_SECONDS=1200
 USE_STUB_AI=false
 
 # ============= Zabbix =============
@@ -181,5 +181,5 @@ print('runbooks:', rt.runbook_registry.list_keys())
 正常输出应该有：
 - store: SQLStore（不是 InMemoryStore）
 - zabbix stub=False
-- skills 30+
-- runbooks 4 条
+- skills 20
+- runbooks 5 条

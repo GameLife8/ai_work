@@ -49,6 +49,17 @@
 > `command='iptables-save'`、内核事件就 `command='dmesg -T | grep -i oom'`、进容器
 > netns 做 DNS/连通性诊断见 `container_netns_diag` runbook（[runbook.md](runbook.md)）。
 
+### 2.1 平台侧确认闭环
+
+`host_run_command` 是写 skill，模型第一次调用不会真的执行命令，而是：
+
+1. `SkillInvoker` 落 `platform_pending_action`，返回 `needs_confirmation + pending_token`。
+2. Chainlit / Admin 展示 ✅ / ❌ 确认卡片；Chainlit 当前最长等待 30 分钟。
+3. 用户确认后，平台才调用 agent 执行命令，并把真实 stdout/stderr/exit_code 写回审计。
+4. agent 通过 `resume_state` 把执行结果接回同一条 tool-loop，继续分析，不需要用户重新提问。
+
+因此命令能力的主要安全边界是平台的 RBAC、会话绑定、确认卡和审计，而不是 agent 内部维护一份永远追不全的命令黑名单。
+
 ---
 
 ## 3. 协议规范
@@ -236,7 +247,7 @@ curl -H "Authorization: Bearer $TOKEN" http://$NODE_IP:9100/v1/health | jq .
 |---|---|
 | 网络 | (a) agent 只绑节点 NIC（hostNetwork），不走 overlay；(b) `AGENT_ALLOWED_CIDR` 限源 IP；(c) 集群外建议 iptables 阻断 `:9100` 入站 |
 | 协议 | Bearer token；HTTPS 由集群入口/反代负责（agent 自身只裸 HTTP，避免每节点维护证书） |
-| 命令 | (a) 数组形式无 shell 注入；(b) 白名单只放取证型只读；(c) 写操作必须走平台 needs_confirmation |
+| 命令 | agent 原始 API 用数组参数 + allowlist；平台 `host_run_command` 统一以 `sh -c <command>` 进入 agent，**必须先走 needs_confirmation** |
 | 进程 | timeout 强 SIGTERM→SIGKILL；输出截断防 OOM |
 | 审计 | 双向日志：agent 侧记 `peer_ip + cmd + exit_code + duration`；平台 `platform_skill_call` 记完整调用链 |
 
@@ -285,6 +296,11 @@ alpine 默认源没有 crictl 包，所以 `Dockerfile.agent` 里**已内置**�
 containerd 集群进容器 netns：模型用 `host_run_command` 跑
 `crictl pods -q --name <Pod名>` → `crictl ps -q --pod <PodID>` → `crictl inspect …` 拿宿主机
 PID，再 `nsenter -t <PID> -n …`（完整套路见 `container_netns_diag` runbook）。
+
+Swarm 服务到 `IP:PORT` 的连通性探测同理：先用 `swarm_query service ps` 定位服务运行 Node；
+定位到 Running Node 后，agent 会推动模型下一步进入 `host_run_command` 确认流，在目标节点上
+`docker ps --filter name=<服务>.<副本>` 找真实容器、`docker inspect` 取 PID，再 `nsenter -t $PID -n`
+做带 timeout 的 DNS/TCP 探测。
 
 ---
 
